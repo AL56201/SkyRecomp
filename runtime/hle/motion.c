@@ -41,6 +41,8 @@ static _Atomic int auto_joycon;
 // recalibration request, then teardown. The game's cursor stays off until it has run. In VR it runs, answered by
 // the port: while it is active the right Joy-Con points at the screen's centre (the HUD panel's centre, where the
 // menu pointer's mapping starts: vr_controls.c) and Y is pressed for the player (input.c motion_auto_buttons).
+// The prompt is never seen or heard: while it runs (and a little after, its fade-out) the game's 2D layer isn't drawn
+// in the headset (exec.c) and the game's sound is muted (services/audio.c): motion_vr_calibration_hidden.
 // SKYRECOMP_VR_MOTION_CALIBRATION=1: the game's own modal in VR too (the player presses Y).
 #define LEGACY_CALIBRATION_COORDINATOR 0x7000dd2a68ull
 static GuestFn legacy_calibration_coordinator;
@@ -60,6 +62,13 @@ static void vr_auto_calibration(Cpu *c) {
         atomic_store(&calibration_frame, renderer_present_count() + 1);
     }
     legacy_calibration_coordinator(c);
+}
+
+// (exec.c, audio.c) The calibration prompt is up in VR, or just closed: hide it.
+bool motion_vr_calibration_hidden(void) {
+    extern uint64_t renderer_present_count(void);
+    const uint64_t f = atomic_load(&calibration_frame);
+    return f && renderer_present_count() + 1 <= f + 40;
 }
 
 // (input.c, each pad poll) Buttons the port presses: Y, pulsed, while the calibration runs in VR.

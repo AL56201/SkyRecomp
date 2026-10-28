@@ -3861,6 +3861,13 @@ static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     g_hud_rec = r;
     g_hud_candidate = vk_hud_layer_on() && st.program && (hud_clear_for_frame(), !hud_full2d()) && is_hud_draw();
+    extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the motion calibration prompt, answered for the
+    if (g_hud_candidate && motion_vr_calibration_hidden()) {  // player, is never shown)
+        g_hud_candidate = false;
+        stat_skipped++;
+        PROF_ADD(prof_draw);
+        return;
+    }
     // World behind a menu (hle/vr_world.c): the menu's own passes that read the screen back (the map's islands,
     // drawn there first, then captured into its map texture) read the HUD texture, where its 2D layer now is.
     const bool menu_sub = !g_hud_candidate && g_menu_screen && g_hud_tex.backend && vk_hud_layer_on() && vr_world_menu_active();
