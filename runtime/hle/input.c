@@ -14,6 +14,8 @@
 #include "../nvn/nvn.h"
 #include "../nvn/renderer.h"
 #include "../settings.h"
+#include "../vr/vr.h"
+#include "../vr/vr_rig.h"
 #include "../input_bind.h"
 #include "stick.h"
 #include "../frame_rate.h"
@@ -190,6 +192,16 @@ bool input_user_blocked(const SDL_Event *e) {
 // Controller family for the button prompts (runtime/nvn/texpatch.c): 0 Nintendo / other / none, 1 Xbox, 2 PlayStation.
 // LARECOMP_PAD_TYPE=xbox|playstation|nintendo pretends one is attached (tests).
 static _Atomic int pad_family;
+static bool pad_is_joycon_pair(void) {
+    if (!pad) return false;
+    SDL_GamepadType type = SDL_GetGamepadType(pad);
+    return type == SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR;
+}
+
+static void select_active_pad(void) {
+    extern void motion_select_input(bool joycon);
+    motion_select_input(pad_is_joycon_pair());
+}
 static void note_family(void) {
     int f = 0;
     if (pad) switch (SDL_GetGamepadType(pad)) {
@@ -231,6 +243,10 @@ void input_handle_event(const SDL_Event *e) {
         break;
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
+        if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F6 && !e->key.repeat && vr_running()) {
+            vr_rig_toggle_view();  // VR: 1st <-> 3rd person (runtime/vr_rig.h), kept for the next launch
+            settings_save();
+        }
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         recompute_keyboard();
         break;
@@ -264,7 +280,15 @@ void input_handle_event(const SDL_Event *e) {
         if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
         recompute_pad();
         break;
-    case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        if (abs(e->gaxis.value) > 8000) select_active_pad();
+        recompute_pad();
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        select_active_pad();
+        recompute_pad();
+        break;
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
         recompute_pad();
         break;
     }
@@ -591,7 +615,7 @@ static bool mouse_input(uint64_t *buttons, int32_t *rx, int32_t *ry, uint64_t no
 
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
 // {int64 sampling, u64 buttons, AnalogStick L {x,y}, AnalogStick R {x,y}, u32 attributes}
-static void fill_state(Cpu *c) {
+static void fill_state(Cpu *c, uint32_t attributes) {
     uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
     uint32_t id = *(uint32_t *)(uintptr_t)c->x[1];
     memset(s, 0, 0x28);
@@ -632,6 +656,14 @@ static void fill_state(Cpu *c) {
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
+    VrJoyConState vj;  // VR motion controllers as Joy-Cons (runtime/vr.h): their buttons and sticks on top of the rest
+    if (!menu && vr_joycon_state(&vj)) {
+        b |= vj.buttons;  // (the Npad button bits)
+        lx = clamp_axis(lx + (int32_t)(vj.stick[0][0] * 32767.0f));
+        ly = clamp_axis(ly + (int32_t)(vj.stick[0][1] * 32767.0f));
+        rx = clamp_axis(rx + (int32_t)(vj.stick[1][0] * 32767.0f));
+        ry = clamp_axis(ry + (int32_t)(vj.stick[1][1] * 32767.0f));
+    }
     uint64_t now = SDL_GetTicks();
     bool mouse_sword = mouse_input(&b, &rx, &ry, now, menu);
 
@@ -692,56 +724,39 @@ static void fill_state(Cpu *c) {
     { extern void input_note_rstick(int32_t ry); input_note_rstick(ry); }
     *(int32_t *)(s + 24) = rx;
     *(int32_t *)(s + 28) = ry;
-    *(uint32_t *)(s + 32) = 1;  // IsConnected
+    *(uint32_t *)(s + 32) = attributes;  // NpadAttribute: IsConnected (+ IsLeftConnected / IsRightConnected for a Joy-Con pair)
 }
 
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullkey) { fill_state(c); }
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", hid_state_dual) { fill_state(c); }
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left) { fill_state(c); }
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) { fill_state(c); }
-HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) { fill_state(c); }
-
-// FullKey style set on Player 1 (NpadId::No1 = 0)
-HLE_FUNC("_ZN2nn3hid15GetNpadStyleSetERKj", hid_style_set) {
-    uint32_t id = *(uint32_t *)(uintptr_t)c->x[0];
-    c->x[0] = (id == 0) ? 1 : 0;
-}
-
-// SixAxisSensor HLE stubs (Pro Controller / FullKey has 1 handle)
-HLE_FUNC("_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", hid_sixaxis_handles) {
-    uint32_t *out = (uint32_t *)(uintptr_t)c->x[0];
-    int count = (int)c->x[1];
-    uint32_t id = *(uint32_t *)(uintptr_t)c->x[2];
-    if (id == 0 && count >= 1 && out) {
-        out[0] = 1;
-        c->x[0] = 1;
-    } else {
-        c->x[0] = 0;
+static void note_state(const char *style) {  // (step 0 of the motion controls: which states the game polls, once each)
+    static const char *seen[8];
+    for (int i = 0; i < 8; i++) {
+        if (seen[i] == style) return;
+        if (!seen[i]) { seen[i] = style; break; }
     }
+    if (getenv("SKYRECOMP_JOYCON_TRACE")) LOG("[motion] game polls Npad%sState\n", style);
 }
-HLE_FUNC("_ZN2nn3hid18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", hid_start_sixaxis) { c->x[0] = 0; }
-HLE_FUNC("_ZN2nn3hid17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", hid_stop_sixaxis) { c->x[0] = 0; }
-HLE_FUNC("_ZN2nn3hid25EnableSixAxisSensorFusionERKNS0_19SixAxisSensorHandleEb", hid_enable_sixaxis_fusion) { c->x[0] = 0; }
-HLE_FUNC("_ZN2nn3hid32SetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleEff", hid_set_sixaxis_fusion) { c->x[0] = 0; }
-HLE_FUNC("_ZN2nn3hid25SetGyroscopeZeroDriftModeERKNS0_19SixAxisSensorHandleERKNS0_22GyroscopeZeroDriftModeE", hid_set_gyro_drift) { c->x[0] = 0; }
-HLE_FUNC("_ZN2nn3hid21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", hid_get_sixaxis_state) {
-    uint8_t *s = (uint8_t *)(uintptr_t)c->x[0];
-    static int64_t sixaxis_samp;
-    memset(s, 0, 0x60);
-    *(int64_t *)(s + 0x00) = (int64_t)rt_frame_period_ns();  // deltaTimeNanoSeconds
-    *(int64_t *)(s + 0x08) = ++sixaxis_samp; // samplingNumber
-    *(float *)(s + 0x14) = -1.0f;            // acceleration.y = -1g
-    *(float *)(s + 0x34) = 1.0f;             // direction[0][0]
-    *(float *)(s + 0x44) = 1.0f;             // direction[1][1]
-    *(float *)(s + 0x54) = 1.0f;             // direction[2][2]
-    *(uint32_t *)(s + 0x58) = 1;             // attributes = IsConnected
-    c->x[0] = 0;
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullkey) {
+    note_state("FullKey");
+    fill_state(c, 1);
 }
-HLE_FUNC("_ZNK2nn3hid18SixAxisSensorState13GetQuaternionEPNS_4util4neon12Vector4fTypeE", hid_sixaxis_quat) {
-    float *q = (float *)(uintptr_t)c->x[1];
-    if (q) { q[0] = 0.0f; q[1] = 0.0f; q[2] = 0.0f; q[3] = 1.0f; }
-    c->x[0] = 0;
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", hid_state_dual) {
+    note_state("JoyDual");
+    fill_state(c, 1u | 1u << 2 | 1u << 4);
 }
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left) {
+    note_state("JoyLeft");
+    fill_state(c, 1);
+}
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj", hid_state_handheld) {
+    note_state("Handheld");
+    fill_state(c, 1);
+}
+HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj", hid_state_right) {
+    note_state("JoyRight");
+    fill_state(c, 1);
+}
+
+// Controller style and Joy-Con motion sensors: runtime/hle/motion.c.
 
 // Controller Support Applet HLE stubs: immediately report Player 1 (NpadId::No1 = 0) connected
 HLE_FUNC("_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE", hid_show_controller_support) {
@@ -781,9 +796,22 @@ HLE_FUNC("_ZN2nn3hid28ShowControllerFirmwareUpdateERKNS0_27ControllerFirmwareUpd
 // BindNpadStyleSetUpdateEvent(id, SystemEventType*, clear mode): signaled once so the game sees a
 // controller connected.
 #include "../kernel.h"
+static KEvent *style_events[8];
+static int style_event_count;
+
+// The VR setting can change while the game is running. Wake the SDK listeners so it drops the Pro Controller
+// handles and opens the Joy-Con pair's two motion sensors (or performs the reverse transition when VR is disabled).
+void input_controller_style_changed(void) {
+    pthread_mutex_lock(&g_klock);
+    for (int i = 0; i < style_event_count; i++) kernel_signal(style_events[i]);
+    pthread_mutex_unlock(&g_klock);
+}
+
 HLE_FUNC("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS3_14EventClearModeE", hid_bind_style_event) {
     uint32_t w, r;
     KEvent *ev = kernel_create_event_pair(&w, &r);
+    if (style_event_count < (int)(sizeof style_events / sizeof *style_events))
+        style_events[style_event_count++] = ev;
     pthread_mutex_lock(&g_klock);
     kernel_signal(ev);
     pthread_mutex_unlock(&g_klock);

@@ -3,9 +3,12 @@
 VR is opt-in and off by default. Start SteamVR, then use **Enable VR Mode** in VR Options to enter or leave VR live.
 `SKYRECOMP_VR=0` / `=1` before launch overrides the saved setting.
 
-This build covers VR rendering only: stereo output, the head-tracked camera (1st / 3rd person), culling, per-eye
-visual fixes and performance. Play with a regular gamepad; the VR controllers are not used. The game's 2D layer
-(HUD, menus, map) is drawn into each eye as it is on the desktop.
+This build covers VR rendering (stereo output, the head-tracked camera in 1st / 3rd person, culling, per-eye visual
+fixes, performance), the HUD panel / world behind menus / wrist HUD, and the VR controllers as the game's Joy-Con
+pair: buttons, sticks and motion (runtime/vr/vr_input.c bindings for Index, Touch, Vive, WMR and the simple
+controller; runtime/hle/motion.c the motion sensors). Not here: Link's hands on the controllers, the Bow, item
+aiming, the menu pointer, teleport and rumble. With VR on the game always uses the Joy-Con pair (motion controls); a
+gamepad's buttons still work alongside.
 
 **VR Resolution** in VR Options controls the game's render resolution relative to OpenXR's recommended per-eye size.
 `1.0x` renders at the recommendation; values above it supersample for a sharper image at a substantial GPU cost.
@@ -40,6 +43,7 @@ hooks (`runtime/hle/`).
 | File | What |
 |---|---|
 | `vr.c`, `vr_xr.h` | OpenXR core: instance, session, frame loop, eye images, poses, resolution scale |
+| `vr_input.c`, `vr_controls.c` | The controllers as the game's Joy-Con pair (OpenXR actions, buttons, sticks, motion sensors), grip poses for the wrist HUD |
 | `vr_rig.c` | Camera rig: eye cameras, 1st / 3rd person, hiding Link's body, culling field of view |
 | `vr_stereo_cull.cpp` | Stereo culling helpers |
 | `vr_settings.cpp` | The `[VR]` section of `skyrecomp.ini` |

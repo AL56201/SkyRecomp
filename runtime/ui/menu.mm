@@ -69,6 +69,8 @@ static void push(const QEvent &e) {
 }
 
 bool menu_is_open(void) { return g_open.load(); }
+static std::atomic<bool> g_vr_close{false};
+extern "C" void menu_vr_close(void) { g_vr_close.store(true); }
 static void set_open(bool open);
 extern "C" void menu_test_open(void) {
     set_open(true);
@@ -1027,6 +1029,7 @@ void menu_render(id<MTLDevice> dev, id<MTLCommandBuffer> cb, id<MTLTexture> targ
 void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     const double tw = target_w, th = target_h;
 #endif
+    if (g_vr_close.exchange(false) && g_open.load()) set_open(false);  // (VR controllers: B)
     bool open = g_open.load();
     bool inv = !open && inventory_overlay_wanted();
     bool trk = !open && tracker_overlay_wanted();

@@ -469,8 +469,8 @@ bool vr_vulkan_init(void *instance_, void *physical_device_, void *device_, uint
     space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     ok = ok && xr_ok(p_xrCreateReferenceSpace(xr_session, &space, &view_space), "xrCreateReferenceSpace (view)") &&
          create_swapchain() && create_staging();
-    if (ok && !vr_grip_create(xr_instance, xr_session))
-        LOG("[vr] no controller poses (the wrist HUD stays off; the headset still renders)\n");
+    if (ok && !vr_input_create(xr_instance, xr_session))
+        LOG("[vr] no controller input (the headset still renders)\n");
     if (!ok) {
         vr_shutdown();
         return false;
@@ -488,7 +488,7 @@ void vr_shutdown(void) {
     atomic_store(&focus_requested, false);
     memset(&frame, 0, sizeof frame);
     set_stage(STAGE_IDLE);
-    vr_grip_destroy();
+    vr_input_destroy();
     if (vk_device && staging) vkDestroyImage(vk_device, staging, NULL);
     if (vk_device && staging_memory) vkFreeMemory(vk_device, staging_memory, NULL);
     staging = VK_NULL_HANDLE;
@@ -529,6 +529,8 @@ void vr_poll(void) {
                 if (xr_ok(p_xrBeginSession(xr_session, &begin), "xrBeginSession")) {
                     running = true;
                     reference_valid = false;
+                    extern void input_controller_style_changed(void);
+                    input_controller_style_changed();  // (the game opens the Joy-Con pair's motion sensors)
                     set_status("SteamVR stereo rendering active");
                 }
             } else if (state == XR_SESSION_STATE_FOCUSED) {
@@ -537,6 +539,8 @@ void vr_poll(void) {
                 if (frame.begun) vr_frame_end();
                 p_xrEndSession(xr_session);
                 running = false;
+                extern void input_controller_style_changed(void);
+                input_controller_style_changed();
                 set_status("SteamVR session stopped");
             } else if (state == XR_SESSION_STATE_EXITING || state == XR_SESSION_STATE_LOSS_PENDING) {
                 running = false;
@@ -547,7 +551,8 @@ void vr_poll(void) {
         }
         event = (XrEventDataBuffer){.type = XR_TYPE_EVENT_DATA_BUFFER};
     }
-    vr_grip_sync(running ? local_space : XR_NULL_HANDLE, frame.display_time);  // (wrist HUD)
+    // Controllers are located in the same OpenXR local space as the HMD (the game's Joy-Cons, the wrist HUD).
+    vr_input_sync(running ? local_space : XR_NULL_HANDLE, frame.display_time, reference_valid ? reference_pose : NULL);
 }
 
 // ================================================================== frame loop

@@ -14,6 +14,20 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+// The VR motion controllers as a pair of Joy-Cons (runtime/nvn/vulkan/JoyConTranslator.h has the conventions).
+typedef struct {
+    uint32_t buttons;    // nn::hid NpadButton bits
+    float stick[2][2];   // left, right: x, y in -1..1
+} VrJoyConState;
+
+typedef struct {         // nn::hid::SixAxisSensorState's payload
+    float accel[3];      // g
+    float gyro[3];       // revolutions / s, the Joy-Con's own axes
+    float angle[3];      // revolutions
+    float direction[9];  // the Joy-Con's axes (rows) in the player's frame: x right, y forward, z up
+    int64_t delta_ns;
+} VrJoyConSensor;
+
 // ---- lifecycle
 bool vr_requested(void);  // settings "vr" (or SKYRECOMP_VR=0/1); decides the Vulkan extensions asked for
 // After the Vulkan instance and device exist. Vulkan handles are opaque to keep Vulkan out of this header.
@@ -34,7 +48,10 @@ void TriggerFastVRExit(void);
 bool IsVRExitRequested(void);
 
 // ---- per frame
-void vr_poll(void);  // session events
+void vr_poll(void);  // session events and controller actions
+// Any thread (the game's input calls). False: no tracked VR controllers right now.
+bool vr_joycon_state(VrJoyConState *state);
+bool vr_joycon_sensor(int device, VrJoyConSensor *sensor);  // device 0: Joy-Con (L) = left hand, 1: (R) = right
 bool vr_take_window_focus_request(void);  // one-shot: SteamVR focused the session, raise the desktop window
 
 bool vr_frame_begin(void);  // idempotent within a frame; true when the frame renders in stereo
@@ -53,7 +70,7 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
 // frame_is_3d: this frame drew a 3D scene; its eyes become that "last 3D frame".
 void vr_freeze_world(bool freeze, bool frame_is_3d);
 bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint32_t h, bool flip_y, bool opaque);
-// Latest OpenXR grip poses (vr_grip.c) for the wrist HUD: {qx, qy, qz, qw, px, py, pz} in the local space.
+// Latest OpenXR grip poses (vr_input.c) for the wrist HUD: {qx, qy, qz, qw, px, py, pz} in the local space.
 void vr_set_grip_poses(bool left_tracked, const float left_pose[7], bool right_tracked, const float right_pose[7]);
 void vr_frame_end(void);
 extern float g_vr_gpu_ms;  // the last measured GPU frame time in ms (exec.c), for dynamic resolution
