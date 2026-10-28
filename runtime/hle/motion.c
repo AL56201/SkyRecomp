@@ -206,6 +206,16 @@ static bool test_sample(uint8_t device, SensorState *s) {
         if (f >= 2700 && f < 2760) s->gyro[2] = 0.1f;
         return true;
     }
+    float pu, pv, pfrom = 0, ptilt = 0;  // (test) =panel:<u>,<v>[,<frame>[,<tilt>]]: the menu pointer's mapping
+    // (vr_controls.c) aimed at (u, v); tilt: gravity as from a controller pitched down that many degrees
+    if (sscanf(test, "panel:%f,%f,%f,%f", &pu, &pv, &pfrom, &ptilt) >= 2) {
+        if ((float)f < pfrom) return true;
+        extern void vr_pointer_direction(float u, float v, float out[9]);
+        vr_pointer_direction(pu, pv, s->direction);
+        const float t = ptilt * (float)(M_PI / 180.0);
+        s->accel[0] = 0, s->accel[1] = sinf(t), s->accel[2] = -cosf(t);
+        return true;
+    }
     // (test) =point:<yaw>,<pitch>[,<frame>]: held turned that many degrees about z, then about x (from that frame:
     // straight before it, so the game's Y calibration can be made first)
     // =seq:<yaw>,<pitch>,<frame>[,<gx>,<gy>,<gz>[,<ax>,<ay>,<az>]]/...: each from its frame (straight before the

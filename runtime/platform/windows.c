@@ -197,14 +197,20 @@ static void open_log_console(void) {
 static void log_to_file_without_console(void) {
     HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
     DWORD type = err && err != INVALID_HANDLE_VALUE ? GetFileType(err) : FILE_TYPE_UNKNOWN;
-    if (type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK) return;  // caller already captures diagnostics
+    // A process restarted by plat_exec inherits the parent's Windows standard
+    // handle, but a GUI-subsystem child's C runtime stderr FILE is not reliably
+    // attached to that handle. SKYRECOMP_LOG_APPEND identifies that child: open
+    // its own CRT stream instead of silently sending all in-game LOG() output to
+    // an invalid descriptor. An external pipe/file capture remains untouched.
+    const bool reexec = getenv("SKYRECOMP_LOG_APPEND") != NULL;
+    if (!reexec && (type == FILE_TYPE_PIPE || type == FILE_TYPE_DISK)) return;
     char exe[MAX_PATH];
     DWORD n = GetModuleFileNameA(NULL, exe, sizeof exe);
     if (!n || n >= sizeof exe) return;
     char *slash = strrchr(exe, '\\');
     if (slash) slash[1] = 0;
     snprintf(g_log_path, sizeof g_log_path, "%sskyrecomp.log", exe);
-    bool append = getenv("SKYRECOMP_LOG_APPEND") != NULL;
+    bool append = reexec;
     if (!freopen(g_log_path, append ? "ab" : "wb", stderr)) { g_log_path[0] = 0; return; }
     setvbuf(stderr, NULL, _IONBF, 0);
     _dup2(_fileno(stderr), _fileno(stdout));

@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <SDL3/SDL_timer.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -36,7 +37,8 @@ static bool g_ptr_aim_ok, g_ptr_hud_ok;
 
 // The Joy-Con direction (rows: its axes in the player's frame) that puts the game's cursor at (u, v) of the screen
 // (0..1, top left): a turn about its own z then x from the canonical centre.
-static void pointer_direction(float u, float v, float out[9]) {
+void vr_pointer_direction(float u, float v, float out[9]);  // (also motion.c tests)
+void vr_pointer_direction(float u, float v, float out[9]) {
     const float a = atanf((u - 0.5f) / POINTER_KX), b = atanf((v - 0.5f) / POINTER_KY);
     const float ca = cosf(a), sa = sinf(a), cb = cosf(b), sb = sinf(b);
     const float yaw[9] = {ca, -sa, 0, sa, ca, 0, 0, 0, 1}, pitch[9] = {1, 0, 0, 0, cb, -sb, 0, sb, cb};
@@ -118,7 +120,21 @@ static bool panel_pointer(SkyJoyConSensor *s) {
     if (!on) return false;
     float u, v;
     if (!panel_uv(aim, hud, &u, &v)) return false;
-    pointer_direction(u, v, s->direction);
+    {   // (diagnostics) every half second while the pointer is active: the panel point, the ray, the panel
+        static uint64_t next;
+        const uint64_t now = SDL_GetTicksNS();
+        if (now >= next) {
+            next = now + 500000000ull;
+            LOG("[vr-pointer] u %.2f v %.2f | ray from (%.2f %.2f %.2f) dir (%.2f %.2f %.2f) | panel centre (%.2f %.2f %.2f) "
+                "x (%.2f %.2f %.2f) y (%.2f %.2f %.2f)\n", u, v, aim[3], aim[7], aim[11], -aim[2], -aim[6], -aim[10],
+                hud[3], hud[7], hud[11], hud[0], hud[4], hud[8], hud[1], hud[5], hud[9]);
+        }
+    }
+    vr_pointer_direction(u, v, s->direction);
+    // Gravity as the Joy-Con would feel it held that way (its axes' z, the player's up, negated: (0, 0, -1) level),
+    // not as the controller is really held: the game also reads the tilt from it, and the real controller is held
+    // lower and pitched down to aim at the panel - the cursor could not rise past the middle of the screen.
+    for (int i = 0; i < 3; i++) s->accel[i] = -s->direction[i * 3 + 2];
     static int logged;
     if (!logged++) LOG("[vr] menu pointer: the game's cursor follows the right controller's ray on the HUD panel\n");
     return true;
@@ -159,6 +175,10 @@ bool vr_joycon_sensor(int device, VrJoyConSensor *sensor) {
 }
 
 #else
+void vr_pointer_direction(float u, float v, float out[9]) {
+    (void)u; (void)v;
+    for (int i = 0; i < 9; i++) out[i] = i % 4 == 0;
+}
 void vr_controls_set_hud_panel(const float m[16]) { (void)m; }
 bool vr_joycon_state(VrJoyConState *state) { (void)state; return false; }
 bool vr_joycon_sensor(int device, VrJoyConSensor *sensor) { (void)device; (void)sensor; return false; }
