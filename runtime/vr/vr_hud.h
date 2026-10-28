@@ -83,6 +83,7 @@ typedef struct VRHUDConfig {
 extern VRHUDConfig g_vr_hud_config;
 
 void ResetVRHUDConfig(void);
+extern bool g_vr_hud_hold;  // the panel holds still (the menu pointer is in use: vr.c sets it each frame)
 void ValidateVRHUDConfig(void);
 
 // Matrices use the runtime's convention: row-major, multiplied by column vectors. head_pose is tracking-space-from-

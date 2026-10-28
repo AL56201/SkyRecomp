@@ -722,6 +722,7 @@ bool vr_stereo_active(void) { return frame.begun && frame.stereo; }
 void vr_recenter(void) {
     reference_valid = false;  // (the next tracked head pose is the new reference)
     vr_rig_recenter();
+    ResetHUDLazyFollow();  // (the HUD panel: in front of the head again)
 }
 
 
@@ -1230,6 +1231,8 @@ static XrPosef hud_pose(void) {
                             0, 0, 0, 1};
     float m[16];
     const float dt = frame.display_period > 0 ? (float)frame.display_period * 1e-9f : 1.0f / 90.0f;
+    extern bool vr_menu_pointer_active(void);  // (vr_controls.c: the panel holds still while it is in use)
+    g_vr_hud_hold = vr_menu_pointer_active();
     ComputeHUDQuadMatrixDelta(m, head, NULL, dt);
     {   // (the menu pointer, vr_controls.c) the panel with its half extents as axes
         const float hw = 0.8f * g_vr_hud_config.hud_scale, hh = hw * HUD_H / HUD_W;
@@ -1237,6 +1240,15 @@ static XrPosef hud_pose(void) {
         memcpy(h, m, sizeof h);
         for (int r = 0; r < 3; r++) h[r * 4 + 0] *= hw, h[r * 4 + 1] *= hh;
         vr_controls_set_hud_panel(h);
+        static uint64_t next;  // (diagnostics, with the menu pointer's [vr-pointer] lines) the head and the panel
+        const uint64_t now = SDL_GetTicksNS();
+        if (now >= next) {
+            next = now + 500000000ull;
+            LOG("[vr-panel] head (%.2f %.2f %.2f) looking (%.2f %.2f %.2f) | panel centre (%.2f %.2f %.2f) facing (%.2f %.2f %.2f) "
+                "| distance %.2f offset %.2f scale %.2f lock %d\n", head[3], head[7], head[11], -head[2], -head[6], -head[10],
+                m[3], m[7], m[11], m[2], m[6], m[10], g_vr_hud_config.hud_distance, g_vr_hud_config.hud_vertical_offset,
+                g_vr_hud_config.hud_scale, (int)g_vr_hud_config.lock_to_head);
+        }
     }
     // rotation (columns right, up, back) -> quaternion
     const float r00 = m[0], r01 = m[1], r02 = m[2], r10 = m[4], r11 = m[5], r12 = m[6], r20 = m[8], r21 = m[9], r22 = m[10];

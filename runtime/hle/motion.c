@@ -41,18 +41,18 @@ static _Atomic int auto_joycon;
 // recalibration, then teardown; the game's cursor stays off until it has run. It is called each frame while the
 // prompt is up; its state (+24): 0 opening, 1 waiting for the prompt's opening animation (its object +8: +0x160b
 // set when an animation is done), 2 Y pressed?, 3 closing requested, 4 waiting for the closing animation, 5
-// teardown, then 0 (idle). State 3 waits for the prompt's status +0x15e0 to be 2 (open). In VR it runs, answered by the port, and is never seen or heard:
-//  - states 1, 3 and 4: the prompt is reported open / its animation done at once (+0x15e0 = 2, +0x160b), so the whole
-//    run takes a few frames (~1.2 s before);
-//  - state 1: Y is pressed for the player (input.c motion_auto_buttons) - only then, so Y can't restart it;
+// teardown, then 0 (idle). State 3 waits for the prompt's status +0x15e0 to be 2 (open). In VR it runs, answered by
+// the port, and is never seen or heard:
+//  - states 1, 3 and 4: the prompt is reported open / its animation done at once (+0x15e0 = 2, +0x160b);
+//  - state 2: after a short centred-pose settling window, Y is pressed for the player (input.c motion_auto_buttons);
 //  - states 1-4: the right Joy-Con points at the screen's centre (the HUD panel's centre, where the menu pointer's
 //    mapping starts: vr_controls.c);
-//  - the whole run and 40 frames after it (the fade-out): the game's 2D layer isn't shown in the headset (exec.c,
+//  - the whole run and CAL_FADE_FRAMES after it (the fade-out): the game's 2D layer isn't shown in the headset (exec.c,
 //    device.c) and the game's sound is muted (services/audio.c): motion_vr_calibration_hidden.
 // A run ends when the state returns to 0 after the prompt, or when the coordinator stops being called; it is never
-// answered for more than CAL_MAX_FRAMES. SKYRECOMP_VR_MOTION_CALIBRATION=1: the game's own prompt in VR too.
+// answered for more than CAL_MAX_FRAMES. SKYRECOMP_VR_MOTION_CALIBRATION=1: show the game's own prompt in VR too.
 #define LEGACY_CALIBRATION_COORDINATOR 0x7000dd2a68ull
-enum { CAL_MAX_FRAMES = 1200, CAL_FADE_FRAMES = 4 };
+enum { CAL_MAX_FRAMES = 1200, CAL_SETTLE_FRAMES = 45, CAL_FADE_FRAMES = 4 };
 static GuestFn legacy_calibration_coordinator;
 static _Atomic uint64_t cal_last_call, cal_run_start, cal_run_end;  // (present count + 1; 0 none)
 static _Atomic uint32_t cal_state;
@@ -108,10 +108,13 @@ bool motion_vr_calibration_hidden(void) {
     return over && now <= over + CAL_FADE_FRAMES;
 }
 
-// (input.c, each pad poll) Buttons the port presses: Y while the prompt waits for it in VR (states 1-2).
+// (input.c, each pad poll) Confirm only after the game's motion filter has received a stable centred pose.  Completing
+// the hidden prompt in 2-3 frames left its baseline dependent on the controller pose from before the prompt, which
+// could restrict the cursor to part of the screen even though the absolute VR ray covered the whole HUD panel.
 uint64_t motion_auto_buttons(void) {
     const uint32_t st = atomic_load(&cal_state);
-    return cal_running() && (st == 1 || st == 2) ? 1u << 3 : 0;  // (Npad Y)
+    const uint64_t start = atomic_load(&cal_run_start);
+    return cal_running() && st == 2 && cal_now() >= start + CAL_SETTLE_FRAMES ? 1u << 3 : 0;  // (Npad Y)
 }
 
 // TEMP (RE) SKYRECOMP_TEMP_MOTION_GATE=1: f_7000a17aa8 / f_7000a17be0 (player: "motion input active?") logged on change
@@ -268,7 +271,15 @@ static void motion_sample(uint8_t device, SensorState *s) {
     s->accel[2] = -1.0f;
     s->direction[0] = s->direction[4] = s->direction[8] = 1.0f;
     if (test_sample(device, s)) return;
-    if (device == DEVICE_RIGHT && auto_calibrating()) return;  // (VR calibration: pointing at the centre, still)
+    if (device == DEVICE_RIGHT && auto_calibrating()) {
+        // Bias the hidden baseline slightly toward the top of the panel.  The game's accepted pointer cone is
+        // asymmetric after calibration; using its geometric centre left a narrow unreachable strip at the bottom.
+        // Moving the baseline (rather than amplifying live poses) preserves the cone and shifts its usable range.
+        extern void vr_pointer_direction(float u, float v, float out[9]);
+        vr_pointer_direction(0.5f, 0.46f, s->direction);
+        for (int i = 0; i < 3; i++) s->accel[i] = -s->direction[i * 3 + 2];
+        return;
+    }
     VrJoyConSensor v;
     if (device > DEVICE_RIGHT || !vr_joycon_sensor(device, &v)) return;
     memcpy(s->accel, v.accel, sizeof s->accel);

@@ -105,6 +105,12 @@ extern "C" void ValidateVRHUDConfig(void) { sanitize_config(); }
 
 extern "C" void ResetHUDLazyFollow(void) { follow = FollowState{}; }
 
+// While the menu pointer is in use (vr_controls.c: title, file select, paused menus) the panel holds still where it
+// was placed (in front of the head when the hold began): with the panel following the head, the same controller
+// direction pointed at different parts of the menu as the head turned, and the cursor jumped across it.
+bool g_vr_hud_hold;
+static bool held;
+
 extern "C" void ComputeHUDQuadMatrixDelta(float out[16], const float head_pose[16], const float camera_pose[16],
                                             float delta_seconds) {
     if (!out) return;
@@ -120,7 +126,11 @@ extern "C" void ComputeHUDQuadMatrixDelta(float out[16], const float head_pose[1
     if (!normalize(head_up)) { head_up[0] = head_up[2] = 0.0f; head_up[1] = 1.0f; }
     if (!normalize(head_forward)) { head_forward[0] = head_forward[1] = 0.0f; head_forward[2] = -1.0f; }
 
-    if (g_vr_hud_config.lock_to_head) {
+    if (g_vr_hud_hold != held) {  // (the hold begins: placed in front of the head again; ends: follows again)
+        held = g_vr_hud_hold;
+        if (held) follow.valid = false;
+    }
+    if (g_vr_hud_config.lock_to_head && !held) {
         float position[3];
         for (int i = 0; i < 3; ++i)
             position[i] = head_position[i] + head_forward[i] * g_vr_hud_config.hud_distance +
@@ -147,7 +157,7 @@ extern "C" void ComputeHUDQuadMatrixDelta(float out[16], const float head_pose[1
         std::memcpy(follow.position, target_position, sizeof target_position);
         std::memcpy(follow.forward, target_forward, sizeof target_forward);
         follow.valid = true;
-    } else {
+    } else if (!held) {
         const float dt = std::clamp(std::isfinite(delta_seconds) ? delta_seconds : 0.0f, 0.0f, kMaxDelta);
         const float blend = 1.0f - std::exp(-dt / kFollowTime);
         for (int i = 0; i < 3; ++i) {

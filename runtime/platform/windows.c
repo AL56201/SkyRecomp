@@ -211,12 +211,15 @@ static void log_to_file_without_console(void) {
     if (slash) slash[1] = 0;
     snprintf(g_log_path, sizeof g_log_path, "%sskyrecomp.log", exe);
     bool append = reexec;
-    if (!freopen(g_log_path, append ? "ab" : "wb", stderr)) { g_log_path[0] = 0; return; }
+    // The diagnostics window first (it may release this process's console, FreeConsole), then the redirection:
+    // released after it, the console took the log's output with it (nothing past the first line was written).
+    if (!append) { FILE *f = fopen(g_log_path, "wb"); if (f) fclose(f); }
+    open_log_console();
+    if (!freopen(g_log_path, "ab", stderr)) { g_log_path[0] = 0; return; }
     setvbuf(stderr, NULL, _IONBF, 0);
     _dup2(_fileno(stderr), _fileno(stdout));
     _putenv("SKYRECOMP_LOG_APPEND=1");
     fprintf(stderr, "[diagnostics] log: %s\n", g_log_path);
-    open_log_console();
 }
 
 // The recompiled game code is built for x86-64-v3 (Makefile GENARCH: AVX2, FMA, BMI2): say so instead of crashing

@@ -78,6 +78,9 @@ static bool panel_pointer_on(void) {
            || !player_eye(NULL);  // (no Link: the title, file select, loading)
 }
 
+bool vr_menu_pointer_active(void);
+bool vr_menu_pointer_active(void) { return panel_pointer_on(); }  // (vr.c: the HUD panel holds still meanwhile)
+
 // Where the ray points on the panel, (u, v) in 0..1 (top left), clamped to its edges: the panel follows the head's
 // yaw, so a turned head can leave the controller pointing past it - the cursor then stays on the nearest edge
 // instead of leaving the screen (the game hides it off screen). A ray pointing away from the panel's plane goes to
@@ -175,6 +178,7 @@ bool vr_joycon_sensor(int device, VrJoyConSensor *sensor) {
 }
 
 #else
+bool vr_menu_pointer_active(void) { return false; }
 void vr_pointer_direction(float u, float v, float out[9]) {
     (void)u; (void)v;
     for (int i = 0; i < 9; i++) out[i] = i % 4 == 0;
