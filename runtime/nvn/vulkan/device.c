@@ -830,7 +830,8 @@ void backend_present(NvnTexture *t) {
         {   // the 2D layer (exec.c HUD texture) onto the HUD panel
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void);
             extern TexBackend *vk_hud_backend(void);
-            TexBackend *hb = vk_hud_layer_on() ? vk_hud_backend() : NULL;
+            extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the calibration prompt, hidden)
+            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() ? vk_hud_backend() : NULL;
             if (hb) {
                 vk_label_begin(vk_cmd(), "[VR] HUD Quad");
                 vr_record_hud_copy((void *)vk_cmd(), (void *)hb->image, hb->width, hb->height, renderer_origin_lower_left(),

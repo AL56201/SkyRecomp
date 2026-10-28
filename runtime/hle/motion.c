@@ -37,45 +37,71 @@ _Static_assert(offsetof(SensorState, accel) == 0x10 && offsetof(SensorState, dir
 
 static _Atomic int auto_joycon;
 
-// This coordinator owns the game's pointer calibration: the "point at the screen and press Y" modal, the
-// recalibration request, then teardown. The game's cursor stays off until it has run. In VR it runs, answered by
-// the port: while it is active the right Joy-Con points at the screen's centre (the HUD panel's centre, where the
-// menu pointer's mapping starts: vr_controls.c) and Y is pressed for the player (input.c motion_auto_buttons).
-// The prompt is never seen or heard: while it runs (and a little after, its fade-out) the game's 2D layer isn't drawn
-// in the headset (exec.c) and the game's sound is muted (services/audio.c): motion_vr_calibration_hidden.
-// SKYRECOMP_VR_MOTION_CALIBRATION=1: the game's own modal in VR too (the player presses Y).
+// This coordinator owns the game's pointer calibration: the "point at the screen and press Y" prompt, the
+// recalibration, then teardown; the game's cursor stays off until it has run. It is called each frame while the
+// prompt is up; its state (+24): 0 opening, 1 waiting for Y, 2-4 Y accepted, 5 closing, then 0 again (idle).
+// In VR it runs, answered by the port, and is never seen or heard:
+//  - state 1: Y is pressed for the player (input.c motion_auto_buttons) - only then, so Y can't restart it;
+//  - states 1-4: the right Joy-Con points at the screen's centre (the HUD panel's centre, where the menu pointer's
+//    mapping starts: vr_controls.c);
+//  - the whole run and 40 frames after it (the fade-out): the game's 2D layer isn't shown in the headset (exec.c,
+//    device.c) and the game's sound is muted (services/audio.c): motion_vr_calibration_hidden.
+// A run ends when the state returns to 0 after the prompt, or when the coordinator stops being called; it is never
+// answered for more than CAL_MAX_FRAMES. SKYRECOMP_VR_MOTION_CALIBRATION=1: the game's own prompt in VR too.
 #define LEGACY_CALIBRATION_COORDINATOR 0x7000dd2a68ull
+enum { CAL_MAX_FRAMES = 1200, CAL_FADE_FRAMES = 40 };
 static GuestFn legacy_calibration_coordinator;
-static _Atomic uint64_t calibration_frame;  // (present count + 1 of the coordinator's last run in VR; 0 never)
-static bool auto_calibrating(void) {
+static _Atomic uint64_t cal_last_call, cal_run_start, cal_run_end;  // (present count + 1; 0 none)
+static _Atomic uint32_t cal_state;
+static _Atomic bool cal_in_run;
+static uint64_t cal_now(void) {
     extern uint64_t renderer_present_count(void);
-    const uint64_t f = atomic_load(&calibration_frame);
-    return f && renderer_present_count() + 1 <= f + 2;
+    return renderer_present_count() + 1;
+}
+static bool cal_running(void) {  // (a run is in progress: called lately, not past its limit)
+    const uint64_t now = cal_now(), last = atomic_load(&cal_last_call), start = atomic_load(&cal_run_start);
+    return atomic_load(&cal_in_run) && last && now <= last + 2 && now <= start + CAL_MAX_FRAMES;
 }
 static void vr_auto_calibration(Cpu *c) {
     static int keep = -1;
     if (keep < 0) keep = getenv("SKYRECOMP_VR_MOTION_CALIBRATION") != NULL;
-    if (vr_requested() && !keep) {
-        extern uint64_t renderer_present_count(void);
-        static int logged;
-        if (!logged++) LOG("[motion] VR: the pointer calibration is answered automatically (pointing at the centre)\n");
-        atomic_store(&calibration_frame, renderer_present_count() + 1);
+    if (!vr_requested() || keep) {
+        legacy_calibration_coordinator(c);
+        return;
     }
+    const uint64_t self = c->x[0], now = cal_now();
+    if (!cal_running()) {  // (a new run)
+        atomic_store(&cal_run_start, now);
+        atomic_store(&cal_in_run, true);
+        LOG("[motion] VR: the pointer calibration prompt is answered automatically, hidden and muted\n");
+    }
+    atomic_store(&cal_last_call, now);
     legacy_calibration_coordinator(c);
+    const uint32_t st = self ? *(const uint32_t *)(uintptr_t)(self + 24) : 0;
+    const uint32_t before = atomic_exchange(&cal_state, st);
+    if (st == 0 && before == 5) {  // (closed: the run is over)
+        atomic_store(&cal_in_run, false);
+        atomic_store(&cal_run_end, now);
+    }
+}
+static bool auto_calibrating(void) {  // (the right Joy-Con points at the centre)
+    const uint32_t st = atomic_load(&cal_state);
+    return cal_running() && st >= 1 && st <= 4;
 }
 
-// (exec.c, audio.c) The calibration prompt is up in VR, or just closed: hide it.
+// (exec.c, device.c, audio.c) The calibration prompt is up in VR, or just closed: hide it.
 bool motion_vr_calibration_hidden(void) {
-    extern uint64_t renderer_present_count(void);
-    const uint64_t f = atomic_load(&calibration_frame);
-    return f && renderer_present_count() + 1 <= f + 40;
+    const uint64_t now = cal_now();
+    if (cal_running()) return true;
+    const uint64_t end = atomic_load(&cal_run_end), last = atomic_load(&cal_last_call);
+    const uint64_t over = end > last ? end : last;  // (closed, or stopped being called)
+    return over && now <= over + CAL_FADE_FRAMES;
 }
 
-// (input.c, each pad poll) Buttons the port presses: Y, pulsed, while the calibration runs in VR.
+// (input.c, each pad poll) Buttons the port presses: Y, pulsed, while the prompt waits for it in VR.
 uint64_t motion_auto_buttons(void) {
-    if (!auto_calibrating()) return 0;
-    extern uint64_t renderer_present_count(void);
-    return (renderer_present_count() / 6) % 2 ? 0 : 1u << 3;  // (Npad Y, pressed 6 frames of every 12)
+    if (!cal_running() || atomic_load(&cal_state) != 1) return 0;
+    return (cal_now() / 6) % 2 ? 0 : 1u << 3;  // (Npad Y, pressed 6 frames of every 12)
 }
 
 // TEMP (RE) SKYRECOMP_TEMP_MOTION_GATE=1: f_7000a17aa8 / f_7000a17be0 (player: "motion input active?") logged on change
