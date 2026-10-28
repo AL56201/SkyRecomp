@@ -20,6 +20,7 @@
 
 #include "hle.h"
 #include "vr_xr.h"
+#include "vr_internal.h"
 #include "nvn/vulkan/JoyConTranslator.h"
 
 enum {
@@ -247,6 +248,7 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
         if (b_down && !b_was_down && menu_is_open()) menu_vr_close();
         b_was_down = b_down;
     }
+    vr_pointer_set_aim(s.active && s.hand[1].tracked, s.hand[1].orientation, s.hand[1].position);  // (menu pointer)
     // The game's motion sensors follow the aim poses (where each controller points); the grip poses (the controller
     // in the palm) place the wrist HUD.
     SkyVrHand grip[2] = {0};

@@ -18,3 +18,7 @@
 const float *vr_reference_pose(void);         // the head pose the game camera stands for {qx, qy, qz, qw, px, py, pz}
 bool vr_eye_pose(int eye, float pose[7]);     // this frame's eye pose (OpenXR local space)
 bool vr_eye_tangents(int eye, float tan[4]);  // this frame's eye field: tangents left, right, up, down
+
+// ---- vr_controls.c: the menu pointer
+void vr_pointer_set_aim(bool tracked, const float orientation[4], const float position[3]);  // (vr_input.c)
+void vr_controls_set_hud_panel(const float m[16]);  // (vr.c) the panel it aims at

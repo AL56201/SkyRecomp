@@ -1231,6 +1231,13 @@ static XrPosef hud_pose(void) {
     float m[16];
     const float dt = frame.display_period > 0 ? (float)frame.display_period * 1e-9f : 1.0f / 90.0f;
     ComputeHUDQuadMatrixDelta(m, head, NULL, dt);
+    {   // (the menu pointer, vr_controls.c) the panel with its half extents as axes
+        const float hw = 0.8f * g_vr_hud_config.hud_scale, hh = hw * HUD_H / HUD_W;
+        float h[16];
+        memcpy(h, m, sizeof h);
+        for (int r = 0; r < 3; r++) h[r * 4 + 0] *= hw, h[r * 4 + 1] *= hh;
+        vr_controls_set_hud_panel(h);
+    }
     // rotation (columns right, up, back) -> quaternion
     const float r00 = m[0], r01 = m[1], r02 = m[2], r10 = m[4], r11 = m[5], r12 = m[6], r20 = m[8], r21 = m[9], r22 = m[10];
     XrQuaternionf q;
