@@ -37,25 +37,36 @@ _Static_assert(offsetof(SensorState, accel) == 0x10 && offsetof(SensorState, dir
 
 static _Atomic int auto_joycon;
 
-// This coordinator owns the entire legacy sequence: create the pointing/Y modal, wait, request recalibration, wait
-// again, then tear it down. Bypass the coordinator itself in VR, before any modal/audio/calibration state exists.
-// JoyDual HID remains active throughout; desktop/controller behavior is untouched.
+// This coordinator owns the game's pointer calibration: the "point at the screen and press Y" modal, the
+// recalibration request, then teardown. The game's cursor stays off until it has run. In VR it runs, answered by
+// the port: while it is active the right Joy-Con points at the screen's centre (the HUD panel's centre, where the
+// menu pointer's mapping starts: vr_controls.c) and Y is pressed for the player (input.c motion_auto_buttons).
+// SKYRECOMP_VR_MOTION_CALIBRATION=1: the game's own modal in VR too (the player presses Y).
 #define LEGACY_CALIBRATION_COORDINATOR 0x7000dd2a68ull
-#define CONTROLLER_MANAGER_PTR (MAIN_BASE + 0x1827380)
 static GuestFn legacy_calibration_coordinator;
-static void vr_skip_legacy_calibration(Cpu *c) {
-    if (!vr_requested()) {
-        legacy_calibration_coordinator(c);
-        return;
+static _Atomic uint64_t calibration_frame;  // (present count + 1 of the coordinator's last run in VR; 0 never)
+static bool auto_calibrating(void) {
+    extern uint64_t renderer_present_count(void);
+    const uint64_t f = atomic_load(&calibration_frame);
+    return f && renderer_present_count() + 1 <= f + 2;
+}
+static void vr_auto_calibration(Cpu *c) {
+    static int keep = -1;
+    if (keep < 0) keep = getenv("SKYRECOMP_VR_MOTION_CALIBRATION") != NULL;
+    if (vr_requested() && !keep) {
+        extern uint64_t renderer_present_count(void);
+        static int logged;
+        if (!logged++) LOG("[motion] VR: the pointer calibration is answered automatically (pointing at the centre)\n");
+        atomic_store(&calibration_frame, renderer_present_count() + 1);
     }
-    static int logged;
-    if (!logged++) LOG("[motion] VR: legacy manual-calibration coordinator disabled\n");
+    legacy_calibration_coordinator(c);
+}
 
-    // Preserve the coordinator's unconditional tail update of the controller manager.
-    c->x[0] = *(uint64_t *)(uintptr_t)CONTROLLER_MANAGER_PTR;
-    if (!c->x[0]) return;
-    uint64_t update = *(uint64_t *)(uintptr_t)(*(uint64_t *)(uintptr_t)c->x[0] + 0x30);
-    if (update) guest_call(c, update);
+// (input.c, each pad poll) Buttons the port presses: Y, pulsed, while the calibration runs in VR.
+uint64_t motion_auto_buttons(void) {
+    if (!auto_calibrating()) return 0;
+    extern uint64_t renderer_present_count(void);
+    return (renderer_present_count() / 6) % 2 ? 0 : 1u << 3;  // (Npad Y, pressed 6 frames of every 12)
 }
 
 // TEMP (RE) SKYRECOMP_TEMP_MOTION_GATE=1: f_7000a17aa8 / f_7000a17be0 (player: "motion input active?") logged on change
@@ -83,7 +94,7 @@ void motion_vr_init(void) {
     }
     legacy_calibration_coordinator = dispatch_lookup(LEGACY_CALIBRATION_COORDINATOR);
     if (legacy_calibration_coordinator)
-        hle_override(LEGACY_CALIBRATION_COORDINATOR, vr_skip_legacy_calibration, "vr_skip_legacy_motion_calibration");
+        hle_override(LEGACY_CALIBRATION_COORDINATOR, vr_auto_calibration, "vr_auto_motion_calibration");
     else
         LOG("[motion] warning: legacy calibration hook unavailable\n");
 }
@@ -202,6 +213,7 @@ static void motion_sample(uint8_t device, SensorState *s) {
     s->accel[2] = -1.0f;
     s->direction[0] = s->direction[4] = s->direction[8] = 1.0f;
     if (test_sample(device, s)) return;
+    if (device == DEVICE_RIGHT && auto_calibrating()) return;  // (VR calibration: pointing at the centre, still)
     VrJoyConSensor v;
     if (device > DEVICE_RIGHT || !vr_joycon_sensor(device, &v)) return;
     memcpy(s->accel, v.accel, sizeof s->accel);

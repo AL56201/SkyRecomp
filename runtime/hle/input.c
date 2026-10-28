@@ -656,6 +656,7 @@ static void fill_state(Cpu *c, uint32_t attributes) {
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
+    { extern uint64_t motion_auto_buttons(void); b |= motion_auto_buttons(); }  // (VR: the pointer calibration's Y)
     VrJoyConState vj;  // VR motion controllers as Joy-Cons (runtime/vr.h): their buttons and sticks on top of the rest
     if (!menu && vr_joycon_state(&vj)) {
         b |= vj.buttons;  // (the Npad button bits)
