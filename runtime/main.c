@@ -186,6 +186,7 @@ static void boot(const char *root) {
     kernel_init();
     dispatch_init();
     { extern void custom_tex_init(void); custom_tex_init(); }
+    { extern void vr_world_init(void); vr_world_init(); }  // (VR: the world keeps drawing behind the map)
     { extern void vr_cull_init(void); vr_cull_init(); }  // (VR: objects outside the game camera's view are drawn)
 
     uint32_t stack_size = 0x100000;

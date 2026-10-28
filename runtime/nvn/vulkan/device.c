@@ -710,10 +710,10 @@ void present_game_hooks(uint64_t frame) {
 static char g_post_shot[64];  // (eye shots) eye 0 after vk_vr_eye_post, saved this frame
 
 // SKYRECOMP_VR_PACE_TRACE=1: the VR present's CPU time by part (ms per frame, every 300 frames)
-enum { PT_POLL, PT_HEAD, PT_POST, PT_EYECOPY, PT_MIRROR_ACQ, PT_MIRROR_DRAW, PT_MENU, PT_MIRROR_END,
+enum { PT_POLL, PT_HEAD, PT_FREEZE, PT_POST, PT_EYECOPY, PT_HUD, PT_MIRROR_ACQ, PT_MIRROR_DRAW, PT_MENU, PT_MIRROR_END,
        PT_SUBMIT, PT_ENDFRAME, PT_TAIL, PT_N };
-static const char *const pt_name[PT_N] = {"vr_poll", "head", "eye post", "eye copies (+acquire/wait)",
-                                          "mirror acquire", "mirror draw", "menu",
+static const char *const pt_name[PT_N] = {"vr_poll", "head", "freeze", "eye post", "eye copies (+acquire/wait)",
+                                          "HUD quad (+acquire)", "mirror acquire", "mirror draw", "menu",
                                           "mirror submit+present", "submit", "xrEndFrame", "after present"};
 static uint64_t pt_ns[PT_N], pt_last, pt_frames;
 static inline void pt_mark(int part) {
@@ -745,6 +745,8 @@ void backend_present(NvnTexture *t) {
     static uint64_t pres_count;
     if (++pres_count % 60 == 1) LOG("[vk] present frame %llu\n", (unsigned long long)pres_count);
     g_last_presented = t;
+    extern void vk_hud_note_presented(NvnTexture *t);  // (exec.c: the VR HUD layer's "this is the screen")
+    vk_hud_note_presented(t);
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
@@ -786,9 +788,24 @@ void backend_present(NvnTexture *t) {
                 renderer_save_texture_tex(b, p0);
                 if (b->vr_eye) renderer_save_texture_tex(b->vr_eye, p1);
                 snprintf(g_post_shot, sizeof g_post_shot, list ? "build/vr_post0_%ld.png" : "build/vr_post0.png", at[i]);
+                extern TexBackend *vk_hud_backend(void);  // (exec.c: the 2D layer, SKYRECOMP_VR_HUD_LAYER)
+                if (vk_hud_backend()) {
+                    char ph[64];
+                    snprintf(ph, sizeof ph, list ? "build/vr_hud_%ld.png" : "build/vr_hud.png", at[i]);
+                    extern void vk_save_texture_raw(TexBackend *b, const char *path);
+                    vk_save_texture_raw(vk_hud_backend(), ph);  // (raw bytes: its alpha is the point)
+                }
                 LOG("[vr] eye shots at frame %ld: eye 1 image %s\n", at[i], b->vr_eye ? "saved" : "missing");
             }
         }
+        extern void vk_hud_present(NvnTexture *screen);  // (exec.c: full-screen 2D frames -> the HUD texture)
+        vk_hud_present(t);
+        {   // full-screen 2D (the map): the eyes keep the last 3D frame
+            extern bool vk_hud_layer_on(void), vk_hud_opaque(void), vk_hud_frame_had_scene(void);
+            const bool had_scene = vk_hud_frame_had_scene();
+            vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene, had_scene);  // (world mode: live)
+        }
+        pt_mark(PT_FREEZE);
         TexBackend *mirror_src = b;  // (the desktop mirror shows eye 0 as the headset gets it: no second post chain)
         {   // each eye: anti-aliased and filtered to the headset's eye size (exec.c vk_vr_eye_post), then copied
             extern TexBackend *vk_vr_eye_post(int eye, TexBackend *b, uint32_t ow, uint32_t oh);
@@ -809,6 +826,18 @@ void backend_present(NvnTexture *t) {
                                  renderer_origin_lower_left(), (uint32_t)p0->format, p0->layer0, p1 ? p1->layer0 : p0->layer0);
             vk_label_end(vk_cmd());
             pt_mark(PT_EYECOPY);
+        }
+        {   // the 2D layer (exec.c HUD texture) onto the HUD panel
+            extern bool vk_hud_layer_on(void), vk_hud_opaque(void);
+            extern TexBackend *vk_hud_backend(void);
+            TexBackend *hb = vk_hud_layer_on() ? vk_hud_backend() : NULL;
+            if (hb) {
+                vk_label_begin(vk_cmd(), "[VR] HUD Quad");
+                vr_record_hud_copy((void *)vk_cmd(), (void *)hb->image, hb->width, hb->height, renderer_origin_lower_left(),
+                                   vk_hud_opaque());
+                vk_label_end(vk_cmd());
+            }
+            pt_mark(PT_HUD);
         }
         // Desktop mirror: the left eye, with the menu.
         static const float mirror_black[4] = {0, 0, 0, 1};

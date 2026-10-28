@@ -41,6 +41,7 @@ typedef struct {
     float vr_foveation_outer;  // fraction of half-FOV where 4x4 shading begins (when supported)
     bool vr_fast_post;   // bypass optional VR SMAA/upscale/sharpen passes
     bool async_replay;   // Multithreaded Rendering: commands replayed on their own thread (nvn/async.c), next launch
+    bool vr_world_in_menus;  // VR: the 3D world stays around the map and other full-screen menus (hle/vr_world.c)
     float vr_near_clip;  // VR 1st person: geometry nearer than this is clipped, game units (5..40): vr_rig.c
     int frame_rate;       // 60, 120 or 144 (in VR, the high ones follow the headset); the Skyward Sword simulation step follows this target
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick

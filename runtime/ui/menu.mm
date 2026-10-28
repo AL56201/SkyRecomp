@@ -27,6 +27,7 @@ extern "C" {
 #include "../hle.h"
 #include "../settings.h"
 #include "../vr/vr_settings.h"
+#include "../vr/vr_hud.h"
 #include "../vr/vr.h"
 #include "menu.h"
 extern "C" bool input_free_cam_active(void);  // runtime/hle/input.c: free camera session toggle
@@ -659,6 +660,9 @@ static void tab_vr_options(void) {
                           "Bypasses optional SMAA, upscale and sharpening passes. OpenXR output remains native-sized. "
                           "Useful for measuring post-processing GPU cost. "
                           "Changes apply live.");
+    changed |= opt_toggle("World Behind Menus", &g_settings.vr_world_in_menus, true,
+                          "Keeps the 3D world around you while the map and other full-screen menus are open; the menu "
+                          "floats in front of it. Off: the classic black background. Applies from the next menu opened.");
     changed |= opt_toggle("Adaptive VR Resolution", &g_vr_config.dynamic_resolution, false,
                           "Keeps the highest resolution that fits the headset frame budget. It lowers resolution "
                           "under sustained load and restores quality gradually when performance recovers.");
@@ -666,6 +670,37 @@ static void tab_vr_options(void) {
                           g_vr_config.resolution_scale, 0.05f, 0.7f, "%.2fx",
                           "Lowest resolution Adaptive VR Resolution may use. The VR Resolution value above remains "
                           "the quality ceiling.");
+
+    opt_section("Wrist HUD");
+    changed |= opt_toggle("Enable Wrist HUD", &g_vr_hud_config.wrist_hud, true,
+                          "During gameplay, places the status modules on the left wrist and item modules on the "
+                          "right wrist. Title, file select and full-screen menus keep the normal floating panel.");
+    changed |= opt_toggle("Show Status When Viewed", &g_vr_hud_config.wrist_hud_glance, false,
+                          "Shows the left status wrist only while its back is turned toward your view. The item wrist "
+                          "remains available.");
+    changed |= opt_toggle("Swap Wrist HUD Hands", &g_vr_hud_config.wrist_hud_swap_hands, false,
+                          "Moves status modules to the right hand and item modules to the left hand.");
+    changed |= opt_slider("Wrist HUD Size", &g_vr_hud_config.wrist_hud_size, 0.08f, 0.50f, 0.01f, 0.20f, "%.2f m",
+                          "Physical width and height of each wrist panel.");
+    changed |= opt_slider("Wrist HUD Sideways", &g_vr_hud_config.wrist_hud_side, -0.20f, 0.20f, 0.01f, 0.12f, "%.2f m",
+                          "Moves each panel outward or inward from its controller grip.");
+    changed |= opt_slider("Wrist HUD Up", &g_vr_hud_config.wrist_hud_up, -0.20f, 0.20f, 0.01f, 0.02f, "%.2f m",
+                          "Moves each panel above or below its controller grip.");
+    changed |= opt_slider("Wrist HUD Along Arm", &g_vr_hud_config.wrist_hud_forward, -0.20f, 0.25f, 0.01f, 0.10f, "%.2f m",
+                          "Moves each panel along the hand and forearm axis.");
+    changed |= opt_slider("Wrist HUD Tilt", &g_vr_hud_config.wrist_hud_tilt, -90.0f, 90.0f, 5.0f, 0.0f, "%+g deg",
+                          "Tilts both panels relative to the backs of the hands.");
+    changed |= opt_slider("Wrist Background", &g_vr_hud_config.wrist_hud_background, 0.0f, 0.85f, 0.05f, 0.46f, "%g",
+                          "Opacity of the dark translucent backing behind each wrist HUD.");
+    if (opt_action("Reset Wrist HUD", "", "Restores wrist size, placement, tilt and background opacity.")) {
+        g_vr_hud_config.wrist_hud_size = 0.20f;
+        g_vr_hud_config.wrist_hud_side = 0.12f;
+        g_vr_hud_config.wrist_hud_up = 0.02f;
+        g_vr_hud_config.wrist_hud_forward = 0.10f;
+        g_vr_hud_config.wrist_hud_tilt = 0.0f;
+        g_vr_hud_config.wrist_hud_background = 0.46f;
+        changed = true;
+    }
 
     opt_section("View");
     changed |= opt_slider("World Scale", &g_vr_config.world_scale, 50.0f, 200.0f, 5.0f, 100.0f, "%g%%",

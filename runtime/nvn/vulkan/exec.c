@@ -1619,7 +1619,10 @@ static void begin_pass(void) {
         float gsx = 1, gsy = 1;
         renderer_get_scale(&gsx, &gsy);
         const bool eye_sized = vr_stereo_active() && gsx > 1.0f && fabsf(pass_sx - gsx) < 1e-3f && minw >= 512;
-        if (eye_sized) snprintf(name, sizeof name, "[VR] Eye %d %s %ux%u", vk_vr_eye() ? 1 : 0,
+        const NvnTexture *t0 = st.rt.ncolor ? st.rt.color[0] : st.rt.depth;
+        extern TexBackend *vk_hud_backend(void);
+        if (t0 && t0->backend && t0->backend == vk_hud_backend()) snprintf(name, sizeof name, "[VR] HUD");
+        else if (eye_sized) snprintf(name, sizeof name, "[VR] Eye %d %s %ux%u", vk_vr_eye() ? 1 : 0,
                                      st.rt.depth ? "Scene" : "Post Processing", minw, minh);
         else snprintf(name, sizeof name, "%sOffscreen %ux%u", vr_stereo_active() ? (vk_vr_eye() ? "[VR] Eye 1 " : "[VR] Eye 0 ") : "",
                       minw, minh);
@@ -2373,12 +2376,25 @@ typedef struct { NvnTexture *key; TexBackend copy; } Snap;
 static Snap snaps[16];
 static int nsnaps;
 
+// VR HUD layer (see draw()): while a 2D-layer draw renders into the HUD texture, reads of the presented image (the
+// map's parchment composites the map drawn so far) read the HUD texture instead.
+static NvnTexture *g_hud_sub_from, *g_hud_sub_to;
+static NvnTexture *g_menu_screen;  // (the screen the last HUD draw was redirected from)
+// (the game samples it through other texture objects over the same memory: matched by address and size)
+static inline NvnTexture *hud_sub(NvnTexture *t) {
+    if (!t || !g_hud_sub_from) return t;
+    if (t == g_hud_sub_from) return g_hud_sub_to;
+    if (t->addr && t->addr == g_hud_sub_from->addr && t->width == g_hud_sub_from->width && t->height == g_hud_sub_from->height)
+        return g_hud_sub_to;
+    return t;
+}
+
 static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
     int slot = ((int)st_->handle_offset - 0x20) / 8;
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
-    return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+    return hud_sub(((NvnTexEntry *)st.tpool->entries)[tic].tex);
 }
 
 static bool is_attachment(NvnTexture *t) {
@@ -3317,7 +3333,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
             // A deferred depth copy can change which image owns this texture's
             // contents within the same frame. Cache the resolved source, not
             // the destination object (otherwise a shadow lookup can reuse old depth).
-            NvnTexture *etex = e->tex;
+            NvnTexture *etex = hud_sub(e->tex);
             NvnTexture *read_tex = naliases ? alias_read(etex) : etex;
             uint64_t vh = e->has_view ? hash_words(0, &e->view, sizeof e->view) : 0, frame = vk_frame_counter();
             uint32_t ms = (uint32_t)((((uintptr_t)read_tex >> 4) ^ vh ^ (uint64_t)st_->type * 0x9E3779B97F4A7C15ull ^
@@ -3686,12 +3702,243 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
 
 static void draw_(CmdRec *r, bool indexed);
 
+// ---- VR HUD layer: the game's 2D layer (HUD, menus, title, file select, map) drawn once per frame into its own
+// 16:9 texture instead of into each eye, for an OpenXR panel. Its draws are the last of a frame: an orthographic
+// 192-byte camera block (vertex slot 0) and the presented image as target (measured on the title, file select,
+// gameplay and map screens). On by default in VR; SKYRECOMP_VR_HUD_LAYER=0 turns it off.
+static NvnTexture g_hud_tex, g_hud_depth;  // (its own depth / stencil: some 2D draws depth-test, e.g. the map islands)
+static uint64_t g_hud_cleared = ~0ull;
+
+bool vk_hud_layer_enabled(void) {  // (on by default; SKYRECOMP_VR_HUD_LAYER=0 draws the 2D layer into the eyes)
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("SKYRECOMP_VR_HUD_LAYER"); on = !e || atoi(e) != 0; }
+    return on;
+}
+
+bool vk_hud_layer_on(void) { return vk_hud_layer_enabled() && vr_stereo_active(); }
+
+// The images the game presented lately (device.c backend_present): the screen this frame will present is one of
+// them. (A texture's "presented" mark is for good: the game reuses images, the map draws its islands into one.)
+static struct { NvnTexture *t; uint64_t frame; } g_recent_presented[4];
+void vk_hud_note_presented(NvnTexture *t) {
+    const uint64_t f = renderer_present_count();
+    int slot = 0;
+    for (int i = 0; i < 4; i++) {
+        if (g_recent_presented[i].t == t) { slot = i; break; }
+        if (g_recent_presented[i].frame < g_recent_presented[slot].frame) slot = i;
+    }
+    g_recent_presented[slot].t = t;
+    g_recent_presented[slot].frame = f;
+}
+static bool recently_presented(const NvnTexture *t) {
+    const uint64_t f = renderer_present_count();
+    for (int i = 0; i < 4; i++)
+        if (t && g_recent_presented[i].t == t && g_recent_presented[i].frame + 4 >= f) return true;
+    return false;
+}
+
+static bool is_hud_draw(void) {
+    NvnTexture *c = st.rt.ncolor ? st.rt.color[0] : NULL;
+    const TexBackend *b = c ? (const TexBackend *)c->backend : NULL;
+    const Range c0 = st.ubuf[0][0];
+    if (!b || !recently_presented(c) || !c0.addr || c0.size != 192) return false;
+    const float *f = (const float *)(uintptr_t)c0.addr;
+    return fabsf(f[15] - 1) < 1e-4f && fabsf(f[12]) < 1e-4f && fabsf(f[13]) < 1e-4f && fabsf(f[14]) < 1e-4f;
+}
+
+// The HUD texture's backend (NULL before the first HUD draw).
+TexBackend *vk_hud_backend(void) { return g_hud_tex.backend; }
+
+// Made like the presented image but 1920x1080 and not resolution-scaled (the game lays its 2D layer out in those
+// pixels), host-only (no guest memory: never uploaded).
+static NvnTexture *hud_texture(const NvnTexture *like) {
+    if (!g_hud_tex.width) {
+        g_hud_tex = *like;
+        g_hud_tex.width = 1920;
+        g_hud_tex.height = 1080;
+        g_hud_tex.depth = 1;
+        g_hud_tex.levels = 1;
+        g_hud_tex.samples = 1;
+        g_hud_tex.target = 1;
+        g_hud_tex.flags &= ~8u;  // (not a scaled render target)
+        g_hud_tex.addr = 0;
+        g_hud_tex.pool = NULL;
+        g_hud_tex.pool_offset = 0;
+        g_hud_tex.backend = NULL;
+        g_hud_tex.pending_rgba = NULL;
+        snprintf(g_hud_tex.label, sizeof g_hud_tex.label, "vr-hud");
+    }
+    return &g_hud_tex;
+}
+
+static NvnTexture *hud_depth(const NvnTexture *like) {
+    if (!like) return NULL;
+    if (!g_hud_depth.width) {
+        g_hud_depth = *like;
+        g_hud_depth.width = 1920;
+        g_hud_depth.height = 1080;
+        g_hud_depth.depth = 1;
+        g_hud_depth.levels = 1;
+        g_hud_depth.samples = 1;
+        g_hud_depth.target = 1;
+        g_hud_depth.flags &= ~8u;
+        g_hud_depth.addr = 0;
+        g_hud_depth.pool = NULL;
+        g_hud_depth.pool_offset = 0;
+        g_hud_depth.backend = NULL;
+        g_hud_depth.pending_rgba = NULL;
+        snprintf(g_hud_depth.label, sizeof g_hud_depth.label, "vr-hud-depth");
+    }
+    return &g_hud_depth;
+}
+
+// Once per frame, before the frame's first draw: the HUD texture becomes fully transparent (a frame without HUD
+// draws leaves it empty).
+static void hud_clear_for_frame(void) {
+    const uint64_t frame = renderer_present_count();
+    if (frame == g_hud_cleared || !g_hud_tex.backend || vk_vr_eye()) return;
+    g_hud_cleared = frame;
+    vk_end_pass();
+    TexBackend *b = vk_tex(&g_hud_tex, true);
+    VkClearColorValue zero = {{0, 0, 0, 0}};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, b->layer0, 1};
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+    if (g_hud_depth.backend) {  // (depth 0: the game's reversed-Z far plane; stencil 0)
+        TexBackend *d = vk_tex(&g_hud_depth, true);
+        VkClearDepthStencilValue dz = {0.0f, 0};
+        VkImageSubresourceRange da = {d->aspect, 0, 1, d->layer0, 1};
+        vkCmdClearDepthStencilImage(cb, d->image, VK_IMAGE_LAYOUT_GENERAL, &dz, 1, &da);
+    }
+    vk_full_barrier(cb);
+    st.rt_dirty = true;  // (the next draw begins its pass again)
+}
+
+// Full-screen 2D (the map, menus with no 3D scene behind): the previous frame drew no scene. Nothing is redirected
+// then; at present the screen's 16:9 box goes to the HUD texture whole (vk_hud_present), opaque.
+static uint64_t g_last_scene_frame;
+static bool g_scene_since_present;  // a scene draw since the last present (vk_hud_frame_had_scene)
+static bool hud_full2d(void) { return renderer_present_count() > g_last_scene_frame + 1; }
+// (hle/vr_world.c) A full-screen menu pauses the game while the world keeps drawing behind it: its 2D layer is
+// redirected whole and shown opaque, drawn with the game's own blending (the map's parchment blends over its islands
+// by the destination's alpha, which the coverage alpha below would replace).
+extern bool vr_world_menu_active(void);
+bool vk_hud_opaque(void) { return hud_full2d() || vr_world_menu_active(); }
+
+static CmdRec *g_hud_rec;  // (the draw being routed)
+static bool g_hud_candidate;  // this draw is drawn like the 2D layer (decided in draw_ once its program is known)
+static bool g_hud_active;     // this draw renders into the HUD texture: draw() restores the targets afterwards
+static RtState g_hud_saved_rt;
+
+// (device.c, at present, eye 0's screen) Full-screen 2D frames: the screen's centred 16:9 box (where the game's
+// layout sits; the eye image's taller or wider rest shows what a 16:9 screen would not) becomes the HUD texture.
+// (device.c, at present) Whether the frame being presented drew a 3D scene; resets for the next frame.
+bool vk_hud_frame_had_scene(void) {
+    const bool had = g_scene_since_present;
+    g_scene_since_present = false;
+    return had;
+}
+
+void vk_hud_present(NvnTexture *screen) {
+    if (!vk_hud_layer_on() || !hud_full2d() || !screen || !screen->backend) return;
+    NvnTexture *hud = hud_texture(screen);
+    TexBackend *d = vk_tex(hud, true), *s = (TexBackend *)screen->backend;
+    float u = fminf(s->sx, s->sy);
+    if (!(u > 0)) u = 1;
+    const int bw = (int)lroundf(1920 * u), bh = (int)lroundf(1080 * u);
+    const int x0 = ((int)s->width - bw) / 2, y0 = ((int)s->height - bh) / 2;
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkImageBlit bl = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, s->layer0, 1}, .srcOffsets = {{x0, y0, 0}, {x0 + bw, y0 + bh, 1}},
+                      .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, d->layer0, 1}, .dstOffsets = {{0, 0, 0}, {(int)d->width, (int)d->height, 1}}};
+    vkCmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
+    vk_full_barrier(cb);
+}
+
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
+    g_hud_rec = r;
+    g_hud_candidate = vk_hud_layer_on() && st.program && (hud_clear_for_frame(), !hud_full2d()) && is_hud_draw();
+    // World behind a menu (hle/vr_world.c): the menu's own passes that read the screen back (the map's islands,
+    // drawn there first, then captured into its map texture) read the HUD texture, where its 2D layer now is.
+    const bool menu_sub = !g_hud_candidate && g_menu_screen && g_hud_tex.backend && vk_hud_layer_on() && vr_world_menu_active();
+    if (menu_sub) g_hud_sub_from = g_menu_screen, g_hud_sub_to = &g_hud_tex;
     eye_memo_rec = r;
     draw_(r, indexed);
     eye_memo_rec = NULL;
+    if (menu_sub && !g_hud_active) g_hud_sub_from = g_hud_sub_to = NULL;
+    if (g_hud_active) {
+        st.rt = g_hud_saved_rt;
+        st.rt_dirty = true;
+        g_hud_sub_from = g_hud_sub_to = NULL;
+        g_hud_active = false;
+    }
+    g_hud_candidate = false;
     PROF_ADD(prof_draw);
+}
+
+// (draw_, its program known) Where a 2D-layer draw goes. Some of the 2D layer's draws composite the 3D scene
+// (bloom, the title's haze, the file select's backdrop): they read a texture made from this frame's scene and stay
+// in the eyes. The rest renders once, in eye 0, into the HUD texture; eye 1 skips it. False: skip the draw.
+static bool hud_route(Prog *pr) {
+    const uint64_t fr1 = renderer_present_count() + 1;
+    bool reads_scene = false;
+    for (int i = 0; i < pr->fi->ntex && i < 64 && !reads_scene; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+        reads_scene = b && b->scene_frame == fr1 && !recently_presented(t);
+    }
+    if (reads_scene) {
+        // Full-screen scene composites (the title's haze, the additive glow) are unit quads (vertex positions 0..1)
+        // and stay in the eyes. A panel's frosted backdrop reads the scene too, but sits in the 2D layout (canvas
+        // positions, e.g. the file's info box): it belongs on the panel.
+        const float *vb = st.vbuf[0].addr && st.vbuf[0].size >= 48 ? (const float *)(uintptr_t)st.vbuf[0].addr : NULL;
+        bool unit = vb && g_hud_rec && g_hud_rec->x[2] <= 6;
+        for (int i = 0; unit && i < 12; i++) unit = isfinite(vb[i]) && vb[i] >= -0.01f && vb[i] <= 1.01f;
+        if (unit) return true;  // (drawn normally, both eyes)
+    }
+    if (vk_vr_eye()) return false;
+    NvnTexture *hud = hud_texture(st.rt.color[0]);
+    NvnTexture *hd = hud_depth(st.rt.depth);
+    if (!hud->backend || (hd && !hd->backend)) {  // (first use: made now, cleared for this frame)
+        vk_tex(hud, true);
+        if (hd) vk_tex(hd, true);
+        g_hud_cleared = ~0ull;
+        hud_clear_for_frame();
+    }
+    g_hud_saved_rt = st.rt;
+    st.rt = (RtState){0};
+    st.rt.ncolor = 1;
+    st.rt.color[0] = hud;
+    st.rt.depth = hd;
+    st.rt_dirty = true;
+    g_hud_sub_from = g_menu_screen = g_hud_saved_rt.color[0];
+    g_hud_sub_to = hud;
+    g_hud_active = true;
+    return true;
+}
+
+// (draw_) Marks the targets of a draw that renders this frame's scene, or something made from it.
+static void hud_mark_scene_targets(Prog *pr) {
+    const uint64_t fr1 = renderer_present_count() + 1;
+    bool scene = false;
+    const Range c0 = st.ubuf[0][0];
+    if (c0.addr && c0.size >= 112) {
+        extern bool sky_vr_is_scene_projection(const float *ubo, uint64_t bytes);
+        scene = sky_vr_is_scene_projection((const float *)(uintptr_t)c0.addr, c0.size);
+        if (scene) g_last_scene_frame = renderer_present_count(), g_scene_since_present = true;
+    }
+    for (int i = 0; i < pr->fi->ntex && i < 64 && !scene; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+        scene = b && b->scene_frame == fr1;
+    }
+    if (!scene) return;
+    for (int i = 0; i < st.rt.ncolor; i++)
+        if (st.rt.color[i] && st.rt.color[i] != &g_hud_tex && st.rt.color[i]->backend)
+            ((TexBackend *)st.rt.color[i]->backend)->scene_frame = fr1;
 }
 
 static uint64_t prof_tp_;
@@ -3721,6 +3968,8 @@ static void draw_(CmdRec *r, bool indexed) {
         stat_skipped++;
         return;
     }
+    if (g_hud_candidate && !hud_route(pr)) { stat_skipped++; return; }  // (VR HUD layer, see draw())
+    if (vk_hud_layer_on()) hud_mark_scene_targets(pr);
     {   // SKYRECOMP_VR_DRAW_LOG=<frame>: that frame's draws (eye 0)
         static long at = -2;
         if (at == -2) { const char *e = getenv("SKYRECOMP_VR_DRAW_LOG"); at = e ? atol(e) : -1; }
@@ -3936,6 +4185,13 @@ static void draw_(CmdRec *r, bool indexed) {
             k.blend_on |= (uint8_t)(1u << i);
             memcpy(k.blend[i], st.blend[i], 8);
         }
+    }
+    if (g_hud_sub_from && k.ncolor && k.color[0] != VK_FORMAT_UNDEFINED && !vr_world_menu_active()) {
+        // VR HUD layer: the game writes its 2D layer with RGB-only masks (the screen's alpha was never used). The HUD
+        // texture accumulates coverage in alpha instead (alpha = src + dst * (1 - src)), colour blending unchanged:
+        // premultiplied colour over transparent black, ready to be composited on the panel.
+        if (k.write_mask[0] & 7) k.write_mask[0] |= 8;
+        if (k.blend_on & 1) { k.blend[0][3] = 2; k.blend[0][4] = 6; }  // (NVN blend factors: ONE, ONE_MINUS_SRC_ALPHA)
     }
     k.a2c = st.ms[0xC] != 0;
     // NVN and Vulkan use the same logic-op values; OR preserves overlapping shadow-mask channels.
@@ -4555,6 +4811,7 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
     TexBackend *s = vk_tex(st_, false), *d = vk_tex(dt, true);
     mv_note_later(dt);  // (VR multiview: eye 1 copies its own later)
     renderer_mark_gpu_owned(dt);
+    if (s->scene_frame == renderer_present_count() + 1) d->scene_frame = s->scene_frame;  // (VR HUD layer: a scene copy)
     if (renderer_texture_presented(dt) && st_->width == dt->width && st_->height == dt->height) renderer_texture_mark_presented(st_);
     renderer_texture_first_write(dt);
     renderer_texture_level_fresh(dt);
@@ -5484,4 +5741,20 @@ void backend_submit_commands(void) {
     static int each = -1;
     if (each < 0) each = getenv("LARECOMP_VK_SUBMIT_EACH_LIST") != NULL || getenv("LARECOMP_SYNC_SUBMIT") != NULL;
     if (!each) renderer_submit();
+}
+
+// (test) An RGBA8 image's bytes as they are, alpha included (renderer_save_texture_tex draws through the present
+// shader, which writes alpha 1): the VR HUD layer's transparency.
+void vk_save_texture_raw(TexBackend *b, const char *path) {
+    if (!b || !b->image || (b->format != VK_FORMAT_R8G8B8A8_UNORM && b->format != VK_FORMAT_R8G8B8A8_SRGB)) return;
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkSpan out = vk_readback((uint64_t)b->width * b->height * 4);
+    VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, b->layer0, 1},
+                           .imageExtent = {b->width, b->height, 1}};
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, out.buf, 1, &c);
+    renderer_flush();
+    extern void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
+    vk_save_png(path, out.ptr, b->width, b->height);
 }

@@ -47,5 +47,13 @@ bool vr_patch_scene_fragment_ubo(uint32_t eye, float out[28], const float *in, u
 // recorded.
 bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_image, uint32_t sw, uint32_t sh,
                           bool flip_y, uint32_t source_format, uint32_t left_layer, uint32_t right_layer);  // (layers: of each image)
+// The game's 2D layer (exec.c HUD texture, VkImage in VK_IMAGE_LAYOUT_GENERAL, w x h) onto the HUD panel's swapchain,
+// recorded after vr_record_eye_copies. opaque: full-screen 2D (the panel shown alone, not blended).
+// For the next vr_record_eye_copies. freeze: full-screen 2D (no 3D scene): show the last 3D frame, at its own poses.
+// frame_is_3d: this frame drew a 3D scene; its eyes become that "last 3D frame".
+void vr_freeze_world(bool freeze, bool frame_is_3d);
+bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint32_t h, bool flip_y, bool opaque);
+// Latest OpenXR grip poses (vr_grip.c) for the wrist HUD: {qx, qy, qz, qw, px, py, pz} in the local space.
+void vr_set_grip_poses(bool left_tracked, const float left_pose[7], bool right_tracked, const float right_pose[7]);
 void vr_frame_end(void);
 extern float g_vr_gpu_ms;  // the last measured GPU frame time in ms (exec.c), for dynamic resolution

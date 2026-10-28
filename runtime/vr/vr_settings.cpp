@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "vr_hud.h"
+
 
 namespace {
 constexpr VRConfig kDefaults = {1.0f, true, false, 0.7f, 100.0f, 0, 0.0f, 0.0f, true};
@@ -82,7 +84,17 @@ bool any_section(const std::string &line) {
 }
 
 std::vector<std::string> vr_lines() {
-    std::ostringstream resolution, resolution_min, world, height, distance;
+    std::ostringstream resolution, resolution_min, world, height, distance, hud_distance, hud_scale, hud_offset,
+        wrist_size, wrist_side, wrist_up, wrist_forward, wrist_tilt, wrist_background;
+    hud_distance << std::fixed << std::setprecision(2) << g_vr_hud_config.hud_distance;
+    hud_scale << std::fixed << std::setprecision(2) << g_vr_hud_config.hud_scale;
+    hud_offset << std::fixed << std::setprecision(2) << g_vr_hud_config.hud_vertical_offset;
+    wrist_size << std::fixed << std::setprecision(2) << g_vr_hud_config.wrist_hud_size;
+    wrist_side << std::fixed << std::setprecision(2) << g_vr_hud_config.wrist_hud_side;
+    wrist_up << std::fixed << std::setprecision(2) << g_vr_hud_config.wrist_hud_up;
+    wrist_forward << std::fixed << std::setprecision(2) << g_vr_hud_config.wrist_hud_forward;
+    wrist_tilt << std::fixed << std::setprecision(1) << g_vr_hud_config.wrist_hud_tilt;
+    wrist_background << std::fixed << std::setprecision(2) << g_vr_hud_config.wrist_hud_background;
     resolution << std::fixed << std::setprecision(2) << g_vr_config.resolution_scale;
     resolution_min << std::fixed << std::setprecision(2) << g_vr_config.dynamic_resolution_min;
     world << std::fixed << std::setprecision(2) << g_vr_config.world_scale;
@@ -95,7 +107,17 @@ std::vector<std::string> vr_lines() {
             "world_scale = " + world.str(),
             "view_mode = " + std::to_string(g_vr_config.view_mode),
             "camera_height_offset = " + height.str(), "camera_distance_offset = " + distance.str(),
-            std::string("level_horizon = ") + (g_vr_config.level_horizon ? "true" : "false")};
+            std::string("level_horizon = ") + (g_vr_config.level_horizon ? "true" : "false"),
+            "hud_distance = " + hud_distance.str(), "hud_scale = " + hud_scale.str(),
+            "hud_vertical_offset = " + hud_offset.str(),
+            std::string("hud_curvature = ") + (g_vr_hud_config.curvature ? "true" : "false"),
+            std::string("hud_lock_to_head = ") + (g_vr_hud_config.lock_to_head ? "true" : "false"),
+            std::string("wrist_hud = ") + (g_vr_hud_config.wrist_hud ? "true" : "false"),
+            std::string("wrist_hud_glance = ") + (g_vr_hud_config.wrist_hud_glance ? "true" : "false"),
+            std::string("wrist_hud_swap_hands = ") + (g_vr_hud_config.wrist_hud_swap_hands ? "true" : "false"),
+            "wrist_hud_size = " + wrist_size.str(), "wrist_hud_side = " + wrist_side.str(),
+            "wrist_hud_up = " + wrist_up.str(), "wrist_hud_forward = " + wrist_forward.str(),
+            "wrist_hud_tilt = " + wrist_tilt.str(), "wrist_hud_background = " + wrist_background.str()};
 }
 } // namespace
 
@@ -105,6 +127,7 @@ extern "C" void ResetVRConfig(void) { g_vr_config = kDefaults; }
 
 extern "C" void LoadVRConfig(const char *filepath) {
     ResetVRConfig();
+    ResetVRHUDConfig();
     if (!filepath || !*filepath) return;
     std::ifstream file(filepath);
     if (!file) return;
@@ -129,13 +152,29 @@ extern "C" void LoadVRConfig(const char *filepath) {
         else if (key == "camera_height_offset") parse_float(value, g_vr_config.camera_height_offset);
         else if (key == "camera_distance_offset") parse_float(value, g_vr_config.camera_distance_offset);
         else if (key == "level_horizon") parse_bool(value, g_vr_config.level_horizon);
+        else if (key == "hud_distance") parse_float(value, g_vr_hud_config.hud_distance);
+        else if (key == "hud_scale") parse_float(value, g_vr_hud_config.hud_scale);
+        else if (key == "hud_vertical_offset") parse_float(value, g_vr_hud_config.hud_vertical_offset);
+        else if (key == "hud_curvature") parse_bool(value, g_vr_hud_config.curvature);
+        else if (key == "hud_lock_to_head") parse_bool(value, g_vr_hud_config.lock_to_head);
+        else if (key == "wrist_hud") parse_bool(value, g_vr_hud_config.wrist_hud);
+        else if (key == "wrist_hud_glance") parse_bool(value, g_vr_hud_config.wrist_hud_glance);
+        else if (key == "wrist_hud_swap_hands") parse_bool(value, g_vr_hud_config.wrist_hud_swap_hands);
+        else if (key == "wrist_hud_size") parse_float(value, g_vr_hud_config.wrist_hud_size);
+        else if (key == "wrist_hud_side") parse_float(value, g_vr_hud_config.wrist_hud_side);
+        else if (key == "wrist_hud_up") parse_float(value, g_vr_hud_config.wrist_hud_up);
+        else if (key == "wrist_hud_forward") parse_float(value, g_vr_hud_config.wrist_hud_forward);
+        else if (key == "wrist_hud_tilt") parse_float(value, g_vr_hud_config.wrist_hud_tilt);
+        else if (key == "wrist_hud_background") parse_float(value, g_vr_hud_config.wrist_hud_background);
     }
     validate(g_vr_config);
+    ValidateVRHUDConfig();
 }
 
 extern "C" void SaveVRConfig(const char *filepath) {
     if (!filepath || !*filepath) return;
     validate(g_vr_config);
+    ValidateVRHUDConfig();
 
     std::vector<std::string> input;
     std::ifstream source(filepath);

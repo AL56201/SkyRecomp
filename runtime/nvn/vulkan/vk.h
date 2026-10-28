@@ -99,6 +99,7 @@ typedef struct TexBackend {
     uint32_t unchanged_frames;
     bool scalable, presented;
     uint64_t touched_frame, frame_cleared;
+    uint64_t scene_frame;  // present count + 1 when this frame's 3D scene (or something made from it) was drawn into it (exec.c, VR HUD layer)
     uint32_t level_gen;
     float sx, sy;
     void *pending_rgba;  // host-produced pixels (video) waiting to be uploaded on the render thread

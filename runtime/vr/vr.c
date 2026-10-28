@@ -26,6 +26,7 @@
 #include "vr_rig.h"
 #include "vr_settings.h"
 #include "vr_stereo_cull.h"
+#include "vr_hud.h"
 #include "nvn/vulkan/shaders.h"
 #else
 #define SKYRECOMP_HAS_OPENXR 0
@@ -144,12 +145,32 @@ bool vr_render_scale(float *sx, float *sy) {
 
 static float reference_pose[7];         // head pose the game camera stands for (set on the first tracked frame)
 static bool reference_valid;
+// UI consumes the same raw grip samples as the controller renderer, but never feeds them back into Link or vr_rig.
+static bool hud_grip_tracked[2];
+static XrPosef hud_grip_pose[2];
+
+void vr_set_grip_poses(bool left_tracked, const float left[7], bool right_tracked, const float right[7]) {
+    const bool tracked[2] = {left_tracked, right_tracked};
+    const float *pose[2] = {left, right};
+    for (int h = 0; h < 2; h++) {
+        hud_grip_tracked[h] = tracked[h] && pose[h];
+        if (hud_grip_tracked[h]) {
+            hud_grip_pose[h].orientation = (XrQuaternionf){pose[h][0], pose[h][1], pose[h][2], pose[h][3]};
+            hud_grip_pose[h].position = (XrVector3f){pose[h][4], pose[h][5], pose[h][6]};
+        }
+    }
+}
+
 static struct {
     bool begun;     // xrBeginFrame succeeded; xrEndFrame is owed
     bool stereo;    // shouldRender and both eye views tracked: the renderer records both eyes
     bool acquired;  // a swapchain image was acquired and waited; xrReleaseSwapchainImage is owed
     bool copied;    // both eye layers were recorded: submit the projection layer
     uint32_t image;
+    bool hud_acquired, hud_copied;  // the HUD panel's swapchain image: acquired / recorded (submit the quad layer)
+    bool hud_opaque;                // full-screen 2D: the panel opaque, in front of the frozen world
+    bool frozen_used;               // the eyes show the frozen world (vr_freeze_world): its poses go in the layer
+    uint32_t hud_image;
     uint32_t patched[2];  // draws whose scene camera became the eye's (trace)
     XrTime display_time;
     XrDuration display_period;
@@ -164,6 +185,10 @@ bool vr_eye_fov(int eye, float fov[4]) {  // this frame's eye field of view: tan
     return true;
 }
 
+
+static void hud_destroy(void);
+static void frozen_destroy(void);
+extern bool vk_hud_layer_enabled(void);  // (exec.c: SKYRECOMP_VR_HUD_LAYER)
 
 static bool trace_enabled(void) {
     static int on = -1;
@@ -444,6 +469,8 @@ bool vr_vulkan_init(void *instance_, void *physical_device_, void *device_, uint
     space.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     ok = ok && xr_ok(p_xrCreateReferenceSpace(xr_session, &space, &view_space), "xrCreateReferenceSpace (view)") &&
          create_swapchain() && create_staging();
+    if (ok && !vr_grip_create(xr_instance, xr_session))
+        LOG("[vr] no controller poses (the wrist HUD stays off; the headset still renders)\n");
     if (!ok) {
         vr_shutdown();
         return false;
@@ -461,6 +488,7 @@ void vr_shutdown(void) {
     atomic_store(&focus_requested, false);
     memset(&frame, 0, sizeof frame);
     set_stage(STAGE_IDLE);
+    vr_grip_destroy();
     if (vk_device && staging) vkDestroyImage(vk_device, staging, NULL);
     if (vk_device && staging_memory) vkFreeMemory(vk_device, staging_memory, NULL);
     staging = VK_NULL_HANDLE;
@@ -470,6 +498,8 @@ void vr_shutdown(void) {
     image_count = 0;
     if (swapchain && p_xrDestroySwapchain) p_xrDestroySwapchain(swapchain);
     swapchain = XR_NULL_HANDLE;
+    hud_destroy();
+    frozen_destroy();
     XrSpace *spaces[] = {&view_space, &local_space};
     for (size_t i = 0; i < SDL_arraysize(spaces); i++) {
         if (*spaces[i] && p_xrDestroySpace) p_xrDestroySpace(*spaces[i]);
@@ -517,6 +547,7 @@ void vr_poll(void) {
         }
         event = (XrEventDataBuffer){.type = XR_TYPE_EVENT_DATA_BUFFER};
     }
+    vr_grip_sync(running ? local_space : XR_NULL_HANDLE, frame.display_time);  // (wrist HUD)
 }
 
 // ================================================================== frame loop
@@ -763,6 +794,48 @@ static void barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkIma
     eye_barrier_layers(cb, image, from, to, dst_stage, dst_access, 2);
 }
 
+// Frozen world: full-screen 2D screens (the map) draw no 3D scene. The eyes then show the last frame that had one,
+// submitted with the poses it was rendered for, so the compositor keeps it fixed in the room as the head moves.
+static VkImage frozen;                  // the swapchain's format, 2 layers: the last 3D frame's eye images
+static VkDeviceMemory frozen_memory;
+static XrView frozen_views[2];
+static bool frozen_valid, frozen_failed, freeze_next, frame_3d_next;
+
+void vr_freeze_world(bool freeze, bool frame_is_3d) { freeze_next = freeze; frame_3d_next = frame_is_3d; }
+
+static void frozen_destroy(void) {
+    if (vk_device && frozen) vkDestroyImage(vk_device, frozen, NULL);
+    if (vk_device && frozen_memory) vkFreeMemory(vk_device, frozen_memory, NULL);
+    frozen = VK_NULL_HANDLE;
+    frozen_memory = VK_NULL_HANDLE;
+    frozen_valid = frozen_failed = false;
+}
+
+static bool frozen_create(void) {
+    if (frozen) return true;
+    if (frozen_failed || swapchain_format == VK_FORMAT_UNDEFINED) return false;
+    frozen_failed = true;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = swapchain_format,
+                            .extent = {eye_width, eye_height, 1}, .mipLevels = 1, .arrayLayers = 2,
+                            .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    if (vkCreateImage(vk_device, &ci, NULL, &frozen) != VK_SUCCESS) return false;
+    VkMemoryRequirements mr;
+    vkGetImageMemoryRequirements(vk_device, frozen, &mr);
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(vk_physical_device, &mp);
+    uint32_t type = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount && type == UINT32_MAX; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = type};
+    if (type == UINT32_MAX || vkAllocateMemory(vk_device, &ai, NULL, &frozen_memory) != VK_SUCCESS ||
+        vkBindImageMemory(vk_device, frozen, frozen_memory, 0) != VK_SUCCESS)
+        return false;
+    frozen_failed = false;
+    return true;
+}
+
 bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_image, uint32_t sw, uint32_t sh, bool flip_y,
                           uint32_t source_format, uint32_t left_layer, uint32_t right_layer) {
     if (!vr_stereo_active() || frame.acquired || !command_buffer || !left_image || !sw || !sh) return false;
@@ -797,6 +870,25 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
 
     VkCommandBuffer cb = command_buffer;
     VkImage dst = images[frame.image].image;
+    const bool freeze = freeze_next, frame_3d = frame_3d_next;
+    freeze_next = frame_3d_next = false;
+    if (freeze && frozen_valid) {  // (vr_freeze_world: the last 3D frame again, with its poses)
+        barrier(cb, frozen, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+        barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        const VkImageCopy copy = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2},
+                                  .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2}, .extent = {eye_width, eye_height, 1}};
+        vkCmdCopyImage(cb, frozen, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        barrier(cb, frozen, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        frame.frozen_used = true;
+        frame.copied = true;
+        return true;
+    }
     VkImage src[2] = {left_image, right_image};
     // Colour: the game's image holds display-ready (gamma-encoded) values; the desktop presents them unchanged. A blit
     // into the sRGB swapchain from a UNORM image would encode them a second time (washed-out colours), so when the
@@ -847,12 +939,375 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
                                   .extent = {eye_width, eye_height, 1}};
         vkCmdCopyImage(cb, staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     }
+    // The frozen world (vr_freeze_world): this 3D frame's eyes, kept with their poses. (Not a frame that is itself
+    // full-screen 2D: its eye images hold the flat screen.)
+    if (!freeze && frame_3d && vk_hud_layer_enabled() && frozen_create()) {
+        barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                VK_ACCESS_2_TRANSFER_READ_BIT);
+        barrier(cb, frozen, frozen_valid ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        const VkImageCopy copy = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2},
+                                  .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 2}, .extent = {eye_width, eye_height, 1}};
+        vkCmdCopyImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, frozen, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        frozen_views[0] = frame.views[0];
+        frozen_views[1] = frame.views[1];
+        frozen_valid = true;
+    }
     // The runtime takes the image back in COLOR_ATTACHMENT_OPTIMAL (swapchain created with the color attachment usage).
     barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     frame.copied = true;
     return true;
+}
+
+// ================================================================== HUD panel (the game's 2D layer on a quad)
+// exec.c draws the 2D layer into a 1920x1080 texture of its own (SKYRECOMP_VR_HUD_LAYER); it goes to an OpenXR quad
+// layer about 2 m in front of the player (runtime/vr_hud.h: distance, scale, smooth follow of the head's yaw).
+enum { HUD_W = 1920, HUD_H = 1080 };
+static XrSwapchain hud_swapchain;
+static XrSwapchainImageVulkanKHR *hud_images;
+static uint32_t hud_count;
+static VkImage hud_staging;  // UNORM, as the eyes' staging image: raw bytes into the sRGB swapchain
+static VkDeviceMemory hud_staging_memory;
+static VkImageView hud_staging_view;
+static VkPipeline hud_backing_pipeline;
+static VkPipelineLayout hud_backing_layout;
+static bool hud_failed;
+
+static void hud_destroy(void) {
+    if (vk_device && hud_backing_pipeline) vkDestroyPipeline(vk_device, hud_backing_pipeline, NULL);
+    if (vk_device && hud_backing_layout) vkDestroyPipelineLayout(vk_device, hud_backing_layout, NULL);
+    if (vk_device && hud_staging_view) vkDestroyImageView(vk_device, hud_staging_view, NULL);
+    if (vk_device && hud_staging) vkDestroyImage(vk_device, hud_staging, NULL);
+    if (vk_device && hud_staging_memory) vkFreeMemory(vk_device, hud_staging_memory, NULL);
+    hud_staging = VK_NULL_HANDLE;
+    hud_staging_memory = VK_NULL_HANDLE;
+    hud_staging_view = VK_NULL_HANDLE;
+    hud_backing_pipeline = VK_NULL_HANDLE;
+    hud_backing_layout = VK_NULL_HANDLE;
+    SDL_free(hud_images);
+    hud_images = NULL;
+    hud_count = 0;
+    if (hud_swapchain && p_xrDestroySwapchain) p_xrDestroySwapchain(hud_swapchain);
+    hud_swapchain = XR_NULL_HANDLE;
+    hud_failed = false;
+}
+
+static bool hud_backing_create(VkFormat format) {
+    static const char *vs_source =
+        "#version 450\n"
+        "void main(){ vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3)); gl_Position=vec4(p[gl_VertexIndex],0,1); }\n";
+    static const char *fs_source =
+        "#version 450\n"
+        "layout(push_constant) uniform P { vec4 color; } pc; layout(location=0) out vec4 out_color;\n"
+        "void main(){ out_color=pc.color; }\n";
+    size_t vn = 0, fn = 0;
+    uint32_t *vspv = vk_glsl_to_spirv(vs_source, STAGE_VERTEX, "vr wrist backing vertex", &vn);
+    uint32_t *fspv = vk_glsl_to_spirv(fs_source, STAGE_FRAGMENT, "vr wrist backing fragment", &fn);
+    if (!vspv || !fspv) { free(vspv); free(fspv); return false; }
+    VkShaderModule vm = vk_module(vspv, vn), fm = vk_module(fspv, fn);
+    free(vspv); free(fspv);
+    if (!vm || !fm) return false;
+    const VkPushConstantRange push = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, 4 * sizeof(float)};
+    const VkPipelineLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                           .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
+    if (vkCreatePipelineLayout(vk_device, &li, NULL, &hud_backing_layout) != VK_SUCCESS) return false;
+    const VkPipelineShaderStageCreateInfo stages[2] = {
+        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_VERTEX_BIT,.module=vm,.pName="main"},
+        {.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,.stage=VK_SHADER_STAGE_FRAGMENT_BIT,.module=fm,.pName="main"}};
+    const VkPipelineVertexInputStateCreateInfo vi = {.sType=VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    const VkPipelineInputAssemblyStateCreateInfo ia = {.sType=VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+                                                        .topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    const VkPipelineViewportStateCreateInfo vp = {.sType=VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                                                   .viewportCount=1,.scissorCount=1};
+    const VkPipelineRasterizationStateCreateInfo rs = {.sType=VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+        .polygonMode=VK_POLYGON_MODE_FILL,.cullMode=VK_CULL_MODE_NONE,.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE,.lineWidth=1};
+    const VkPipelineMultisampleStateCreateInfo ms = {.sType=VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+                                                      .rasterizationSamples=VK_SAMPLE_COUNT_1_BIT};
+    const VkPipelineColorBlendAttachmentState ba = {.blendEnable=VK_TRUE,
+        .srcColorBlendFactor=VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,.dstColorBlendFactor=VK_BLEND_FACTOR_ONE,
+        .colorBlendOp=VK_BLEND_OP_ADD,.srcAlphaBlendFactor=VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA,
+        .dstAlphaBlendFactor=VK_BLEND_FACTOR_ONE,.alphaBlendOp=VK_BLEND_OP_ADD,
+        .colorWriteMask=VK_COLOR_COMPONENT_R_BIT|VK_COLOR_COMPONENT_G_BIT|VK_COLOR_COMPONENT_B_BIT|VK_COLOR_COMPONENT_A_BIT};
+    const VkPipelineColorBlendStateCreateInfo bs = {.sType=VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+                                                     .attachmentCount=1,.pAttachments=&ba};
+    const VkDynamicState dynamics[] = {VK_DYNAMIC_STATE_VIEWPORT,VK_DYNAMIC_STATE_SCISSOR};
+    const VkPipelineDynamicStateCreateInfo ds = {.sType=VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                                                  .dynamicStateCount=2,.pDynamicStates=dynamics};
+    const VkPipelineRenderingCreateInfo rendering = {.sType=VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+                                                      .colorAttachmentCount=1,.pColorAttachmentFormats=&format};
+    const VkGraphicsPipelineCreateInfo pi = {.sType=VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,.pNext=&rendering,
+        .stageCount=2,.pStages=stages,.pVertexInputState=&vi,.pInputAssemblyState=&ia,.pViewportState=&vp,
+        .pRasterizationState=&rs,.pMultisampleState=&ms,.pColorBlendState=&bs,.pDynamicState=&ds,.layout=hud_backing_layout};
+    const VkResult result = vkCreateGraphicsPipelines(vk_device, VK_NULL_HANDLE, 1, &pi, NULL, &hud_backing_pipeline);
+    vkDestroyShaderModule(vk_device, vm, NULL); vkDestroyShaderModule(vk_device, fm, NULL);
+    return result == VK_SUCCESS;
+}
+
+static bool hud_create(void) {
+    if (hud_swapchain) return true;
+    if (hud_failed || !xr_session || swapchain_format == VK_FORMAT_UNDEFINED) return false;
+    hud_failed = true;  // (until it all succeeds)
+    XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+                                .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
+                                .format = swapchain_format, .sampleCount = 1, .width = HUD_W, .height = HUD_H,
+                                .faceCount = 1, .arraySize = 1, .mipCount = 1};
+    if (!xr_ok(p_xrCreateSwapchain(xr_session, &ci, &hud_swapchain), "xrCreateSwapchain (HUD)") ||
+        !xr_ok(p_xrEnumerateSwapchainImages(hud_swapchain, 0, &hud_count, NULL), "xrEnumerateSwapchainImages (HUD)") ||
+        !hud_count)
+        return false;
+    hud_images = SDL_calloc(hud_count, sizeof *hud_images);
+    if (!hud_images) return false;
+    for (uint32_t i = 0; i < hud_count; i++) hud_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+    if (!xr_ok(p_xrEnumerateSwapchainImages(hud_swapchain, hud_count, &hud_count, (XrSwapchainImageBaseHeader *)hud_images),
+               "xrEnumerateSwapchainImages (HUD)"))
+        return false;
+    const VkFormat f = swapchain_format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
+                     : swapchain_format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_UNDEFINED;
+    if (f != VK_FORMAT_UNDEFINED) {
+        VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
+                                .extent = {HUD_W, HUD_H, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        if (vkCreateImage(vk_device, &ii, NULL, &hud_staging) != VK_SUCCESS) return false;
+        VkMemoryRequirements mr;
+        vkGetImageMemoryRequirements(vk_device, hud_staging, &mr);
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(vk_physical_device, &mp);
+        uint32_t type = UINT32_MAX;
+        for (uint32_t i = 0; i < mp.memoryTypeCount && type == UINT32_MAX; i++)
+            if ((mr.memoryTypeBits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = i;
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = type};
+        if (type == UINT32_MAX || vkAllocateMemory(vk_device, &ai, NULL, &hud_staging_memory) != VK_SUCCESS ||
+            vkBindImageMemory(vk_device, hud_staging, hud_staging_memory, 0) != VK_SUCCESS)
+            return false;
+        const VkImageViewCreateInfo view = {.sType=VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,.image=hud_staging,
+            .viewType=VK_IMAGE_VIEW_TYPE_2D,.format=f,
+            .subresourceRange={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1}};
+        if (vkCreateImageView(vk_device, &view, NULL, &hud_staging_view) != VK_SUCCESS || !hud_backing_create(f)) return false;
+    }
+    hud_failed = false;
+    LOG("[vr] HUD panel swapchain: %ux%u, %u images, format %d\n", HUD_W, HUD_H, hud_count, swapchain_format);
+    return true;
+}
+
+static void barrier_layers(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 dst_stage,
+                           VkAccessFlags2 dst_access, uint32_t layers) {
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = dst_stage, .dstAccessMask = dst_access};
+    VkImageMemoryBarrier2 ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
+                                .dstStageMask = dst_stage, .dstAccessMask = dst_access, .oldLayout = from, .newLayout = to,
+                                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                .image = image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, layers}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb,
+                           .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint32_t h, bool flip_y, bool opaque) {
+    if (!vr_stereo_active() || frame.hud_acquired || !command_buffer || !hud_image || !w || !h || !hud_create()) return false;
+    static int acquire_logged, wait_logged;
+    XrSwapchainImageAcquireInfo ai = {.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    if (!xr_frame_ok(p_xrAcquireSwapchainImage(hud_swapchain, &ai, &frame.hud_image), "xrAcquireSwapchainImage (HUD)",
+                     &acquire_logged) || frame.hud_image >= hud_count)
+        return false;
+    XrSwapchainImageWaitInfo wait = {.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .timeout = 100000000ll};
+    XrResult r = XR_TIMEOUT_EXPIRED;
+    for (int tries = 0; r == XR_TIMEOUT_EXPIRED && tries < 20; tries++) r = p_xrWaitSwapchainImage(hud_swapchain, &wait);
+    if (r != XR_SUCCESS) {
+        if (wait_logged++ < 5) LOG("[vr] xrWaitSwapchainImage (HUD) failed (%d)\n", (int)r);
+        return false;
+    }
+    frame.hud_acquired = true;
+    VkCommandBuffer cb = command_buffer;
+    VkImage dst = hud_images[frame.hud_image].image;
+    VkImage blit_dst = hud_staging ? hud_staging : dst;  // (as the eyes: no second sRGB encoding)
+    if (hud_staging) barrier_layers(cb, hud_staging, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 1);
+    barrier_layers(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT, 1);
+    extern bool player_eye(float eye[3]);
+    const bool compose_wrist = !opaque && g_vr_hud_config.wrist_hud && player_eye(NULL) &&
+                               (hud_grip_tracked[0] || hud_grip_tracked[1]) && w == HUD_W && h == HUD_H;
+    if (!compose_wrist) {
+        int32_t y0 = 0, y1 = (int32_t)h;
+        if (flip_y) { y0 = (int32_t)h; y1 = 0; }
+        VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, y0, 0}, {(int32_t)w, y1, 1}},
+                            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {HUD_W, HUD_H, 1}}};
+        vkCmdBlitImage(cb, hud_image, VK_IMAGE_LAYOUT_GENERAL, blit_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    } else {
+        // Build two real 480x480 atlases in the OpenXR image. Each atlas is later displayed by one quad; the
+        // individual HUD elements are pixels in that image, not additional composition layers.
+        // Premultiplied dark backing, similar to Shipwright's wrist panel. The centre area is immediately replaced
+        // with the original transparent HUD, so this backing exists only inside the two sampled wrist squares.
+        const VkClearColorValue backing = {{0, 0, 0, 0}};
+        const VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(cb, blit_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &backing, 1, &all);
+        typedef struct { int sx, sy, sw, sh, dx0, dy0, dx1, dy1; } AtlasBlit;
+        const AtlasBlit parts[] = {
+            {540, 0, 900, 1080, 540, 0, 1440, 1080}, // centred prompts, clear of the wide heart row at the left edge
+            // Left wrist, matching ss-module template.png: hearts on top, shield gauge and rupees in the
+            // middle, D-pad/help at the bottom. All destinations lie in the same 480x480 atlas.
+            {40, 940, 470, 110, 10, 8, 470, 125},    // hearts only; begins above the shield module's glow
+            {45, 850, 205, 90, 10, 135, 190, 220},  // shield icon and gauge, clear of the centre hand silhouette
+            {45, 45, 185, 65, 265, 150, 465, 220},  // rupees only; stops before the lower status icon begins
+            {35, 105, 195, 220, 125, 245, 355, 440},// D-pad/help/status, including the complete lower icon and glow
+            // Right wrist: item slot above pouch, as marked in the supplied template.
+            {1715, 805, 170, 235, 1550, 15, 1810, 255}, // complete item slot and its single label
+            {1735, 660, 145, 155, 1555, 280, 1805, 465} // tightly isolated pouch module
+        };
+        VkImageBlit blits[sizeof parts / sizeof *parts];
+        for (uint32_t i = 0; i < sizeof parts / sizeof *parts; i++) {
+            const AtlasBlit *p = &parts[i];
+            const int sy0 = flip_y ? p->sy + p->sh : p->sy;
+            const int sy1 = flip_y ? p->sy : p->sy + p->sh;
+            blits[i] = (VkImageBlit){
+                .srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                .srcOffsets = {{p->sx, sy0, 0}, {p->sx + p->sw, sy1, 1}},
+                .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                .dstOffsets = {{p->dx0, p->dy0, 0}, {p->dx1, p->dy1, 1}}};
+        }
+        vkCmdBlitImage(cb, hud_image, VK_IMAGE_LAYOUT_GENERAL, blit_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       (uint32_t)(sizeof blits / sizeof *blits), blits, VK_FILTER_LINEAR);
+    }
+    VkImageLayout staging_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    if (compose_wrist && hud_staging && hud_staging_view && hud_backing_pipeline) {
+        barrier_layers(cb, hud_staging, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                       VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, 1);
+        const VkRenderingAttachmentInfo attachment = {.sType=VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView=hud_staging_view,.imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .loadOp=VK_ATTACHMENT_LOAD_OP_LOAD,.storeOp=VK_ATTACHMENT_STORE_OP_STORE};
+        const VkRenderingInfo rendering = {.sType=VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea={{0,0},{HUD_W,HUD_H}},.layerCount=1,.colorAttachmentCount=1,.pColorAttachments=&attachment};
+        vkCmdBeginRendering(cb, &rendering);
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, hud_backing_pipeline);
+        const VkViewport viewport = {0, 0, HUD_W, HUD_H, 0, 1};
+        vkCmdSetViewport(cb, 0, 1, &viewport);
+        const float alpha = g_vr_hud_config.wrist_hud_background;
+        const float color[4] = {.022f*alpha, .026f*alpha, .039f*alpha, alpha};
+        vkCmdPushConstants(cb, hud_backing_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof color, color);
+        const VkRect2D panels[2] = {{{0,0},{480,480}},{{1440,0},{480,480}}};
+        for (int i = 0; i < 2; i++) { vkCmdSetScissor(cb, 0, 1, &panels[i]); vkCmdDraw(cb, 3, 1, 0, 0); }
+        vkCmdEndRendering(cb);
+        staging_layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    }
+    if (hud_staging) {
+        barrier_layers(cb, hud_staging, staging_layout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, 1);
+        const VkImageCopy copy = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {HUD_W, HUD_H, 1}};
+        vkCmdCopyImage(cb, hud_staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
+    barrier_layers(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, 1);
+    frame.hud_copied = true;
+    frame.hud_opaque = opaque;
+    return true;
+}
+
+// The quad layer's pose: vr_hud.h's world-from-HUD matrix from the head (between the eyes), in the local space.
+static XrPosef hud_pose(void) {
+    const XrPosef *a = &frame.views[0].pose, *b = &frame.views[1].pose;
+    const float x = a->orientation.x, y = a->orientation.y, z = a->orientation.z, w = a->orientation.w;
+    const float head[16] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), (a->position.x + b->position.x) / 2,
+                            2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), (a->position.y + b->position.y) / 2,
+                            2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), (a->position.z + b->position.z) / 2,
+                            0, 0, 0, 1};
+    float m[16];
+    const float dt = frame.display_period > 0 ? (float)frame.display_period * 1e-9f : 1.0f / 90.0f;
+    ComputeHUDQuadMatrixDelta(m, head, NULL, dt);
+    // rotation (columns right, up, back) -> quaternion
+    const float r00 = m[0], r01 = m[1], r02 = m[2], r10 = m[4], r11 = m[5], r12 = m[6], r20 = m[8], r21 = m[9], r22 = m[10];
+    XrQuaternionf q;
+    const float tr = r00 + r11 + r22;
+    if (tr > 0) {
+        const float s4 = sqrtf(tr + 1) * 2;
+        q = (XrQuaternionf){(r21 - r12) / s4, (r02 - r20) / s4, (r10 - r01) / s4, s4 / 4};
+    } else if (r00 > r11 && r00 > r22) {
+        const float s4 = sqrtf(1 + r00 - r11 - r22) * 2;
+        q = (XrQuaternionf){s4 / 4, (r01 + r10) / s4, (r02 + r20) / s4, (r21 - r12) / s4};
+    } else if (r11 > r22) {
+        const float s4 = sqrtf(1 + r11 - r00 - r22) * 2;
+        q = (XrQuaternionf){(r01 + r10) / s4, s4 / 4, (r12 + r21) / s4, (r02 - r20) / s4};
+    } else {
+        const float s4 = sqrtf(1 + r22 - r00 - r11) * 2;
+        q = (XrQuaternionf){(r02 + r20) / s4, (r12 + r21) / s4, s4 / 4, (r10 - r01) / s4};
+    }
+    return (XrPosef){.orientation = q, .position = {m[3], m[7], m[11]}};
+}
+
+static XrVector3f rotate_vector(XrQuaternionf q, XrVector3f v) {
+    const XrVector3f u = {q.x, q.y, q.z};
+    const float dot = u.x * v.x + u.y * v.y + u.z * v.z;
+    const float uu = u.x * u.x + u.y * u.y + u.z * u.z;
+    const XrVector3f cross = {u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x};
+    return (XrVector3f){2 * dot * u.x + (q.w * q.w - uu) * v.x + 2 * q.w * cross.x,
+                        2 * dot * u.y + (q.w * q.w - uu) * v.y + 2 * q.w * cross.y,
+                        2 * dot * u.z + (q.w * q.w - uu) * v.z + 2 * q.w * cross.z};
+}
+
+static XrQuaternionf basis_quaternion(XrVector3f right, XrVector3f up, XrVector3f back) {
+    const float r00 = right.x, r01 = up.x, r02 = back.x;
+    const float r10 = right.y, r11 = up.y, r12 = back.y;
+    const float r20 = right.z, r21 = up.z, r22 = back.z;
+    const float tr = r00 + r11 + r22;
+    if (tr > 0) { const float s = sqrtf(tr + 1) * 2; return (XrQuaternionf){(r21-r12)/s,(r02-r20)/s,(r10-r01)/s,s/4}; }
+    if (r00 > r11 && r00 > r22) { const float s = sqrtf(1+r00-r11-r22)*2; return (XrQuaternionf){s/4,(r01+r10)/s,(r02+r20)/s,(r21-r12)/s}; }
+    if (r11 > r22) { const float s = sqrtf(1+r11-r00-r22)*2; return (XrQuaternionf){(r01+r10)/s,s/4,(r12+r21)/s,(r02-r20)/s}; }
+    const float s = sqrtf(1+r22-r00-r11)*2; return (XrQuaternionf){(r02+r20)/s,(r12+r21)/s,s/4,(r10-r01)/s};
+}
+
+static XrQuaternionf multiply_quaternion(XrQuaternionf a, XrQuaternionf b) {
+    return (XrQuaternionf){a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
+                           a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
+                           a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
+                           a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z};
+}
+
+static XrPosef wrist_hud_pose(int hand) {
+    const XrPosef grip = hud_grip_pose[hand];
+    XrVector3f local = {(hand ? 1.0f : -1.0f) * g_vr_hud_config.wrist_hud_side,
+                        g_vr_hud_config.wrist_hud_up, g_vr_hud_config.wrist_hud_forward};
+    XrVector3f offset = rotate_vector(grip.orientation, local);
+    XrVector3f position = {grip.position.x + offset.x, grip.position.y + offset.y, grip.position.z + offset.z};
+    // The neutral OpenXR grip is a handshake pose: fingers forward and thumb up. A useful wrist display therefore
+    // faces along the grip's +Y (thumb-up) axis. Using the anatomical back-of-hand normal (+/-X) would leave the
+    // display facing sideways until the player unnaturally rolled the forearm palm-down.
+    XrVector3f back = rotate_vector(grip.orientation, (XrVector3f){0, 1.0f, 0});
+    XrVector3f along_arm = rotate_vector(grip.orientation, (XrVector3f){0, 0, -1});
+    XrVector3f right = {along_arm.y*back.z-along_arm.z*back.y,
+                        along_arm.z*back.x-along_arm.x*back.z,
+                        along_arm.x*back.y-along_arm.y*back.x};
+    float length = sqrtf(right.x*right.x + right.y*right.y + right.z*right.z);
+    if (length < 1e-4f) right = (XrVector3f){1,0,0}; else right.x/=length, right.y/=length, right.z/=length;
+    XrVector3f up = {back.y*right.z-back.z*right.y, back.z*right.x-back.x*right.z,
+                     back.x*right.y-back.y*right.x};
+    XrQuaternionf orientation = basis_quaternion(right, up, back);
+    const float half_tilt = g_vr_hud_config.wrist_hud_tilt * (float)M_PI / 360.0f;
+    orientation = multiply_quaternion(orientation, (XrQuaternionf){sinf(half_tilt), 0, 0, cosf(half_tilt)});
+    return (XrPosef){orientation, position};
+}
+
+static bool wrist_hud_glanced(int hand, XrPosef panel) {
+    const XrPosef *a = &frame.views[0].pose, *b = &frame.views[1].pose;
+    XrVector3f to_head = {(a->position.x+b->position.x)*.5f-panel.position.x,
+                          (a->position.y+b->position.y)*.5f-panel.position.y,
+                          (a->position.z+b->position.z)*.5f-panel.position.z};
+    float length = sqrtf(to_head.x*to_head.x + to_head.y*to_head.y + to_head.z*to_head.z);
+    if (length < 1e-4f) return true;
+    to_head.x/=length; to_head.y/=length; to_head.z/=length;
+    XrVector3f hand_back = rotate_vector(hud_grip_pose[hand].orientation, (XrVector3f){0, 1.0f, 0});
+    XrVector3f head_forward = rotate_vector(a->orientation, (XrVector3f){0, 0, -1});
+    const float hand_facing = hand_back.x*to_head.x + hand_back.y*to_head.y + hand_back.z*to_head.z;
+    const float head_gaze = -(head_forward.x*to_head.x + head_forward.y*to_head.y + head_forward.z*to_head.z);
+    return hand_facing > .25f && head_gaze > .87f;
 }
 
 void vr_frame_end(void) {
@@ -869,16 +1324,64 @@ void vr_frame_end(void) {
     for (uint32_t eye = 0; eye < 2; eye++)
         pv[eye] = (XrCompositionLayerProjectionView){
             .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-            .pose = frame.views[eye].pose,
-            .fov = frame.views[eye].fov,
+            .pose = frame.frozen_used ? frozen_views[eye].pose : frame.views[eye].pose,
+            .fov = frame.frozen_used ? frozen_views[eye].fov : frame.views[eye].fov,
             .subImage = {.swapchain = swapchain, .imageRect = {{0, 0}, {(int32_t)eye_width, (int32_t)eye_height}},
                          .imageArrayIndex = eye}};
     XrCompositionLayerProjection layer = {.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION, .space = local_space,
                                           .viewCount = 2, .views = pv};
     const bool submit = release_ok && frame.copied;
-    const XrCompositionLayerBaseHeader *layers[1];
+    // The HUD panel (vr_record_hud_copy): over the eyes, blended by its (premultiplied) alpha; opaque for a
+    // full-screen 2D frame (the map), in front of the frozen world.
+    static int hud_release_logged;
+    const bool hud_ok = frame.hud_acquired &&
+        xr_frame_ok(p_xrReleaseSwapchainImage(hud_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
+                    "xrReleaseSwapchainImage (HUD)", &hud_release_logged) && frame.hud_copied;
+    const float hud_w = 1.6f * g_vr_hud_config.hud_scale;
+    XrCompositionLayerQuad quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+                                   .layerFlags = frame.hud_opaque ? 0 : XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                                   .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+                                   .subImage = {.swapchain = hud_swapchain, .imageRect = {{0, 0}, {HUD_W, HUD_H}}, .imageArrayIndex = 0},
+                                   .pose = hud_ok ? hud_pose() : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}},
+                                   .size = {hud_w, hud_w * HUD_H / HUD_W}};
+    XrCompositionLayerQuad wrist[2];
+    uint32_t wrist_count = 0;
+    extern bool player_eye(float eye[3]);
+    const bool gameplay = player_eye(NULL);  // false on boot, title, loading, and file-select screens
+    const bool use_wrist = hud_ok && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay &&
+                           (hud_grip_tracked[0] || hud_grip_tracked[1]);
+    if (use_wrist) {
+        const int status_hand = g_vr_hud_config.wrist_hud_swap_hands ? 1 : 0;
+        const int item_hand = 1 - status_hand;
+        const XrPosef panels[2] = {hud_grip_tracked[0] ? wrist_hud_pose(0) : (XrPosef){{0,0,0,1},{0,0,0}},
+                                   hud_grip_tracked[1] ? wrist_hud_pose(1) : (XrPosef){{0,0,0,1},{0,0,0}}};
+        const bool status_visible = hud_grip_tracked[status_hand] &&
+                                    (!g_vr_hud_config.wrist_hud_glance ||
+                                     wrist_hud_glanced(status_hand, panels[status_hand]));
+        if (status_visible)
+            wrist[wrist_count++] = (XrCompositionLayerQuad){
+                .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+                .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+                .subImage = {.swapchain = hud_swapchain, .imageRect = {{0, 0}, {480, 480}}, .imageArrayIndex = 0},
+                .pose = panels[status_hand],
+                .size = {g_vr_hud_config.wrist_hud_size, g_vr_hud_config.wrist_hud_size}};
+        if (hud_grip_tracked[item_hand]) wrist[wrist_count++] = (XrCompositionLayerQuad){
+            .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+            .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+            .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+            .subImage = {.swapchain = hud_swapchain, .imageRect = {{1440, 0}, {480, 480}}, .imageArrayIndex = 0},
+            .pose = panels[item_hand],
+            .size = {g_vr_hud_config.wrist_hud_size, g_vr_hud_config.wrist_hud_size}};
+        quad.subImage.imageRect = (XrRect2Di){{480, 0}, {960, HUD_H}};
+        quad.size.width = hud_w * 960.0f / HUD_W;
+    }
+    const XrCompositionLayerBaseHeader *layers[6];
     uint32_t nlayers = 0;
     if (submit) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&layer;
+    if (submit && hud_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&quad;
+    if (submit && use_wrist)
+        for (uint32_t i = 0; i < wrist_count; i++) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&wrist[i];
     if (g_vr_config.dynamic_resolution && frame.work_start_ns && frame.display_period > 0) {
         adaptive_work_sum += (double)(SDL_GetTicksNS() - frame.work_start_ns);
         adaptive_budget_sum += (double)frame.display_period;
@@ -953,6 +1456,14 @@ void vr_poll(void) {}
 bool vr_frame_begin(void) { return false; }
 bool vr_stereo_active(void) { return false; }
 void vr_recenter(void) {}
+void vr_freeze_world(bool freeze, bool frame_is_3d) { (void)freeze; (void)frame_is_3d; }
+bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint32_t h, bool flip_y, bool opaque) {
+    (void)command_buffer; (void)hud_image; (void)w; (void)h; (void)flip_y; (void)opaque;
+    return false;
+}
+void vr_set_grip_poses(bool left_tracked, const float left[7], bool right_tracked, const float right[7]) {
+    (void)left_tracked; (void)left; (void)right_tracked; (void)right;
+}
 bool vr_patch_scene_ubo(uint32_t eye, float out[28], const float *in, uint64_t size) {
     (void)eye; (void)out; (void)in; (void)size;
     return false;
