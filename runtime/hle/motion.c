@@ -39,8 +39,11 @@ static _Atomic int auto_joycon;
 
 // This coordinator owns the game's pointer calibration: the "point at the screen and press Y" prompt, the
 // recalibration, then teardown; the game's cursor stays off until it has run. It is called each frame while the
-// prompt is up; its state (+24): 0 opening, 1 waiting for Y, 2-4 Y accepted, 5 closing, then 0 again (idle).
-// In VR it runs, answered by the port, and is never seen or heard:
+// prompt is up; its state (+24): 0 opening, 1 waiting for the prompt's opening animation (its object +8: +0x160b
+// set when an animation is done), 2 Y pressed?, 3 closing requested, 4 waiting for the closing animation, 5
+// teardown, then 0 (idle). State 3 waits for the prompt's status +0x15e0 to be 2 (open). In VR it runs, answered by the port, and is never seen or heard:
+//  - states 1, 3 and 4: the prompt is reported open / its animation done at once (+0x15e0 = 2, +0x160b), so the whole
+//    run takes a few frames (~1.2 s before);
 //  - state 1: Y is pressed for the player (input.c motion_auto_buttons) - only then, so Y can't restart it;
 //  - states 1-4: the right Joy-Con points at the screen's centre (the HUD panel's centre, where the menu pointer's
 //    mapping starts: vr_controls.c);
@@ -49,7 +52,7 @@ static _Atomic int auto_joycon;
 // A run ends when the state returns to 0 after the prompt, or when the coordinator stops being called; it is never
 // answered for more than CAL_MAX_FRAMES. SKYRECOMP_VR_MOTION_CALIBRATION=1: the game's own prompt in VR too.
 #define LEGACY_CALIBRATION_COORDINATOR 0x7000dd2a68ull
-enum { CAL_MAX_FRAMES = 1200, CAL_FADE_FRAMES = 40 };
+enum { CAL_MAX_FRAMES = 1200, CAL_FADE_FRAMES = 4 };
 static GuestFn legacy_calibration_coordinator;
 static _Atomic uint64_t cal_last_call, cal_run_start, cal_run_end;  // (present count + 1; 0 none)
 static _Atomic uint32_t cal_state;
@@ -76,9 +79,16 @@ static void vr_auto_calibration(Cpu *c) {
         LOG("[motion] VR: the pointer calibration prompt is answered automatically, hidden and muted\n");
     }
     atomic_store(&cal_last_call, now);
+    {   // (states 1 and 4: no waiting for the prompt's animations)
+        const uint32_t st0 = self ? *(const uint32_t *)(uintptr_t)(self + 24) : 0;
+        const uint64_t prompt = self ? *(const uint64_t *)(uintptr_t)(self + 8) : 0;
+        if ((st0 == 1 || st0 == 4) && prompt) *(volatile uint8_t *)(uintptr_t)(prompt + 0x160b) = 1;
+        if (st0 == 3 && prompt) *(volatile uint32_t *)(uintptr_t)(prompt + 0x15e0) = 2;  // (state 3: "fully open")
+    }
     legacy_calibration_coordinator(c);
     const uint32_t st = self ? *(const uint32_t *)(uintptr_t)(self + 24) : 0;
     const uint32_t before = atomic_exchange(&cal_state, st);
+    if (st != before && getenv("SKYRECOMP_MOTION_CAL_TRACE")) LOG("[motion] calibration state %u at frame %llu\n", st, (unsigned long long)now);
     if (st == 0 && before == 5) {  // (closed: the run is over)
         atomic_store(&cal_in_run, false);
         atomic_store(&cal_run_end, now);
@@ -98,10 +108,10 @@ bool motion_vr_calibration_hidden(void) {
     return over && now <= over + CAL_FADE_FRAMES;
 }
 
-// (input.c, each pad poll) Buttons the port presses: Y, pulsed, while the prompt waits for it in VR.
+// (input.c, each pad poll) Buttons the port presses: Y while the prompt waits for it in VR (states 1-2).
 uint64_t motion_auto_buttons(void) {
-    if (!cal_running() || atomic_load(&cal_state) != 1) return 0;
-    return (cal_now() / 6) % 2 ? 0 : 1u << 3;  // (Npad Y, pressed 6 frames of every 12)
+    const uint32_t st = atomic_load(&cal_state);
+    return cal_running() && (st == 1 || st == 2) ? 1u << 3 : 0;  // (Npad Y)
 }
 
 // TEMP (RE) SKYRECOMP_TEMP_MOTION_GATE=1: f_7000a17aa8 / f_7000a17be0 (player: "motion input active?") logged on change
