@@ -341,14 +341,33 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
     if (no_memory < 0) no_memory = getenv("SKYRECOMP_VR_NO_GAME_CAMERA") != NULL;
     const bool memory = !no_memory && game_camera_view(camera);
     if (memory && same_view(camera, mono + 16)) g_memory_seen_now = true;
+    // Without the memory camera (the title screen, file select, cutscenes: another camera draws), a plain camera
+    // block of the same render pass (its targets; this frame or kept from an earlier one) stands for Vg in that
+    // pass's blocks that are Vg times a model matrix: otherwise those (the sky dome, the cloud ring and sea) kept
+    // the mono camera, stayed fixed to the head, and flickered whenever the memory camera matched for a frame.
+    // (Other passes draw with other cameras: reflections, glare.)
+    enum { PASS_CAMERAS = 16 };
+    static struct { uint64_t pass; float view[12]; } pass_camera[PASS_CAMERAS];
+    static int pass_camera_next;
+    int pc = -1;
+    for (int i = 0; i < PASS_CAMERAS; i++)
+        if (pass_camera[i].pass == g_vr_pass_id) pc = i;
     if (memory && (g_memory_seen_now || g_memory_seen_before) && det3(mono + 16) > 0) game = camera, source = 0;
-    else if (sky_vr_is_scene_camera(mono, 28 * sizeof(float))) game = mono + 16, source = 1;
+    else if (sky_vr_is_scene_camera(mono, 28 * sizeof(float))) {
+        game = mono + 16, source = 1;
+        if (det3(mono + 16) > 0 && g_vr_pass_id) {
+            if (pc < 0) pc = pass_camera_next, pass_camera_next = (pass_camera_next + 1) % PASS_CAMERAS;
+            pass_camera[pc].pass = g_vr_pass_id;
+            memcpy(pass_camera[pc].view, mono + 16, sizeof pass_camera[pc].view);
+        }
+    } else if (pc >= 0 && det3(mono + 16) > 0) game = pass_camera[pc].view, source = 2;
     else return false;
     static int trace = -1;  // SKYRECOMP_VR_CAM_TRACE=1: how often each source is used
-    static long counts[2];
+    static long counts[3];
     if (trace < 0) trace = getenv("SKYRECOMP_VR_CAM_TRACE") != NULL;
-    if (trace && ++counts[source] && (counts[0] + counts[1]) % 4000 == 0)
-        fprintf(stderr, "[vr-rig] camera from game memory %ld, from the block %ld\n", counts[0], counts[1]);
+    if (trace && ++counts[source] && (counts[0] + counts[1] + counts[2]) % 4000 == 0)
+        fprintf(stderr, "[vr-rig] camera from game memory %ld, from the block %ld, from the last camera block %ld\n",
+                counts[0], counts[1], counts[2]);
     memcpy(g_rig.game_view, game, sizeof g_rig.game_view);
     g_rig.have_game_view = true;
     VrRigAnchor a;
@@ -366,7 +385,7 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
     float view[12];
     if (!vr_rig_view(&a, reference, eye, vr_rig_units_per_metre(), view)) return false;
     const float near = g_rig.mode == 1 ? near_units() : 0.0f;
-    if (!direct && source == 0 && planar_reflection(mono + 16, game)) {
+    if (!direct && source != 1 && planar_reflection(mono + 16, game)) {
         // The block draws the reflection in a horizontal mirror: Vm = F Vg R (R the world's reflection in the plane,
         // F = diag(1,-1,1) turning the image upside down, as the game samples it). The eye's version is F Ve R, so
         // C = F Ve R Vm^-1 = (F Ve) (F Vg)^-1. Plain C = Ve Vg^-1 cancelled the mirror: the pass drew an ordinary eye

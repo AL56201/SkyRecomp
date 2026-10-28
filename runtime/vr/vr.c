@@ -580,11 +580,13 @@ static bool locate_views(void) {
     // (test) SKYRECOMP_VR_PIN_HEAD=<degrees>: the eyes sit still at the reference head pose (+-32 mm), turned left by
     // that many degrees (any value, e.g. 1 or 0.0 for straight ahead): reproducible eye shots whatever the headset does
     static int pin = -1;
-    static float pin_turn;
+    static float pin_turn, pin_pitch;  // (",<degrees>" after the turn: also looking up by that many, negative: down)
     if (pin < 0) {
         pin = getenv("SKYRECOMP_VR_PIN_HEAD") != NULL;
         if (pin) pin_turn = (float)atof(getenv("SKYRECOMP_VR_PIN_HEAD")) * (float)(M_PI / 180.0);
         if (pin_turn == (float)(M_PI / 180.0)) pin_turn = 0;  // ("1": on)
+        const char *comma = pin ? strchr(getenv("SKYRECOMP_VR_PIN_HEAD"), ',') : NULL;
+        if (comma) pin_pitch = (float)atof(comma + 1) * (float)(M_PI / 180.0);
     }
     if (ok && pin) {
         const float turn = pin_turn;
@@ -593,7 +595,8 @@ static bool locate_views(void) {
         const float c = 1 - 2 * q.y * q.y, s = 2 * q.y * q.w;  // (the eyes' axis turns with the head)
         for (int e = 0; e < 2; e++) {
             const float x = e ? 0.032f : -0.032f;  // along the reference's +x = (c, 0, -s)
-            frame.views[e].pose.orientation = q;
+            const float px = sinf(pin_pitch / 2), pw = cosf(pin_pitch / 2);  // q * pitch(about the head's +x)
+            frame.views[e].pose.orientation = (XrQuaternionf){q.w * px, q.y * pw, -q.y * px, q.w * pw};
             frame.views[e].pose.position = (XrVector3f){reference_pose[4] + x * c, reference_pose[5], reference_pose[6] - x * s};
         }
     }
