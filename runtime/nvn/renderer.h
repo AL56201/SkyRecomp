@@ -15,6 +15,8 @@ extern uint64_t g_guest_buffer_base;
 bool renderer_is_gpu_owned(NvnTexture *t);
 void renderer_flush(void);  // finish all recorded GPU work
 bool renderer_origin_lower_left(void);
+void renderer_get_scale(float *sx, float *sy);
+void renderer_set_scale(float sx, float sy);
 const char *renderer_stats(void);
 bool renderer_format_is_depth(uint32_t f);
 bool renderer_format_has_stencil(uint32_t f);

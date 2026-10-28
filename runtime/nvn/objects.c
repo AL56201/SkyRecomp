@@ -6,6 +6,15 @@
 #include "nvn.h"
 
 void renderer_sync(void);
+// nvn/async.c: the command replay on its own thread (SKYRECOMP_ASYNC_REPLAY)
+bool nvn_async_on(void);
+void nvn_async_execute(uint64_t handle);
+void nvn_async_submit(void);
+void nvn_async_present(NvnTexture *t);
+void nvn_async_texture_finalize(NvnTexture *t);
+void nvn_async_queue_fence(uint64_t sync);
+void nvn_async_wait_sync(uint64_t sync);
+void nvn_async_drain(void);
 
 static uint64_t next_debug_id = 1;
 
@@ -115,10 +124,16 @@ NVN(nvnQueueResetMemoryUsageCounts) { (void)c; }
 NVN(nvnQueueSubmitCommands) {
     int n = (int)A(1);
     const uint64_t *handles = AP(2);
+    if (nvn_async_on()) {
+        for (int i = 0; i < n; i++) nvn_async_execute(handles[i]);
+        nvn_async_submit();
+        return;
+    }
     for (int i = 0; i < n; i++) backend_execute(handles[i]);
+    backend_submit_commands();
 }
 NVN(nvnQueueFlush) { (void)c; }
-NVN(nvnQueueFinish) { (void)c; renderer_sync(); }
+NVN(nvnQueueFinish) { (void)c; nvn_async_drain(); renderer_sync(); }
 
 static NvnSync *sync_of(uint64_t guest) {
     NvnSync *s = HOST(NvnSync, guest);
@@ -127,7 +142,10 @@ static NvnSync *sync_of(uint64_t guest) {
 }
 uint64_t renderer_fence_seq(void);
 void renderer_wait_seq(uint64_t seq);
-NVN(nvnQueueFenceSync) { NvnSync *s = sync_of(A(1)); s->signaled = 1; s->seq = renderer_fence_seq(); }
+NVN(nvnQueueFenceSync) {
+    if (nvn_async_on()) { nvn_async_queue_fence(A(1)); return; }
+    NvnSync *s = sync_of(A(1)); s->signaled = 1; s->seq = renderer_fence_seq();
+}
 void nvn_sync_set_seq(uint64_t guest, uint64_t seq) { NvnSync *s = sync_of(guest); s->signaled = 1; s->seq = seq; }
 NVN(nvnQueueWaitSync) { RET(1); }
 
@@ -143,8 +161,12 @@ NVN(nvnSyncWait) {  // NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED
     if (getenv("LARECOMP_LOG_SYNC") && n++ % 60 == 0) LOG("[nvn] SyncWait #%llu (lr %llx)\n", (unsigned long long)n, c->x[30]);
     static int whole = -1;  // LARECOMP_SYNC_ALL=1: old behaviour, wait for all submitted work
     if (whole < 0) whole = getenv("LARECOMP_SYNC_ALL") ? 1 : 0;
-    if (flush) renderer_flush();
-    else if (whole) renderer_sync();
+    if (nvn_async_on()) {  // (the replay thread first passes what signals it; then the GPU)
+        if (flush || whole) nvn_async_drain();
+        else nvn_async_wait_sync(A(0));
+    }
+    if (flush && !nvn_async_on()) renderer_flush();
+    else if (flush || whole) renderer_sync();  // (async: Vulkan submissions belong to the replay thread)
     else renderer_wait_seq(sync_of(A(0))->seq);  // only the submission that holds this fence
     RET(0);
 }
@@ -368,7 +390,8 @@ NVN(nvnTextureInitialize) {
 }
 NVN(nvnTextureFinalize) {
     NvnTexture *t = HOST(NvnTexture, A(0));
-    if (t) { backend_texture_destroyed(t); free(t); }
+    if (t && nvn_async_on()) nvn_async_texture_finalize(t);  // (after the queued work that may still draw with it)
+    else if (t) { backend_texture_destroyed(t); free(t); }
     SET_HOST(A(0), 0);
 }
 NVN(nvnTextureSetDebugLabel) {
@@ -676,7 +699,11 @@ NVN(nvnQueueAcquireTexture) {
 NVN(nvnQueuePresentTexture) {
     NvnWindow *w = HOST(NvnWindow, A(1));
     int i = (int)A(2);
-    if (i >= 0 && i < w->num) { backend_set_window_crop(w->crop); backend_present(HOST(NvnTexture, w->textures[i])); }
+    if (i >= 0 && i < w->num) {
+        backend_set_window_crop(w->crop);
+        if (nvn_async_on()) nvn_async_present(HOST(NvnTexture, w->textures[i]));
+        else backend_present(HOST(NvnTexture, w->textures[i]));
+    }
 }
 
 // ================================================================== small state objects

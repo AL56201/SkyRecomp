@@ -11,6 +11,7 @@
 #include "hle.h"
 #include "input_bind.h"
 #include "mods.h"
+#include "vr/vr_settings.h"
 
 #define SETTINGS_FILE settings_file()
 
@@ -34,6 +35,13 @@ Settings g_settings = {
     .movie_audio = true,
     .show_fps = false,
     .hd_textures = true,
+    .draw_distance = 1.0f,
+    .vr_mirror_hz = 60,
+    .vr_foveation = false,  // (coarser lens edges: a choice, not the default)
+    .vr_foveation_inner = 0.60f,
+    .vr_foveation_outer = 0.80f,
+    .async_replay = true,
+    .vr_near_clip = 15.0f,
     .reshade = true,
     .frame_rate = 60,
     .inv_keys = true,
@@ -172,6 +180,7 @@ RT_ON_RESET(settings_reset) { s_settings_loaded = false; }
 void settings_load(void) {
     if (s_settings_loaded) return;
     s_settings_loaded = true;
+    LoadVRConfig(SETTINGS_FILE);
     FILE *f = fopen(SETTINGS_FILE, "r");
     if (!f) return;
     char line[2048];
@@ -199,12 +208,36 @@ void settings_load(void) {
         if (!strcmp(key, "aspect")) g_settings.aspect = !strcmp(val, "original") ? ASPECT_ORIGINAL : ASPECT_UNLOCKED;
         else if (!strcmp(key, "fullscreen")) g_settings.fullscreen = atoi(val) != 0;
         else if (!strcmp(key, "hd_textures")) g_settings.hd_textures = atoi(val) != 0;
+        else if (!strcmp(key, "draw_distance")) {
+            const float v = (float)atof(val);
+            g_settings.draw_distance = v >= 1.0f && v <= 4.0f ? v : 1.0f;
+        }
+        else if (!strcmp(key, "vr_mirror_hz")) {
+            const int v = atoi(val);
+            g_settings.vr_mirror_hz = v == 0 || v == 30 || v == 90 ? v : 60;
+        }
+        else if (!strcmp(key, "vr_foveation")) g_settings.vr_foveation = atoi(val) != 0;
+        else if (!strcmp(key, "vr_foveation_inner")) {
+            const float v = (float)atof(val);
+            if (isfinite(v) && v >= 0.25f && v <= 1.0f) g_settings.vr_foveation_inner = v;
+        }
+        else if (!strcmp(key, "vr_foveation_outer")) {
+            const float v = (float)atof(val);
+            if (isfinite(v) && v >= 0.30f && v <= 1.25f) g_settings.vr_foveation_outer = v;
+        }
+        else if (!strcmp(key, "vr_fast_post")) g_settings.vr_fast_post = atoi(val) != 0;
+        else if (!strcmp(key, "async_replay")) g_settings.async_replay = atoi(val) != 0;
+        else if (!strcmp(key, "vr_near_clip")) {
+            const float v = (float)atof(val);
+            g_settings.vr_near_clip = v >= 5.0f && v <= 40.0f ? v : 15.0f;
+        }
         else if (!strcmp(key, "reshade")) g_settings.reshade = atoi(val) != 0;
+        else if (!strcmp(key, "vr")) g_settings.vr = atoi(val) != 0;
         else if (!strcmp(key, "volume")) g_settings.volume = (float)atof(val);
         else if (!strcmp(key, "reverb")) g_settings.reverb = atoi(val) != 0;
         else if (!strcmp(key, "movie_audio")) g_settings.movie_audio = atoi(val) != 0;
         else if (!strcmp(key, "show_fps")) g_settings.show_fps = atoi(val) != 0;
-        else if (!strcmp(key, "frame_rate")) g_settings.frame_rate = atoi(val) == 120 ? 120 : 60;
+        else if (!strcmp(key, "frame_rate")) g_settings.frame_rate = atoi(val) == 120 || atoi(val) == 144 ? atoi(val) : 60;
         else if (!strcmp(key, "resolution")) {
             int n = atoi(val);
             g_settings.res_mode = !strcmp(val, "dynamic") ? RES_DYNAMIC : (!strcmp(val, "75%") || !strcmp(val, "67%")) ? RES_Q75 :
@@ -273,7 +306,13 @@ void settings_save(void) {
     fprintf(f, "# Sky Recomp settings (edited from the in-game menu: F1, Esc, or Minus+Plus on a controller)\n");
     fprintf(f, "aspect = %s\n", g_settings.aspect == ASPECT_ORIGINAL ? "original" : "unlocked");
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
-    fprintf(f, "hd_textures = %d\nreshade = %d\n", g_settings.hd_textures, g_settings.reshade);
+    fprintf(f, "hd_textures = %d\nreshade = %d\nvr = %d\n", g_settings.hd_textures, g_settings.reshade, g_settings.vr);
+    fprintf(f, "draw_distance = %.2f\n", g_settings.draw_distance);
+    fprintf(f, "async_replay = %d\n", g_settings.async_replay);
+    fprintf(f, "vr_near_clip = %.1f\n", g_settings.vr_near_clip);
+    fprintf(f, "vr_mirror_hz = %d\nvr_foveation = %d\n", g_settings.vr_mirror_hz, g_settings.vr_foveation);
+    fprintf(f, "vr_foveation_inner = %.2f\nvr_foveation_outer = %.2f\nvr_fast_post = %d\n",
+            g_settings.vr_foveation_inner, g_settings.vr_foveation_outer, g_settings.vr_fast_post);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
@@ -316,4 +355,6 @@ void settings_save(void) {
     fprintf(f, "rom_path = %s\n", g_settings.rom_path);
     fprintf(f, "keys_path = %s\n", g_settings.keys_path);
     fclose(f);
+    // settings_save rewrites the legacy flat settings; restore the independent section afterwards.
+    SaveVRConfig(SETTINGS_FILE);
 }

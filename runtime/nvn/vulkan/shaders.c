@@ -20,7 +20,9 @@ static shaderc_shader_kind kind_of(int stage) {
 // SPIR-V disk cache: cache/spirv/<hash of stage + source>.spv, so a known shader costs a file read instead of a
 // GLSL compile (the driver's pipeline cache only covers the step after this one).
 static uint64_t src_hash(const char *src, int stage) {
-    uint64_t h = (0xcbf29ce484222325ull ^ (uint64_t)stage) + 3;  // + version of the post-processing (no_contraction)
+    // Version 4 enables shaderc's performance optimizer for fragment/compute shaders.  Keep this in the key:
+    // otherwise an existing cache silently keeps serving the older unoptimized modules.
+    uint64_t h = (0xcbf29ce484222325ull ^ (uint64_t)stage) + 4;
     for (const char *p = src; *p; p++) { h ^= (uint8_t)*p; h *= 0x100000001B3ull; }
     return h;
 }
@@ -110,9 +112,11 @@ static uint32_t *no_contraction(uint32_t *spv, size_t *nwords) {
 
 // SPIR-V words of src, or NULL (error logged with the source). *nwords set on success. Thread-safe: one shaderc
 // compiler per thread (a shared one behind a lock serialised all the pipeline workers).
-// No spirv-opt by default: it rewrote the depth pre-pass and colour-pass vertex shaders differently enough that
-// their depths stopped matching (EQUAL test: black holes in foliage), and it was most of the compile time; the
-// driver optimises anyway. LARECOMP_VK_OPT=1 turns it back on (experiments).
+// Vertex optimization stays off by default: it rewrote the depth pre-pass and colour-pass shaders differently
+// enough that their depths stopped matching (EQUAL test: black holes in foliage). Fragment and compute shaders do
+// not have that cross-pipeline equality constraint, and the VR profile is dominated by duplicated fragment work,
+// so optimize those by default. LARECOMP_VK_OPT=1 also optimizes vertex shaders; LARECOMP_VK_NO_OPT=1 disables all
+// shaderc optimization for diagnostics.
 uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t *nwords) {
     uint64_t h = src_hash(src, stage);
     static int nocache = -1;
@@ -123,8 +127,9 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     if (!comp) comp = shaderc_compiler_initialize();
     shaderc_compile_options_t o = shaderc_compile_options_initialize();
     shaderc_compile_options_set_target_env(o, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
-    shaderc_compile_options_set_optimization_level(o, getenv("LARECOMP_VK_OPT") ? shaderc_optimization_level_performance
-                                                                                  : shaderc_optimization_level_zero);
+    const bool optimize = !getenv("LARECOMP_VK_NO_OPT") && (stage != STAGE_VERTEX || getenv("LARECOMP_VK_OPT"));
+    shaderc_compile_options_set_optimization_level(o, optimize ? shaderc_optimization_level_performance
+                                                                : shaderc_optimization_level_zero);
     shaderc_compilation_result_t r = shaderc_compile_into_spv(comp, src, strlen(src), kind_of(stage), name, "main", o);
     shaderc_compile_options_release(o);
     if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {
@@ -159,7 +164,7 @@ VkShaderModule vk_compile_glsl(const char *src, int stage, const char *name) {
 
 // ================================================================== reflection
 // Just enough SPIR-V parsing to list the descriptor bindings a module declares (set, binding, type).
-enum { OP_TYPE_IMAGE = 25, OP_TYPE_SAMPLER = 26, OP_TYPE_SAMPLED_IMAGE = 27, OP_TYPE_ARRAY = 28, OP_TYPE_RUNTIME_ARRAY = 29,
+enum { OP_CONSTANT = 43, OP_TYPE_IMAGE = 25, OP_TYPE_SAMPLER = 26, OP_TYPE_SAMPLED_IMAGE = 27, OP_TYPE_ARRAY = 28, OP_TYPE_RUNTIME_ARRAY = 29,
        OP_TYPE_STRUCT = 30, OP_TYPE_POINTER = 32, OP_VARIABLE = 59, OP_DECORATE = 71 };
 enum { DEC_BLOCK = 2, DEC_BUFFER_BLOCK = 3, DEC_BINDING = 33, DEC_SET = 34 };
 enum { SC_UNIFORM_CONSTANT = 0, SC_UNIFORM = 2, SC_STORAGE_BUFFER = 12 };
@@ -170,6 +175,7 @@ int vk_reflect(const uint32_t *spv, size_t n, VkBindingInfo *out, int max) {
     int32_t *binding = malloc(bound * sizeof *binding), *set = malloc(bound * sizeof *set);
     uint8_t *flags = calloc(bound, 1);    // 1 Block, 2 BufferBlock
     uint32_t *op = calloc(bound, sizeof *op), *ref = calloc(bound, sizeof *ref), *sc = calloc(bound, sizeof *sc);
+    uint32_t *len = calloc(bound, sizeof *len), *cval = calloc(bound, sizeof *cval);  // (array lengths: constants)
     for (uint32_t i = 0; i < bound; i++) binding[i] = set[i] = -1;
     for (size_t i = 5; i < n;) {
         uint32_t wc = spv[i] >> 16, o = spv[i] & 0xFFFF;
@@ -182,9 +188,12 @@ int vk_reflect(const uint32_t *spv, size_t n, VkBindingInfo *out, int max) {
             else if (w[2] == DEC_BUFFER_BLOCK) flags[w[1]] |= 2;
         } else if ((o == OP_TYPE_IMAGE || o == OP_TYPE_SAMPLER || o == OP_TYPE_SAMPLED_IMAGE || o == OP_TYPE_STRUCT) && wc >= 2 && w[1] < bound) {
             op[w[1]] = o;
+        } else if (o == OP_CONSTANT && wc >= 4 && w[2] < bound) {
+            cval[w[2]] = w[3];
         } else if ((o == OP_TYPE_ARRAY || o == OP_TYPE_RUNTIME_ARRAY) && wc >= 3 && w[1] < bound) {
             op[w[1]] = o;
             ref[w[1]] = w[2];
+            if (o == OP_TYPE_ARRAY && wc >= 4 && w[3] < bound) len[w[1]] = cval[w[3]];
         } else if (o == OP_TYPE_POINTER && wc >= 4 && w[1] < bound) {
             op[w[1]] = o;
             sc[w[1]] = w[2];
@@ -200,6 +209,7 @@ int vk_reflect(const uint32_t *spv, size_t n, VkBindingInfo *out, int max) {
     for (uint32_t id = 0; id < bound && cnt < max; id++) {
         if (op[id] != OP_VARIABLE || binding[id] < 0) continue;
         uint32_t t = ref[ref[id]];  // pointee
+        uint32_t count = t < bound && op[t] == OP_TYPE_ARRAY && len[t] ? len[t] : 1;  // (an array of descriptors)
         while (t < bound && (op[t] == OP_TYPE_ARRAY || op[t] == OP_TYPE_RUNTIME_ARRAY)) t = ref[t];
         VkDescriptorType dt;
         if (t >= bound) continue;
@@ -209,9 +219,9 @@ int vk_reflect(const uint32_t *spv, size_t n, VkBindingInfo *out, int max) {
         else if (op[t] == OP_TYPE_STRUCT && (sc[id] == SC_STORAGE_BUFFER || (flags[t] & 2))) dt = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         else if (op[t] == OP_TYPE_STRUCT && sc[id] == SC_UNIFORM) dt = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         else continue;
-        out[cnt++] = (VkBindingInfo){(uint32_t)(set[id] < 0 ? 0 : set[id]), (uint32_t)binding[id], dt};
+        out[cnt++] = (VkBindingInfo){(uint32_t)(set[id] < 0 ? 0 : set[id]), (uint32_t)binding[id], dt, count};
     }
-    free(binding); free(set); free(flags); free(op); free(ref); free(sc);
+    free(binding); free(set); free(flags); free(op); free(ref); free(sc); free(len); free(cval);
     return cnt;
 }
 
@@ -219,7 +229,7 @@ VkDescriptorSetLayout vk_set_layout(const VkBindingInfo *b, int n, uint32_t set,
     VkDescriptorSetLayoutBinding lb[96];
     uint32_t k = 0;
     for (int i = 0; i < n && k < 96; i++)
-        if (b[i].set == set) lb[k++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].type, 1, stages, NULL};
+        if (b[i].set == set) lb[k++] = (VkDescriptorSetLayoutBinding){b[i].binding, b[i].type, b[i].count ? b[i].count : 1, stages, NULL};
     VkDescriptorSetLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = k, .pBindings = lb};
     VkDescriptorSetLayout l;
     VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &ci, NULL, &l));
@@ -383,6 +393,32 @@ static const char *builtin_src(const char *name, int *stage) {
     }
     // FSR 1 RCAS: contrast-adaptive sharpening of the EASU output (same size). a.x = sharpness (exp2(-stops)),
     // b.xy = image size. The lobe is limited so the result stays inside the neighbours' range; noise is damped.
+    // VR supersampling (exec.c vk_vr_eye_post): the game image, larger than the headset's eye image, filtered down.
+    // A blit's bilinear filter reads 2 x 2 texels per output pixel, so above ~1.5x it skips most of the image and the
+    // supersampling's anti-aliasing is lost. Here: a tent over one output pixel each way, 4 x 4 bilinear taps (each
+    // averaging 2 x 2 texels), enough for up to ~2.5x. pc.a = (1 / input size, input pixels per output pixel),
+    // pc.b.xy = output size.
+    if (!strcmp(name, "down.frag")) {
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  vec2 uv = gl_FragCoord.xy / pc.b.xy;\n"
+               "  vec2 px = pc.a.zw * pc.a.xy;\n"
+               "  vec3 s = vec3(0.0);\n"
+               "  float ws = 0.0;\n"
+               "  for (int j = 0; j < 4; j++)\n"
+               "    for (int i = 0; i < 4; i++) {\n"
+               "      vec2 f = (vec2(i, j) - 1.5) * 0.5;\n"
+               "      float w = (1.0 - abs(f.x)) * (1.0 - abs(f.y));\n"
+               "      s += texture(t, uv + f * px).rgb * w;\n"
+               "      ws += w;\n"
+               "    }\n"
+               "  o = vec4(s / ws, 1.0);\n"
+               "}\n";
+    }
     if (!strcmp(name, "rcas.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
@@ -483,6 +519,14 @@ static const char *builtin_src(const char *name, int *stage) {
                "  vec3 cmax = max(max(max(max(c, n), s), w), e);\n"
                "  o = vec4(clamp(sharp, cmin, cmax), 1.0);\n"
                "}\n";
+    }
+    // VR hidden area (exec.c hidden_mask): the headset's hidden triangles, positions already in NDC, at depth pc.d.x
+    if (!strcmp(name, "hidmask.vert")) {
+        *stage = STAGE_VERTEX;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { vec4 c; vec4 d; } pc;\n"
+               "layout(location = 0) in vec2 pos;\n"
+               "void main() { gl_Position = vec4(pos, pc.d.x, 1.0); }\n";
     }
     if (!strcmp(name, "clear.vert")) {
         *stage = STAGE_VERTEX;

@@ -31,3 +31,15 @@ Windows/Vulkan testing covered the launcher-to-game transition at 3840x2160 and 
 Run `make dist VISUAL_PACK=/path/to/4K` after preparing the normal Windows build dependencies and helpers. The pack directory must contain `reshade-shaders/`, the Henriko presets, and one directory of `tex2d_*.png` files (the supplied nested `4K texturas/contents/.../textures/` layout is supported). `PACK_PY` selects the build machine's Python executable if it is not `python3`.
 
 `tools/fetch_reshade.py` downloads the official installer **only on the build machine**, checks its pinned SHA-256 and extracts just the 64-bit Vulkan runtime without executing the installer. `tools/package_visuals.py` copies the complete provided visual pack and writes portable configuration, credits and the [ReShade BSD license](https://github.com/crosire/reshade/blob/v6.8.0/LICENSE.md). Packaging fails if the visual assets are missing, rather than producing a release with empty folders. Neither script runs on players' machines.
+
+## Loading
+
+A texture is matched to its replacement when the game uploads it (its data hashed on the render thread), but the
+PNG is decoded by three background threads: the texture keeps its original image for the few frames until its
+replacement is ready, then switches. Decoding dozens of 4K PNGs on the render thread when an area loaded used to
+freeze the game for 1.2-1.4 s (a disaster in a VR headset); now the worst frame of those loads is ~30-50 ms.
+`SKYRECOMP_TEX_SYNC=1` decodes on the spot as before. A frame that spends over 10 ms matching textures is logged.
+
+The pack is looked for in `mods/textures/` next to the executable's working directory (`build/` for a development
+build: copy or link the release's `mods/textures` there, or the option has nothing to load - the log says
+`[custom_tex] registered 0 replacement textures`).

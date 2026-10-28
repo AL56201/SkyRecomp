@@ -10,7 +10,12 @@
 #include "../../third_party/xxhash/xxhash.h"
 
 // Ryujinx replacement names use XXH3-128 of the linear texture data, not MD5.
-typedef struct { char hash[33], path[1200]; uint32_t w, h; } CustomTex;
+typedef struct {
+    char hash[33], path[1200];
+    uint32_t w, h;
+    int state;           // (decoding, under dec_lock) 0 idle, 1 queued / decoding, 2 decoded (ready), 3 failed
+    SDL_Surface *ready;  // the decoded RGBA32 image, waiting for its texture (custom_tex_fetch)
+} CustomTex;
 static CustomTex entries[4096];
 static int count;
 static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -77,7 +82,81 @@ static SDL_Surface *load(const CustomTex *e) {
     return rgba;
 }
 
+// ---- background decoding. A 4K PNG takes tens of milliseconds to decode; entering an area wants dozens at once,
+// which on the render thread dropped a 144 Hz headset to ~30 fps for a moment (and SteamVR then often stayed at 72).
+// Matching a texture (custom_tex_match: its data hashed as it is now) stays on the render thread; decoding runs on
+// DEC_THREADS threads, and the texture keeps its original image until its replacement is ready (custom_tex_fetch).
+// SKYRECOMP_TEX_SYNC=1: decode on the spot, as before.
+#define DEC_THREADS 3
+static pthread_mutex_t dec_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t dec_cv = PTHREAD_COND_INITIALIZER;
+static int dec_queue[4096], dec_head, dec_tail;  // (entry indices; 4096 = every entry at most once)
+static bool dec_started;
+
+static void *dec_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&dec_lock);
+        while (dec_head == dec_tail) pthread_cond_wait(&dec_cv, &dec_lock);
+        CustomTex *e = &entries[dec_queue[dec_head++ % 4096]];
+        pthread_mutex_unlock(&dec_lock);
+        SDL_Surface *s = load(e);
+        pthread_mutex_lock(&dec_lock);
+        e->ready = s;
+        e->state = s ? 2 : 3;
+        pthread_mutex_unlock(&dec_lock);
+    }
+    return NULL;
+}
+
+static bool dec_sync(void) {
+    static int sync = -1;
+    if (sync < 0) sync = getenv("SKYRECOMP_TEX_SYNC") != NULL;
+    return sync;
+}
+
+// A texture's replacement: its image now if decoded (the caller owns it), else NULL with *pending set while it is
+// being decoded (asked again later), or clear when there is none to come.
+SDL_Surface *custom_tex_fetch(const void *match, bool *pending) {
+    CustomTex *e = (CustomTex *)match;
+    *pending = false;
+    if (!e) return NULL;
+    if (dec_sync()) return load(e);
+    pthread_mutex_lock(&dec_lock);
+    SDL_Surface *s = NULL;
+    if (e->state == 2) {
+        s = e->ready;
+        e->ready = NULL;
+        e->state = 0;  // (taken: another texture with the same data decodes it again)
+    } else if (e->state == 3) {
+        e->state = 0;
+    } else {
+        *pending = true;
+        if (e->state == 0) {
+            e->state = 1;
+            dec_queue[dec_tail++ % 4096] = (int)(e - entries);
+            if (!dec_started) {
+                dec_started = true;
+                for (int i = 0; i < DEC_THREADS; i++) {
+                    pthread_t th;
+                    pthread_create(&th, NULL, dec_main, NULL);
+                    pthread_detach(th);
+                }
+            }
+            pthread_cond_signal(&dec_cv);
+        }
+    }
+    pthread_mutex_unlock(&dec_lock);
+    return s;
+}
+
 SDL_Surface *custom_tex_load(const NvnTexture *t) {
+    bool pending;
+    return custom_tex_fetch(custom_tex_match(t), &pending);
+}
+
+// The replacement entry for a texture's current data (render thread: it reads the texture's memory), or NULL.
+const void *custom_tex_match(const NvnTexture *t) {
     if (!g_settings.hd_textures) return NULL;
     custom_tex_init();
     if (!count || !t || !t->addr || t->target != 1 || t->samples > 1 || (t->flags & 8)) return NULL;
@@ -110,5 +189,5 @@ SDL_Surface *custom_tex_load(const NvnTexture *t) {
     const CustomTex *e = find(t, linear, total);
     if (!e && first != total) e = find(t, linear, first);
     free(linear);
-    return e ? load(e) : NULL;
+    return e;
 }

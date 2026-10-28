@@ -33,7 +33,16 @@ typedef struct {
     bool show_fps;
     bool hd_textures;    // external texture replacements, applied live on Vulkan
     bool reshade;        // load the bundled Windows ReShade layer on the next launch
-    int frame_rate;       // 60 or 120; the Skyward Sword simulation step follows this target
+    float draw_distance; // objects' draw distances times this (1 = the game's; up to 4): runtime/hle/vr_cull.c
+    bool vr;             // experimental OpenXR/SteamVR preview, applied on the next launch
+    int vr_mirror_hz;    // VR: desktop mirror refreshes per second (30, 60, 90; 0 = every headset frame)
+    bool vr_foveation;   // VR: coarser shading toward the lens edges (VK_KHR_fragment_shading_rate), live
+    float vr_foveation_inner;  // fraction of half-FOV where 2x2 shading begins
+    float vr_foveation_outer;  // fraction of half-FOV where 4x4 shading begins (when supported)
+    bool vr_fast_post;   // bypass optional VR SMAA/upscale/sharpen passes
+    bool async_replay;   // Multithreaded Rendering: commands replayed on their own thread (nvn/async.c), next launch
+    float vr_near_clip;  // VR 1st person: geometry nearer than this is clipped, game units (5..40): vr_rig.c
+    int frame_rate;       // 60, 120 or 144 (in VR, the high ones follow the headset); the Skyward Sword simulation step follows this target
     bool dpad_move;      // the d-pad (and arrow keys) move Link like the stick
     bool free_cam;       // right stick looks around without holding L
     float free_cam_sens; // camera-only stick speed, 0.25x to 2x

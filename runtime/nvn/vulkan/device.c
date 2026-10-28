@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,8 @@
 
 #include "../../paths.h"
 #include "../../settings.h"
+#include "../../vr/vr.h"
+#include "../../vr/vr_settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
 #include "../output_scale.h"
@@ -22,6 +25,9 @@ VkG g_vk;
 static SDL_Window *window;
 static atomic_bool ui_ready;
 static VkDebugUtilsMessengerEXT messenger;
+static pthread_mutex_t pipeline_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct { uint32_t magic, version; uint64_t blob_size; } SkyPipelineCacheHeader;
+enum { SKY_PIPELINE_CACHE_MAGIC = 0x43504B53u, SKY_PIPELINE_CACHE_VERSION = 2 };
 
 void vk_memory_report(void) {
 #ifdef _WIN32
@@ -55,8 +61,16 @@ static void create_instance(void) {
     const char *ext[16];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
+    if (vr_requested()) {
+        // SteamVR's OpenXR Vulkan bridge obtains the HMD GPU through these KHR entry points even though the
+        // underlying queries are core in modern Vulkan. They are requested only for the opt-in VR path.
+        ext[n_ext++] = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
+        ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME;
+        ext[n_ext++] = VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME;
+    }
     bool validate = getenv("LARECOMP_VK_VALIDATION") != NULL;
-    if (validate) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
+    const bool markers = getenv("SKYRECOMP_GPU_MARKERS") && atoi(getenv("SKYRECOMP_GPU_MARKERS"));  // (profiler labels)
+    if (validate || markers) ext[n_ext++] = VK_EXT_DEBUG_UTILS_EXTENSION_NAME;
     const char *layers[] = {"VK_LAYER_KHRONOS_validation"};
     VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "SkyRecomp",
                              .pEngineName = "SkyRecomp", .apiVersion = VK_API_VERSION_1_3};
@@ -67,9 +81,18 @@ static void create_instance(void) {
     if (r != VK_SUCCESS && validate) {
         LOG("[vk] validation layer unavailable (%d); continuing without\n", r);
         ci.enabledLayerCount = 0;
-        ci.enabledExtensionCount--;
+        if (!markers) ci.enabledExtensionCount--;  // (debug utils stay for the profiler markers)
         validate = false;
         r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+    }
+    if (r != VK_SUCCESS && markers && !validate) {  // (no debug utils: no labels)
+        ci.enabledExtensionCount--;
+        r = vkCreateInstance(&ci, NULL, &g_vk.inst);
+    } else if (r == VK_SUCCESS && (markers || validate)) {
+        g_vk.label_begin = (PFN_vkCmdBeginDebugUtilsLabelEXT)vkGetInstanceProcAddr(g_vk.inst, "vkCmdBeginDebugUtilsLabelEXT");
+        g_vk.label_end = (PFN_vkCmdEndDebugUtilsLabelEXT)vkGetInstanceProcAddr(g_vk.inst, "vkCmdEndDebugUtilsLabelEXT");
+        if (!markers) g_vk.label_begin = NULL, g_vk.label_end = NULL;  // (validation alone: no labels)
+        if (g_vk.label_begin) LOG("[vk] GPU markers on (VK_EXT_debug_utils labels for profilers)\n");
     }
     if (r != VK_SUCCESS) FATAL("vkCreateInstance: %d (is a Vulkan 1.3 driver installed?)\n", r);
     if (validate) {
@@ -158,7 +181,7 @@ static void create_device(void) {
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, NULL);
     VkExtensionProperties *ep = calloc(ne, sizeof *ep);
     vkEnumerateDeviceExtensionProperties(g_vk.phys, NULL, &ne, ep);
-    const char *ext[8];
+    const char *ext[16];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
     g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
@@ -169,6 +192,62 @@ static void create_device(void) {
     if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
     bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);  // device-lost diagnostics (vk_device_fault_report)
     if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
+    {
+        // Keep the optional OpenXR sharing entry points available even for a desktop launch, so VR can be enabled
+        // later from the menu without recreating the Vulkan device. SteamVR loads the KHR entry points by name even
+        // where Vulkan has promoted the operations to core.
+        const char *xr_ext[] = {VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
+                                VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
+                                VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+#ifdef _WIN32
+                                "VK_KHR_external_memory_win32",
+#endif
+                                VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+#ifdef _WIN32
+                                "VK_KHR_external_semaphore_win32",
+#endif
+        };
+        for (uint32_t i = 0; i < sizeof xr_ext / sizeof *xr_ext; i++) {
+            if (has_ext(ep, ne, xr_ext[i])) ext[n_ext++] = xr_ext[i];
+            else if (vr_requested()) LOG("[vr] Vulkan device extension unavailable: %s\n", xr_ext[i]);
+        }
+    }
+    // VR: fixed foveated shading (exec.c) - coarser shading toward the lenses' blurry edges, by a rate image
+    // Off by default (VR Options > Foveated Rendering, live; SKYRECOMP_VR_FOVEATION=on / <inner>,<outer> / 0
+    // overrides): measured in Skyloft it saved ~0.4 ms of ~10 at 1.5x - the game's eye passes are bound by geometry
+    // and bandwidth, not pixel shading. The extension is on with VR so the setting can change while playing.
+    // Enable the capability whenever the device supports it, even if VR or
+    // foveation starts disabled. Both VR Options switches can then turn it on
+    // without recreating the Vulkan device.
+    const bool vrs_ext = has_ext(ep, ne, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrs_have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+    if (vrs_ext) {
+        VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &vrs_have};
+        vkGetPhysicalDeviceFeatures2(g_vk.phys, &f2);
+        VkPhysicalDeviceFragmentShadingRatePropertiesKHR pr = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+        VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &pr};
+        vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+        PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR rates =
+            (PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR)vkGetInstanceProcAddr(g_vk.inst, "vkGetPhysicalDeviceFragmentShadingRatesKHR");
+        VkPhysicalDeviceFragmentShadingRateKHR r[16];
+        uint32_t nr = 16;
+        for (uint32_t i = 0; i < 16; i++) r[i] = (VkPhysicalDeviceFragmentShadingRateKHR){.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR};
+        if (rates && rates(g_vk.phys, &nr, r) >= 0) {
+            if (nr > 16) nr = 16;
+            for (uint32_t i = 0; i < nr; i++) {
+                const uint32_t w = r[i].fragmentSize.width, h = r[i].fragmentSize.height;
+                if (w <= 4 && h <= 4 && (r[i].sampleCounts & VK_SAMPLE_COUNT_1_BIT))
+                    g_vk.vrs_rates |= (uint16_t)(1u << ((w == 4 ? 2 : w == 2 ? 1 : 0) * 3 + (h == 4 ? 2 : h == 2 ? 1 : 0)));
+            }
+        }
+        g_vk.vrs_texel_w = pr.maxFragmentShadingRateAttachmentTexelSize.width;
+        g_vk.vrs_texel_h = pr.maxFragmentShadingRateAttachmentTexelSize.height;
+        g_vk.vrs = vrs_have.attachmentFragmentShadingRate && g_vk.vrs_texel_w && g_vk.vrs_texel_h;
+        LOG("[vr] foveated shading: %s (attachment rates %d, texel %ux%u..%ux%u, rates mask %#x)\n", g_vk.vrs ? "on" : "unavailable",
+            (int)vrs_have.attachmentFragmentShadingRate, pr.minFragmentShadingRateAttachmentTexelSize.width,
+            pr.minFragmentShadingRateAttachmentTexelSize.height, g_vk.vrs_texel_w, g_vk.vrs_texel_h, g_vk.vrs_rates);
+        if (g_vk.vrs) ext[n_ext++] = VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME;
+    }
     g_fault_ext = fault;
     free(ep);
 
@@ -190,11 +269,18 @@ static void create_device(void) {
                                             .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
                                             .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
                                             .scalarBlockLayout = VK_TRUE, .pNext = &f13};
+    VkPhysicalDeviceVulkan11Features have11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceFeatures2 have2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11};
+    vkGetPhysicalDeviceFeatures2(g_vk.phys, &have2);
+    g_vk.multiview = vr_requested() && have11.multiview;  // (VR: both eyes in one pass, exec.c)
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-                                            .storageBuffer16BitAccess = VK_TRUE, .pNext = &f12};
+                                            .storageBuffer16BitAccess = VK_TRUE, .multiview = g_vk.multiview, .pNext = &f12};
+    VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrs_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
+                                                              .attachmentFragmentShadingRate = VK_TRUE, .pNext = &f11};
+    void *chain = g_vk.vrs ? (void *)&vrs_on : (void *)&f11;
     VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
-                                           .pNext = &f11};
-    VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : (void *)&f11};
+                                           .pNext = chain};
+    VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : chain};
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
     b->independentBlend = h->independentBlend;
     b->dualSrcBlend = h->dualSrcBlend;
@@ -213,6 +299,7 @@ static void create_device(void) {
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
+    g_vk.depth_bounds = b->depthBounds = vr_requested() && h->depthBounds;  // (VR hidden area: exec.c)
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -234,41 +321,85 @@ static void create_device(void) {
                                   .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = g_vk.qfam};
     VK_CHECK(vkCreateCommandPool(g_vk.dev, &pi, NULL, &g_vk.pool));
 
-    // pipeline cache: cache/vk_pipelines.bin (written by vk_pipeline_cache_save)
+    // pipeline cache: cache/vk_pipelines.bin (written by vk_pipeline_cache_save).
+    // Our header invalidates driver blobs when renderer pipeline semantics
+    // change even if the driver's UUID remains the same.
     size_t sz = 0;
     void *data = NULL;
     FILE *fp = fopen("cache/vk_pipelines.bin", "rb");
     if (fp) {
         fseek(fp, 0, SEEK_END);
-        sz = (size_t)ftell(fp);
+        long end = ftell(fp);
+        sz = end > 0 && end <= 64 * 1024 * 1024 ? (size_t)end : 0;
         fseek(fp, 0, SEEK_SET);
-        data = malloc(sz);
-        if (fread(data, 1, sz, fp) != sz) sz = 0;
+        data = sz ? malloc(sz) : NULL;
+        if (!data || fread(data, 1, sz, fp) != sz) sz = 0;
         fclose(fp);
+        // Reject stale/corrupt blobs before passing them to the driver. The
+        // Vulkan header identifies the exact vendor, device and driver UUID.
+        if (sz < sizeof(SkyPipelineCacheHeader) + sizeof(VkPipelineCacheHeaderVersionOne)) sz = 0;
+        if (sz) {
+            const SkyPipelineCacheHeader *app = data;
+            const uint8_t *blob = (const uint8_t *)data + sizeof *app;
+            const size_t blob_size = sz - sizeof *app;
+            const VkPipelineCacheHeaderVersionOne *h = (const VkPipelineCacheHeaderVersionOne *)blob;
+            if (app->magic != SKY_PIPELINE_CACHE_MAGIC || app->version != SKY_PIPELINE_CACHE_VERSION ||
+                app->blob_size != blob_size || h->headerSize < sizeof *h || h->headerSize > blob_size ||
+                h->headerVersion != VK_PIPELINE_CACHE_HEADER_VERSION_ONE ||
+                h->vendorID != g_vk.props.vendorID || h->deviceID != g_vk.props.deviceID ||
+                memcmp(h->pipelineCacheUUID, g_vk.props.pipelineCacheUUID, VK_UUID_SIZE)) sz = 0;
+            else { memmove(data, blob, blob_size); sz = blob_size; }
+        }
     }
     VkPipelineCacheCreateInfo pc = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = sz,
                                     .pInitialData = data};
     if (vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache) != VK_SUCCESS) {
+        sz = 0;
         pc.initialDataSize = 0;
         VK_CHECK(vkCreatePipelineCache(g_vk.dev, &pc, NULL, &g_vk.pcache));
     }
+    LOG("[vk] pipeline cache: %s (%zu bytes)\n", sz ? "loaded" : "new", sz);
     free(data);
 }
 
 void vk_pipeline_cache_save(void) {
+    pthread_mutex_lock(&pipeline_cache_lock);
     size_t sz = 0;
-    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) return;
+    if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) != VK_SUCCESS || !sz) {
+        pthread_mutex_unlock(&pipeline_cache_lock);
+        return;
+    }
     void *data = malloc(sz);
+    if (!data) {
+        pthread_mutex_unlock(&pipeline_cache_lock);
+        return;
+    }
     if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, data) == VK_SUCCESS) {
         mkdir("cache", 0755);
         FILE *f = fopen("cache/vk_pipelines.bin.tmp", "wb");
         if (f) {
-            bool ok = fwrite(data, 1, sz, f) == sz;
+            const SkyPipelineCacheHeader h = {SKY_PIPELINE_CACHE_MAGIC, SKY_PIPELINE_CACHE_VERSION, sz};
+            bool ok = fwrite(&h, 1, sizeof h, f) == sizeof h && fwrite(data, 1, sz, f) == sz;
             fclose(f);
             if (ok) { remove("cache/vk_pipelines.bin"); rename("cache/vk_pipelines.bin.tmp", "cache/vk_pipelines.bin"); }
         }
     }
     free(data);
+    pthread_mutex_unlock(&pipeline_cache_lock);
+}
+
+VkResult vk_create_graphics_pipelines(uint32_t count, const VkGraphicsPipelineCreateInfo *info, VkPipeline *pipelines) {
+    pthread_mutex_lock(&pipeline_cache_lock);
+    VkResult r = vkCreateGraphicsPipelines(g_vk.dev, g_vk.pcache, count, info, NULL, pipelines);
+    pthread_mutex_unlock(&pipeline_cache_lock);
+    return r;
+}
+
+VkResult vk_create_compute_pipelines(uint32_t count, const VkComputePipelineCreateInfo *info, VkPipeline *pipelines) {
+    pthread_mutex_lock(&pipeline_cache_lock);
+    VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, count, info, NULL, pipelines);
+    pthread_mutex_unlock(&pipeline_cache_lock);
+    return r;
 }
 
 // ================================================================== swapchain
@@ -286,6 +417,12 @@ static VkPresentModeKHR present_mode(void) {
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
     for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
+    // VR: the window is only the desktop mirror and must never wait for the monitor. With FIFO (AMD on Windows has
+    // no MAILBOX) a 60 Hz monitor held the headset's frames to 60 Hz once its queue filled up, so SteamVR saw late
+    // frames and throttled the headset between 72 and 48 Hz (~57 fps); IMMEDIATE (tearing on the mirror only):
+    // a steady 72 on a 144 Hz Index.
+    if (vr_requested() && !e)
+        for (uint32_t i = 0; i < n; i++) if (m[i] == VK_PRESENT_MODE_IMMEDIATE_KHR) return VK_PRESENT_MODE_IMMEDIATE_KHR;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -305,16 +442,23 @@ static void create_swapchain(void) {
     VkSurfaceFormatKHR sf = fmts[0];
     for (uint32_t i = 0; i < nf; i++)
         if (fmts[i].format == VK_FORMAT_B8G8R8A8_UNORM && fmts[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) { sf = fmts[i]; break; }
-    uint32_t count = caps.minImageCount + 1;
+    const VkPresentModeKHR mode = present_mode();
+    // FIFO/IMMEDIATE use the smallest practical two-image chain to minimize
+    // queued latency. MAILBOX needs one additional image so rendering does not
+    // stall while the compositor owns the displayed image.
+    uint32_t count = mode == VK_PRESENT_MODE_MAILBOX_KHR ? caps.minImageCount + 1 : 2;
+    if (count < caps.minImageCount) count = caps.minImageCount;
     if (caps.maxImageCount && count > caps.maxImageCount) count = caps.maxImageCount;
     if (count > 8) count = 8;
     VkSwapchainKHR old = g_vk.swapchain;
     VkSwapchainCreateInfoKHR ci = {
         .sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR, .surface = g_vk.surface, .minImageCount = count,
         .imageFormat = sf.format, .imageColorSpace = sf.colorSpace, .imageExtent = ext, .imageArrayLayers = 1,
-        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        // Presentation renders directly into the image; transfer source is
+        // needed only for screenshots. Nothing copies into a swapchain image.
+        .imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         .imageSharingMode = VK_SHARING_MODE_EXCLUSIVE, .preTransform = caps.currentTransform,
-        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = present_mode(), .clipped = VK_TRUE,
+        .compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR, .presentMode = mode, .clipped = VK_TRUE,
         .oldSwapchain = old};
     VkSwapchainKHR next = VK_NULL_HANDLE;
     VkResult result = vkCreateSwapchainKHR(g_vk.dev, &ci, NULL, &next);
@@ -334,6 +478,9 @@ static void create_swapchain(void) {
     g_vk.sc_extent = ext;
     g_vk.sc_count = 8;
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+    LOG("[vk] present mode %s, %u swapchain images\n",
+        mode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox" : mode == VK_PRESENT_MODE_IMMEDIATE_KHR ? "immediate" : "fifo",
+        g_vk.sc_count);
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_vk.sc_images[i],
                                     .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sf.format,
@@ -499,6 +646,24 @@ uint64_t vk_frame_counter(void) { return g_frame_counter; }
 static float g_shot_crop[4] = {0, 0, 1, 1};
 static double last_fps_time;
 static NvnTexture *g_last_presented;
+static atomic_int g_vr_enabled_request = -1;
+
+// Called by the settings UI, which may be on the game thread while asynchronous replay presents on another one.
+// The transition is performed only after a complete frame has been submitted and presented.
+void vk_vr_request_enabled(bool enabled) { atomic_store(&g_vr_enabled_request, enabled ? 1 : 0); }
+
+static void vr_apply_enabled_request(void) {
+    const int enabled = atomic_exchange(&g_vr_enabled_request, -1);
+    if (enabled < 0 || !g_vk.dev) return;
+    vkDeviceWaitIdle(g_vk.dev);
+    if (!enabled) {
+        vr_shutdown();
+        LOG("[vr] disabled from the VR settings\n");
+    } else if (!vr_available()) {
+        if (!vr_vulkan_init((void *)g_vk.inst, (void *)g_vk.phys, (void *)g_vk.dev, g_vk.qfam, 0))
+            LOG("[vr] could not enable from the VR settings; continuing in desktop mode\n");
+    }
+}
 
 const float *vk_shot_crop(void) { return g_shot_crop; }
 
@@ -509,19 +674,187 @@ void backend_set_window_crop(const int crop[4]) {
 
 void backend_present(NvnTexture *t);
 void backend_represent(void) {
+    extern bool nvn_async_on(void), nvn_async_is_replay_thread(void);
+    extern void nvn_async_represent(void);
+    if (nvn_async_on() && !nvn_async_is_replay_thread()) { nvn_async_represent(); return; }
     if (g_last_presented) backend_present(g_last_presented);
     else SDL_Delay(16);
 }
 
+// Each presented frame, the hooks that act on the game (scripted input, warps, tests, the save editor): on the
+// game thread - with the asynchronous replay (nvn/async.c) when the present is queued.
+void present_game_hooks(uint64_t frame) {
+    {   // (test) LARECOMP_FRAME_RATE_AT=<frame>:<60|120|144>: the frame rate setting from that frame on (scripted
+        // routes are recorded by frame number at 60 FPS)
+        static long at = -2, rate;
+        if (at == -2 && (!getenv("LARECOMP_FRAME_RATE_AT") || sscanf(getenv("LARECOMP_FRAME_RATE_AT"), "%ld:%ld", &at, &rate) != 2)) at = -1;
+        if (at >= 0 && (long)frame == at) { g_settings.frame_rate = (int)rate; LOG("[test] frame rate %ld from frame %ld\n", rate, at); }
+    }
+    extern void input_frame(uint64_t frame);
+    input_frame(frame);
+    static long slow_ms = -1;
+    if (slow_ms < 0) slow_ms = getenv("LARECOMP_SLOW_FRAME_MS") ? atol(getenv("LARECOMP_SLOW_FRAME_MS")) : 0;
+    static long slow_until = -1;  // LARECOMP_SLOW_FRAME_UNTIL=<frame>: the stall ends there (frame pacing recovery tests)
+    if (slow_until < 0) slow_until = getenv("LARECOMP_SLOW_FRAME_UNTIL") ? atol(getenv("LARECOMP_SLOW_FRAME_UNTIL")) : 0;
+    if (slow_ms > 0 && frame > 2600 && (!slow_until || (long)frame < slow_until)) SDL_Delay((Uint32)slow_ms);
+    extern void fnprof_frame(uint64_t frame);
+    fnprof_frame(frame);
+    extern void warp_frame(uint64_t frame);
+    warp_frame(frame);
+    extern void reboot_test_frame(uint64_t frame);  // runtime/main.c (LARECOMP_REBOOT_AT)
+    reboot_test_frame(frame);
+    extern void save_editor_frame(uint64_t frame);
+    save_editor_frame(frame);
+}
+
+static char g_post_shot[64];  // (eye shots) eye 0 after vk_vr_eye_post, saved this frame
+
+// SKYRECOMP_VR_PACE_TRACE=1: the VR present's CPU time by part (ms per frame, every 300 frames)
+enum { PT_POLL, PT_HEAD, PT_POST, PT_EYECOPY, PT_MIRROR_ACQ, PT_MIRROR_DRAW, PT_MENU, PT_MIRROR_END,
+       PT_SUBMIT, PT_ENDFRAME, PT_TAIL, PT_N };
+static const char *const pt_name[PT_N] = {"vr_poll", "head", "eye post", "eye copies (+acquire/wait)",
+                                          "mirror acquire", "mirror draw", "menu",
+                                          "mirror submit+present", "submit", "xrEndFrame", "after present"};
+static uint64_t pt_ns[PT_N], pt_last, pt_frames;
+static inline void pt_mark(int part) {
+    const uint64_t now = SDL_GetTicksNS();
+    if (pt_last) pt_ns[part] += now - pt_last;
+    pt_last = now;
+}
+static void pt_report(void) {
+    static int trace = -1;
+    if (trace < 0) trace = getenv("SKYRECOMP_VR_PACE_TRACE") != NULL;
+    if (!trace || ++pt_frames < 300) return;
+    char line[600];
+    int n = snprintf(line, sizeof line, "[vr] present CPU ms/frame:");
+    double total = 0;
+    for (int i = 0; i < PT_N; i++) {
+        total += pt_ns[i] / 1e6 / pt_frames;
+        if (pt_ns[i] / 1e6 / pt_frames >= 0.005)
+            n += snprintf(line + n, sizeof line - n, " %s %.3f,", pt_name[i], pt_ns[i] / 1e6 / pt_frames);
+    }
+    LOG("%s total %.3f\n", line, total);
+    memset(pt_ns, 0, sizeof pt_ns);
+    pt_frames = 0;
+}
+
 void backend_present(NvnTexture *t) {
+    pt_last = SDL_GetTicksNS();
+    vr_poll();
+    pt_mark(PT_POLL);
     static uint64_t pres_count;
     if (++pres_count % 60 == 1) LOG("[vk] present frame %llu\n", (unsigned long long)pres_count);
     g_last_presented = t;
     TexBackend *b = vk_tex(t, true);
     b->presented = true;
     vk_end_pass();
-    static const float black[4] = {0, 0, 0, 1};
     uint64_t t0 = SDL_GetTicksNS();
+    if (vr_running()) {
+        // Both eyes were recorded list by list (exec.c exec_list_stereo); here they go to the OpenXR swapchain's two
+        // array layers, recorded into the same submission as the desktop mirror. Game images stay in
+        // VK_IMAGE_LAYOUT_GENERAL throughout (vk.h).
+        vr_frame_begin();  // (no-op unless this frame executed no command list)
+        pt_mark(PT_HEAD);
+        {   // (test) SKYRECOMP_VR_EYE_SHOT=<frame>: both eyes' presented images -> build/vr_eye0.png, build/vr_eye1.png.
+            // A list (<frame>,<frame>,...) saves build/vr_eye0_<frame>.png and build/vr_eye1_<frame>.png for each.
+            static long at[64];
+            static int n = -1;
+            static bool list;
+            if (n < 0) {
+                n = 0;
+                const char *e = getenv("SKYRECOMP_VR_EYE_SHOT");
+                list = e && strchr(e, ',');
+                while (e && *e && n < 64) {
+                    at[n++] = strtol(e, (char **)&e, 10);
+                    while (*e == ',' || *e == ' ') e++;
+                }
+            }
+            static long every = -1;  // SKYRECOMP_VR_EYE_SHOT_EVERY=<frames>: eye 0 -> build/vr_live_<frame>.png
+            if (every < 0) every = getenv("SKYRECOMP_VR_EYE_SHOT_EVERY") ? atol(getenv("SKYRECOMP_VR_EYE_SHOT_EVERY")) : 0;
+            if (every > 0 && total_frames % (uint64_t)every == 0) {
+                char p[64];
+                snprintf(p, sizeof p, "build/vr_live_%06llu.png", (unsigned long long)total_frames);
+                renderer_save_texture_tex(b, p);
+            }
+            for (int i = 0; i < n; i++) {
+                if (total_frames != (uint64_t)at[i]) continue;
+                char p0[64] = "build/vr_eye0.png", p1[64] = "build/vr_eye1.png";
+                if (list) {
+                    snprintf(p0, sizeof p0, "build/vr_eye0_%ld.png", at[i]);
+                    snprintf(p1, sizeof p1, "build/vr_eye1_%ld.png", at[i]);
+                }
+                renderer_save_texture_tex(b, p0);
+                if (b->vr_eye) renderer_save_texture_tex(b->vr_eye, p1);
+                snprintf(g_post_shot, sizeof g_post_shot, list ? "build/vr_post0_%ld.png" : "build/vr_post0.png", at[i]);
+                LOG("[vr] eye shots at frame %ld: eye 1 image %s\n", at[i], b->vr_eye ? "saved" : "missing");
+            }
+        }
+        TexBackend *mirror_src = b;  // (the desktop mirror shows eye 0 as the headset gets it: no second post chain)
+        {   // each eye: anti-aliased and filtered to the headset's eye size (exec.c vk_vr_eye_post), then copied
+            extern TexBackend *vk_vr_eye_post(int eye, TexBackend *b, uint32_t ow, uint32_t oh);
+            uint32_t ew = 0, eh = 0;
+            TexBackend *e1 = vk_vr_eye_image(t, 1) ? b->vr_eye : NULL, *p0 = b, *p1 = e1;
+            if (vr_eye_extent(&ew, &eh)) {
+                p0 = vk_vr_eye_post(0, b, ew, eh);
+                mirror_src = p0;
+                if (e1) p1 = vk_vr_eye_post(1, e1, ew, eh);
+            }
+            pt_mark(PT_POST);
+            if (g_post_shot[0]) {  // (SKYRECOMP_VR_EYE_SHOT: eye 0 as the headset gets it)
+                if (p0 != b) renderer_save_texture_tex(p0, g_post_shot);
+                g_post_shot[0] = 0;
+            }
+            vk_label_begin(vk_cmd(), "[VR] Eye copies");
+            vr_record_eye_copies((void *)vk_cmd(), (void *)p0->image, p1 ? (void *)p1->image : NULL, p0->width, p0->height,
+                                 renderer_origin_lower_left(), (uint32_t)p0->format, p0->layer0, p1 ? p1->layer0 : p0->layer0);
+            vk_label_end(vk_cmd());
+            pt_mark(PT_EYECOPY);
+        }
+        // Desktop mirror: the left eye, with the menu.
+        static const float mirror_black[4] = {0, 0, 0, 1};
+        // Keep the settings usable: opening the menu temporarily restores the mirror even when it is disabled.
+        // The mirror is a preview for the people around: refreshed at most Mirror Refresh Rate times a second
+        // (g_settings.vr_mirror_hz, default 60; SKYRECOMP_VR_MIRROR_HZ supplies its initial value), not at the headset's rate. Each
+        // mirror frame cost ~0.3 ms of this thread and doubled the time xrEndFrame then took (~0.55 -> ~1.1 ms): at
+        // 144 Hz, 1.0x went from a steady 144 to ~137 fps with it on.
+        static bool mirror_env_read;
+        static uint64_t mirror_next;
+        if (!mirror_env_read) {
+            mirror_env_read = true;
+            const char *e = getenv("SKYRECOMP_VR_MIRROR_HZ");
+            if (e) {
+                g_settings.vr_mirror_hz = (int)atof(e);
+                LOG("[vr] initial mirror rate from SKYRECOMP_VR_MIRROR_HZ (VR Options remains live)\n");
+            }
+        }
+        const double mirror_hz = g_settings.vr_mirror_hz;
+        const uint64_t now_ns = SDL_GetTicksNS();
+        const bool mirror_due = menu_is_open() || mirror_hz <= 0 || now_ns >= mirror_next;
+        const bool mirror = (g_vr_config.desktop_mirror || menu_is_open()) && mirror_due && vk_frame_begin(mirror_black);
+        if (mirror && mirror_hz > 0) {
+            const uint64_t period = (uint64_t)(1e9 / mirror_hz);
+            mirror_next = now_ns + period - period / 8 > mirror_next + period ? now_ns + period - period / 8 : mirror_next + period;
+        }
+        pt_mark(PT_MIRROR_ACQ);
+        if (mirror) {
+            VkExtent2D extent = vk_frame_extent();
+            float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, 0, 0, 1, 1};
+            vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
+            pt_mark(PT_MIRROR_DRAW);
+            menu_render((void *)vk_cmd(), extent.width, extent.height);
+            pt_mark(PT_MENU);
+            vk_frame_end(NULL);
+            pt_mark(PT_MIRROR_END);
+        } else {
+            renderer_submit();
+            pt_mark(PT_SUBMIT);
+        }
+        vk_vr_gpu_frame_end();
+        vr_frame_end();  // (after the submission: releases the eye image, ends the OpenXR frame)
+        pt_mark(PT_ENDFRAME);
+        goto present_complete;
+    }
+    static const float black[4] = {0, 0, 0, 1};
     bool have = vk_frame_begin(black);
     uint64_t nd = SDL_GetTicksNS() - t0;
     if (nd > 30000000) {
@@ -573,6 +906,9 @@ void backend_present(NvnTexture *t) {
     } else {
         renderer_submit();
     }
+present_complete:
+    ;
+    const bool pt_vr = vr_running();
     extern void vk_prof_frame(uint64_t frame, uint64_t present_ns);
     vk_prof_frame(total_frames, SDL_GetTicksNS() - t0);
     frames++;
@@ -580,23 +916,12 @@ void backend_present(NvnTexture *t) {
     g_frame_counter++;
     extern void vk_pace_frame(void);
     vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
-    extern void input_frame(uint64_t frame);
-    input_frame(total_frames);
-    static long slow_ms = -1;
-    if (slow_ms < 0) slow_ms = getenv("LARECOMP_SLOW_FRAME_MS") ? atol(getenv("LARECOMP_SLOW_FRAME_MS")) : 0;
-    static long slow_until = -1;  // LARECOMP_SLOW_FRAME_UNTIL=<frame>: the stall ends there (frame pacing recovery tests)
-    if (slow_until < 0) slow_until = getenv("LARECOMP_SLOW_FRAME_UNTIL") ? atol(getenv("LARECOMP_SLOW_FRAME_UNTIL")) : 0;
-    if (slow_ms > 0 && total_frames > 2600 && (!slow_until || (long)total_frames < slow_until)) SDL_Delay((Uint32)slow_ms);
-    extern void fnprof_frame(uint64_t frame);
-    fnprof_frame(total_frames);
-    extern void warp_frame(uint64_t frame);
-    warp_frame(total_frames);
-    extern void reboot_test_frame(uint64_t frame);  // runtime/main.c (LARECOMP_REBOOT_AT)
-    reboot_test_frame(total_frames);
-    extern void save_editor_frame(uint64_t frame);
-    save_editor_frame(total_frames);
+    extern bool nvn_async_on(void);
+    if (!nvn_async_on()) present_game_hooks(total_frames);  // (async replay: run by the game thread, nvn/async.c)
     extern void vk_level_change_check(void);
     vk_level_change_check();
+    vr_apply_enabled_request();
+    if (pt_vr) { pt_mark(PT_TAIL); pt_report(); }
     static long shot_every = -1;
     if (shot_every < 0) { const char *e = getenv("LARECOMP_SCREENSHOT_EVERY"); shot_every = e ? atol(e) : 0; }
     extern bool g_debug_frame;
@@ -617,6 +942,20 @@ void backend_present(NvnTexture *t) {
             long at = strtol(p, (char **)&p, 10);
             if (at == (long)total_frames) { g_gpuprof_frame = true; break; }
             if (*p == ',') p++; else break;
+        }
+        // One automatic capture after startup when the measured application GPU work is clearly over a 90 Hz
+        // budget. It profiles the following frame and intentionally runs only once: reporting waits for that frame
+        // so repeating it would itself disturb pacing. Opt-in (a hitch while it reports): SKYRECOMP_VR_AUTO_GPUPROF=1.
+        static bool auto_profiled;
+        static int auto_on = -1;
+        if (auto_on < 0) auto_on = getenv("SKYRECOMP_VR_AUTO_GPUPROF") && atoi(getenv("SKYRECOMP_VR_AUTO_GPUPROF")) != 0;
+        if (auto_on && !auto_profiled && vr_running() && total_frames > 120) {
+            const float gpu_ms = g_vr_gpu_ms;
+            if (gpu_ms >= 12.0f) {
+                auto_profiled = true;
+                g_gpuprof_frame = true;
+                LOG("[gpuprof] automatic VR capture armed after %.2f ms GPU frame\n", gpu_ms);
+            }
         }
     }
     if (g_debug_frame) LOG("===== debug frame %llu =====\n", (unsigned long long)total_frames);
@@ -673,7 +1012,13 @@ static void quick_exit_handler(void) {
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
     if (trace) LOG("[vk] exit: waiting for the GPU\n");
     if (g_vk.dev) {
-        vkDeviceWaitIdle(g_vk.dev);
+        // Window closed (runtime/vr/vr.h TriggerFastVRExit): no wait for the GPU and no OpenXR teardown (the
+        // process ends; the runtime and driver reclaim both). The pipeline cache is still saved: it is what keeps
+        // the next launch from recompiling every shader.
+        if (!IsVRExitRequested()) {
+            vkDeviceWaitIdle(g_vk.dev);
+            vr_shutdown();
+        }
         if (trace) LOG("[vk] exit: saving the pipeline cache\n");
         vk_pipeline_cache_save();
     }
@@ -792,6 +1137,11 @@ void ui_window_init(void) {
     LOG("[vk] execution ready\n");
     vk_shaders_init();
     LOG("[vk] shaders ready\n");
+    // OpenXR is optional and deliberately initialized last. The desktop engine
+    // is already operational if the loader, runtime, or headset is unavailable.
+    if (vr_requested() && !vr_vulkan_init((void *)g_vk.inst, (void *)g_vk.phys,
+                                           (void *)g_vk.dev, g_vk.qfam, 0))
+        LOG("[vr] OpenXR unavailable; continuing in desktop mode\n");
     if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) {
         if (!SDL_SetWindowFullscreen(window, true) || !SDL_SyncWindow(window))
             LOG("[vk] fullscreen transition: %s\n", SDL_GetError());
@@ -807,6 +1157,8 @@ void backend_init(void) {
 
 // ---- in-place reboot (runtime/main.c teardown; main thread, guest threads stopped)
 void backend_reset(void) {
+    extern void nvn_async_stop(void);
+    nvn_async_stop();  // (the replay thread finishes what was queued and ends)
     if (!g_vk.dev) return;
     vkDeviceWaitIdle(g_vk.dev);
     extern void vk_textures_reset(void);
@@ -840,6 +1192,7 @@ int ui_run(void) {
             if (rt_reboot_requested()) break;
             if (e.type == SDL_EVENT_QUIT) {
                 LOG("window closed\n");
+                TriggerFastVRExit();
                 exit(0);
             }
             extern bool input_user_blocked(const SDL_Event *e);
@@ -850,5 +1203,8 @@ int ui_run(void) {
             input_handle_event(&e);
         }
         menu_apply_window_requests(window);
+        // SteamVR takes the desktop focus when the session starts: give keyboard / gamepad input back to the game
+        // window once (here: SDL window calls belong to this thread).
+        if (vr_take_window_focus_request() && !getenv("LARECOMP_HIDDEN")) SDL_RaiseWindow(window);
     }
 }

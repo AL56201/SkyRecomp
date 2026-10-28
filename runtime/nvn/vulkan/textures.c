@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "vk.h"
+bool vr_requested(void);  // runtime/vr/vr.c
 #include "../../settings.h"
 #include "../astc.h"
 #include "../custom_tex.h"
@@ -176,13 +177,21 @@ static bool tex_scalable(const NvnTexture *t) {
     if (getenv("LARECOMP_NO_SCALE")) return false;
     if (t->target != 1 || t->samples > 1 || !(t->flags & 8) || t->width < 32 || t->height < 16) return false;
     float a = (float)t->width / (float)t->height;
+    // Eye color and depth targets share the game's widescreen aspect and must
+    // scale together. Light-space shadow maps are offscreen square/non-16:9
+    // targets, so the aspect test below keeps those at their native extent.
     return a > 1.74f && a < 1.81f;
 }
 
+// Per-pass bookkeeping below lives in the current VR eye's backend: each eye's images are cleared and tracked
+// on their own (with VR off, or in eye 0, that is the texture's backend).
+static TexBackend *vr_eye_state(NvnTexture *t);
+
 bool renderer_texture_first_write(NvnTexture *t) {
-    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    const TexBackend *base = t ? (const TexBackend *)t->backend : NULL;  // (presented: set on the texture's own)
+    TexBackend *b = vr_eye_state(t);
     uint64_t total_frames = renderer_present_count();
-    if (!b || !b->presented || (b->sx == b->sy) || b->touched_frame == total_frames + 1) return false;
+    if (!b || !base->presented || (b->sx == b->sy) || b->touched_frame == total_frames + 1) return false;
     b->touched_frame = total_frames + 1;
     return true;
 }
@@ -201,7 +210,7 @@ void vk_level_change_check(void) {
 bool renderer_texture_frame_fresh(NvnTexture *t) {
     static int on = -1;
     if (on < 0) on = getenv("LARECOMP_NO_FRAME_CLEAR") == NULL;
-    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    TexBackend *b = vr_eye_state(t);
     uint64_t total_frames = renderer_present_count();
     if (!on || !b || !b->scalable || b->frame_cleared == total_frames + 1) return false;
     b->frame_cleared = total_frames + 1;
@@ -209,7 +218,7 @@ bool renderer_texture_frame_fresh(NvnTexture *t) {
 }
 
 bool renderer_texture_level_fresh(NvnTexture *t) {
-    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    TexBackend *b = vr_eye_state(t);
     static int keep = -1;
     if (keep < 0) keep = getenv("LARECOMP_KEEP_TARGETS") != NULL;
     if (!b || keep || b->level_gen == g_level_gen) return false;
@@ -264,6 +273,7 @@ void vk_collect_dead(void) {
     ndead = k;
 }
 
+static bool g_force_eye_layer;  // (vr_eye_create: an image made again with its eye layer)
 static void create_image(NvnTexture *t, TexBackend *b) {
     VkFmt mf = fmt_of(t->format);
     b->sx = b->scalable ? g_rs_x : 1;
@@ -318,10 +328,31 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkImageCreateFlags flags = 0;
     if (!depthfmt) flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;  // format views (NVN texture views, raw sRGB views)
     if (type == VK_IMAGE_TYPE_2D && layers >= 6 && tw == th && samples == 1) flags |= VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT;
+    // VR: a 2D render target gets a second layer for eye 1 (vr_eye_create), so both eyes can be one multiview
+    // attachment. SKYRECOMP_VR_EYE_LAYERS=0: separate eye-1 images (the earlier layout).
+    static int eye_layers = -1;
+    if (eye_layers < 0) {
+        const char *e = getenv("SKYRECOMP_VR_EYE_LAYERS");
+        eye_layers = vr_requested() && !(e && atoi(e) == 0);
+    }
+    // (render targets from the start; any other texture when a stereo list first renders into it: vr_eye_create)
+    b->eye_layer = eye_layers && ((t->flags & 8) || g_force_eye_layer) && !b->layer_alias && type == VK_IMAGE_TYPE_2D &&
+                   layers == 1 && depth == 1 && samples == 1 && t->target == 1;
     VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .flags = flags, .imageType = type, .format = vf,
-                            .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = layers,
+                            .extent = {tw, th, depth}, .mipLevels = levels, .arrayLayers = b->eye_layer ? 2 : layers,
                             .samples = (VkSampleCountFlagBits)samples, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = usage,
                             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+    // (experiment) LARECOMP_VK_FORMAT_LIST=1: colour targets list the formats their views use (the format and its
+    // sRGB / UNORM twin) - a mutable format without a list keeps AMD from compressing them (DCC).
+    static int flist = -1;
+    if (flist < 0) flist = getenv("LARECOMP_VK_FORMAT_LIST") != NULL;
+    VkFormat twins[2] = {vf, vf == VK_FORMAT_R8G8B8A8_UNORM ? VK_FORMAT_R8G8B8A8_SRGB : vf == VK_FORMAT_R8G8B8A8_SRGB
+                                                            ? VK_FORMAT_R8G8B8A8_UNORM : vf == VK_FORMAT_B8G8R8A8_UNORM
+                                                            ? VK_FORMAT_B8G8R8A8_SRGB : vf == VK_FORMAT_B8G8R8A8_SRGB
+                                                            ? VK_FORMAT_B8G8R8A8_UNORM : vf};
+    VkImageFormatListCreateInfo fl = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+                                      .viewFormatCount = twins[1] == vf ? 1 : 2, .pViewFormats = twins};
+    if (flist && !depthfmt && (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) ci.pNext = &fl;
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VkResult r = vmaCreateImage(g_vk.vma, &ci, &ai, &b->image, &b->mem, NULL);
     if (r != VK_SUCCESS) {
@@ -372,11 +403,210 @@ void vk_dl_note_upload(void *img, uint32_t w, uint32_t h, uint32_t lv);  // (exe
 static uint32_t level_w(const TexBackend *b, uint32_t lv) { uint32_t v = b->width >> lv; return v ? v : 1; }
 static uint32_t level_h(const TexBackend *b, uint32_t lv) { uint32_t v = b->height >> lv; return v ? v : 1; }
 
+static void vr_eye_release(TexBackend *base);
 static void destroy_image(TexBackend *b) {
+    if (b->eye_layer) vr_eye_release(b);  // (its eye-1 backend is a layer of this image)
     views_forget(b);
-    if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
+    if (b->layer_alias) b->mem = VK_NULL_HANDLE;  // (the base texture's image: not ours to free)
+    else if (b->image || b->mem) defer((Dead){.img = b->image, .mem = b->mem});  // (never the same allocation twice)
     b->image = VK_NULL_HANDLE;
     b->mem = VK_NULL_HANDLE;
+}
+
+// ---- VR stereo (exec.c records each command list once per eye). Eye 0 is the texture's own backend; eye 1 gets
+// its own image for every texture the GPU writes during eye 1 (an attachment or a copy destination), made on
+// first such use. Textures only ever sampled (game assets) stay shared. Sampling a texture that has an eye-1
+// image during eye 1 reads that image, so each eye's post-processing chain and history buffers stay separate.
+// The eye-1 image is made when a stereo list first writes the texture, in eye 0, just before that write, and starts
+// as a copy of the texture's contents: a texture rendered before stereo began (or in an earlier frame and drawn on
+// top of since) holds the same picture in both eyes. Callers write outside any render pass (begin_pass,
+// copy_texture), so the copy can be recorded right here.
+static uint32_t g_vr_eye;
+static bool g_vr_stereo;  // a stereo list is being recorded (either eye)
+static bool g_vr_list_tracking, g_vr_list_depends_on_eye;
+static TexBackend **g_vr_list_writes;
+static uint32_t g_vr_list_nwrites, g_vr_list_cap;
+void vk_vr_set_eye(uint32_t eye) { g_vr_eye = eye == 1 ? 1 : 0; }
+uint32_t vk_vr_eye(void) { return g_vr_eye; }
+void vk_vr_set_stereo(bool on) {
+    g_vr_stereo = on;
+    if (!on) g_vr_list_tracking = false;
+}
+
+void vk_vr_list_begin(void) {
+    g_vr_list_tracking = true;
+    g_vr_list_depends_on_eye = false;
+    g_vr_list_nwrites = 0;
+}
+
+bool vk_vr_list_shareable(void) { return g_vr_list_tracking && !g_vr_list_depends_on_eye; }
+
+static void vr_copy_barriers(VkCommandBuffer cb, TexBackend *base, TexBackend *eye, bool begin) {
+    const VkImageLayout src_old = begin ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    const VkImageLayout dst_old = begin ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    const VkImageLayout src_new = begin ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+    const VkImageLayout dst_new = begin ? VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
+    VkImageMemoryBarrier2 b[2] = {
+        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+         .srcStageMask = begin ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_COPY_BIT,
+         .srcAccessMask = begin ? VK_ACCESS_2_MEMORY_WRITE_BIT : VK_ACCESS_2_TRANSFER_READ_BIT,
+         .dstStageMask = begin ? VK_PIPELINE_STAGE_2_COPY_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .dstAccessMask = begin ? VK_ACCESS_2_TRANSFER_READ_BIT : VK_ACCESS_2_MEMORY_READ_BIT,
+         .oldLayout = src_old, .newLayout = src_new, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = base->image,
+         .subresourceRange = {base->aspect, 0, base->levels, base->layer0, base->layers}},
+        {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+         .srcStageMask = begin ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_2_COPY_BIT,
+         .srcAccessMask = begin ? VK_ACCESS_2_MEMORY_WRITE_BIT : VK_ACCESS_2_TRANSFER_WRITE_BIT,
+         .dstStageMask = begin ? VK_PIPELINE_STAGE_2_COPY_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         .dstAccessMask = begin ? VK_ACCESS_2_TRANSFER_WRITE_BIT : VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+         .oldLayout = dst_old, .newLayout = dst_new, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = eye->image,
+         .subresourceRange = {eye->aspect, 0, eye->levels, eye->layer0, eye->layers}}};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 2, .pImageMemoryBarriers = b};
+    vkCmdPipelineBarrier2(cb, &di);
+}
+
+static void vr_list_note_write(TexBackend *base) {
+    if (!g_vr_list_tracking || g_vr_eye || !base || !base->vr_eye) return;
+    const TexBackend *eye = base->vr_eye;
+    if (base->levels > 16 || base->format != eye->format || base->width != eye->width || base->height != eye->height ||
+        base->depth != eye->depth || base->layers != eye->layers || base->levels != eye->levels ||
+        base->samples != eye->samples || base->aspect != eye->aspect) {
+        g_vr_list_depends_on_eye = true;
+        return;
+    }
+    for (uint32_t i = 0; i < g_vr_list_nwrites; i++) if (g_vr_list_writes[i] == base) return;
+    if (g_vr_list_nwrites == g_vr_list_cap) {
+        uint32_t cap = g_vr_list_cap ? g_vr_list_cap * 2 : 64;
+        TexBackend **next = realloc(g_vr_list_writes, cap * sizeof *next);
+        if (!next) { g_vr_list_depends_on_eye = true; return; }
+        g_vr_list_writes = next;
+        g_vr_list_cap = cap;
+    }
+    g_vr_list_writes[g_vr_list_nwrites++] = base;
+}
+
+void vk_vr_list_share_outputs(void) {
+    if (!g_vr_list_tracking) return;
+    g_vr_list_tracking = false;
+    if (!g_vr_list_nwrites) return;
+    VkCommandBuffer cb = vk_cmd();
+    for (uint32_t i = 0; i < g_vr_list_nwrites; i++) {
+        TexBackend *base = g_vr_list_writes[i], *eye = base ? base->vr_eye : NULL;
+        if (!base || !eye || base->format != eye->format || base->width != eye->width || base->height != eye->height ||
+            base->depth != eye->depth || base->layers != eye->layers || base->levels != eye->levels || base->samples != eye->samples)
+            continue;
+        VkImageCopy regions[16];
+        uint32_t n = base->levels < 16 ? base->levels : 16;
+        for (uint32_t lv = 0; lv < n; lv++)
+            regions[lv] = (VkImageCopy){.srcSubresource = {base->aspect, lv, base->layer0, base->layers},
+                                        .dstSubresource = {eye->aspect, lv, eye->layer0, eye->layers},
+                                        .extent = {level_w(base, lv), level_h(base, lv),
+                                                   base->depth >> lv ? base->depth >> lv : 1}};
+        vr_copy_barriers(cb, base, eye, true);
+        vkCmdCopyImage(cb, base->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                      eye->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, n, regions);
+        vr_copy_barriers(cb, base, eye, false);
+    }
+}
+
+static void vr_eye_release(TexBackend *base) {
+    if (!base->vr_eye) return;
+    destroy_image(base->vr_eye);
+    free(base->vr_eye);
+    base->vr_eye = NULL;
+}
+
+static void vr_eye_create(NvnTexture *t, TexBackend *base) {
+    TexBackend *eye = calloc(1, sizeof *eye);
+    if (!eye) FATAL("allocating a VR eye texture failed\n");
+    eye->scalable = base->scalable;
+    if (!base->eye_layer && !base->layer_alias && !base->custom && t->target == 1 && base->layers == 1 && base->depth == 1 &&
+        base->samples == 1) {
+        // A texture not made as a render target, rendered by a stereo list: made again with its eye layer (its
+        // contents copied), so both eyes are one image here too (multiview).
+        TexBackend two = *base;
+        two.image = VK_NULL_HANDLE, two.mem = VK_NULL_HANDLE, two.vr_eye = NULL;
+        g_force_eye_layer = true;
+        create_image(t, &two);
+        g_force_eye_layer = false;
+        if (two.eye_layer && two.format == base->format && two.width == base->width && two.height == base->height &&
+            two.levels == base->levels && two.aspect == base->aspect) {
+            VkCommandBuffer cb = vk_cmd();
+            vk_full_barrier(cb);
+            VkImageCopy rg[16];
+            const uint32_t n = base->levels < 16 ? base->levels : 16;
+            for (uint32_t lv = 0; lv < n; lv++)
+                rg[lv] = (VkImageCopy){.srcSubresource = {base->aspect, lv, 0, 1}, .dstSubresource = {base->aspect, lv, 0, 1},
+                                       .extent = {level_w(base, lv), level_h(base, lv), 1}};
+            vkCmdCopyImage(cb, base->image, VK_IMAGE_LAYOUT_GENERAL, two.image, VK_IMAGE_LAYOUT_GENERAL, n, rg);
+            vk_full_barrier(cb);
+            views_forget(base);
+            defer((Dead){.img = base->image, .mem = base->mem});
+            base->image = two.image, base->mem = two.mem, base->eye_layer = true;
+        } else if (two.image) {
+            defer((Dead){.img = two.image, .mem = two.mem});
+        }
+    }
+    if (base->eye_layer) {  // (layer 1 of the base image)
+        eye->image = base->image;
+        eye->format = base->format, eye->base_type = base->base_type, eye->aspect = base->aspect;
+        eye->width = base->width, eye->height = base->height, eye->depth = base->depth;
+        eye->layers = base->layers, eye->levels = base->levels, eye->samples = base->samples;
+        eye->sx = base->sx, eye->sy = base->sy;
+        eye->layer0 = 1;
+        eye->layer_alias = true;
+    } else {
+        create_image(t, eye);
+    }
+    eye->gpu_owned = true;
+    eye->presented = base->presented;
+    base->vr_eye = eye;
+    if (eye->format != base->format || eye->width != base->width || eye->height != base->height ||
+        eye->depth != base->depth || eye->layers != base->layers || eye->levels != base->levels ||
+        eye->samples != base->samples || eye->aspect != base->aspect)
+        return;  // (an image-creation fallback changed it: starts cleared instead)
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    VkImageCopy regions[16];
+    uint32_t n = base->levels < 16 ? base->levels : 16;
+    for (uint32_t lv = 0; lv < n; lv++)
+        regions[lv] = (VkImageCopy){.srcSubresource = {base->aspect, lv, base->layer0, base->layers},
+                                    .dstSubresource = {eye->aspect, lv, eye->layer0, eye->layers},
+                                    .extent = {level_w(base, lv), level_h(base, lv),
+                                               base->depth >> lv ? base->depth >> lv : 1}};
+    vkCmdCopyImage(cb, base->image, VK_IMAGE_LAYOUT_GENERAL, eye->image, VK_IMAGE_LAYOUT_GENERAL, n, regions);
+    vk_full_barrier(cb);
+}
+
+static TexBackend *vr_eye_backend(NvnTexture *t, TexBackend *base, bool for_render) {
+    // Decoded video frames are uploaded from the host into the texture's own image (upload_pending): one picture
+    // for both eyes, never an eye-1 image that would keep a stale frame.
+    if (t->video_uploaded) {
+        vr_eye_release(base);
+        return base;
+    }
+    if (for_render && g_vr_stereo && !base->vr_eye) vr_eye_create(t, base);
+    if (g_vr_list_tracking && !g_vr_eye) {
+        if (for_render) vr_list_note_write(base);
+        else if (base->vr_eye) g_vr_list_depends_on_eye = true;
+    }
+    if (!g_vr_eye) return base;
+    return base->vr_eye ? base->vr_eye : base;
+}
+
+// The backend holding the current eye's per-pass bookkeeping (first write / clear tracking in begin_pass).
+static TexBackend *vr_eye_state(NvnTexture *t) {
+    TexBackend *b = t ? (TexBackend *)t->backend : NULL;
+    return b && g_vr_eye && b->vr_eye ? b->vr_eye : b;
+}
+
+VkImage vk_vr_eye_image(NvnTexture *t, uint32_t eye) {
+    const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+    if (!b) return VK_NULL_HANDLE;
+    if (eye == 0) return b->image;
+    return b->vr_eye && b->vr_eye->width == b->width && b->vr_eye->height == b->height ? b->vr_eye->image : VK_NULL_HANDLE;
 }
 
 // Live game textures: an in-place reboot (vk_textures_reset) destroys them all.
@@ -399,6 +629,7 @@ static TexBackend *tex_backend(NvnTexture *t) {
     TexBackend *b = t->backend;
     if (b) {
         if (b->scalable && (b->sx != g_rs_x || b->sy != g_rs_y)) {  // output resolution changed: reallocate
+            vr_eye_release(b);  // (made again at the new size on its next eye-1 write)
             destroy_image(b);
             create_image(t, b);
         }
@@ -421,6 +652,7 @@ void backend_texture_destroyed(NvnTexture *t) {
         extern void vk_alias_texture_destroyed(NvnTexture *t);  // (exec.c copy aliases: a source's contents handed over)
         vk_alias_texture_destroyed(t);
         live_remove(b);
+        vr_eye_release(b);
         destroy_image(b);
         free(b->pending_rgba);
         free(b);
@@ -489,9 +721,36 @@ static void upload_pending(NvnTexture *t, TexBackend *b) {
 }
 
 uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn, prof_tex_watch_skips;
+static bool upload_custom_surface(NvnTexture *t, TexBackend *b, SDL_Surface *s);
+
+// A pack replacement for this texture's data: uploaded now if decoded; else the original is uploaded meanwhile and
+// the texture waits for it (custom_wait, upload_texture swaps it in once decoded).
 static bool upload_custom(NvnTexture *t, TexBackend *b) {
-    SDL_Surface *s = custom_tex_load(t);
-    if (!s) return false;
+    b->custom_wait = NULL;
+    const uint64_t m0 = SDL_GetTicksNS();
+    const void *m = custom_tex_match(t);
+    {   // (log) the render thread's share of the pack: matching a texture's data, per frame when it adds up
+        static uint64_t frame_ns, frame_no, frame_n;
+        const uint64_t f = vk_frame_counter();
+        if (f != frame_no) {
+            if (frame_ns > 10000000ull) LOG("[custom_tex] frame %llu: %.1f ms matching %llu textures\n", (unsigned long long)frame_no,
+                                            frame_ns / 1e6, (unsigned long long)frame_n);
+            frame_no = f; frame_ns = 0; frame_n = 0;
+        }
+        frame_ns += SDL_GetTicksNS() - m0;
+        frame_n++;
+    }
+    if (!m) return false;
+    bool pending;
+    SDL_Surface *s = custom_tex_fetch(m, &pending);
+    if (!s) {
+        if (pending) b->custom_wait = m;
+        return false;
+    }
+    return upload_custom_surface(t, b, s);
+}
+
+static bool upload_custom_surface(NvnTexture *t, TexBackend *b, SDL_Surface *s) {
     bool srgb = (t->format >= 0x87 && t->format <= 0x94) ||
                 (t->format >= 0x45 && t->format <= 0x48) || t->format == 0x4e || t->format == 0x9b;
     VkFormat format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
@@ -516,6 +775,7 @@ static bool upload_custom(NvnTexture *t, TexBackend *b) {
     for (int y = 0; y < s->h; y++) memcpy((uint8_t *)span.ptr + (size_t)y * s->w * 4, (uint8_t *)s->pixels + (size_t)y * s->pitch, (size_t)s->w * 4);
     destroy_image(b);
     b->image = image; b->mem = mem; b->format = format;
+    b->eye_layer = false;
     b->width = s->w; b->height = s->h; b->depth = b->layers = b->samples = 1; b->levels = levels;
     b->base_type = VK_IMAGE_VIEW_TYPE_2D; b->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
     b->astc_bw = b->astc_bh = 0; b->custom = true;
@@ -544,6 +804,16 @@ static bool upload_custom(NvnTexture *t, TexBackend *b) {
 
 static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
+    if (b->custom_wait) {  // (its pack replacement was being decoded: swapped in once ready)
+        bool pending;
+        SDL_Surface *s = g_settings.hd_textures ? custom_tex_fetch(b->custom_wait, &pending) : NULL;
+        if (s) {
+            b->custom_wait = NULL;
+            upload_custom_surface(t, b, s);  // (frees it either way)
+        } else if (!g_settings.hd_textures || !pending) {
+            b->custom_wait = NULL;
+        }
+    }
     uint64_t frame = vk_frame_counter();
     bool pack_changed = b->uploaded && b->custom_enabled != g_settings.hd_textures;
     if (!pack_changed && b->uploaded && b->checked_frame == frame) return;
@@ -681,7 +951,7 @@ TexBackend *vk_tex(NvnTexture *t, bool for_render) {
         upload_texture(t, b);
         if (prof_up_ns != ~0ull) prof_up_ns += SDL_GetTicksNS() - t0;
     }
-    return b;
+    return vr_eye_backend(t, b, for_render);
 }
 
 void renderer_mark_gpu_owned(NvnTexture *t) { tex_backend(t)->gpu_owned = true; }
@@ -730,7 +1000,7 @@ VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uin
     extern uint64_t prof_views_created;
     prof_views_created++;
     VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = b->image, .viewType = type,
-                                .format = fmt, .components = sw, .subresourceRange = {aspect, lv0, nlv, ly0, nly}};
+                                .format = fmt, .components = sw, .subresourceRange = {aspect, lv0, nlv, ly0 + b->layer0, nly}};
     VkImageView v;
     if (vkCreateImageView(g_vk.dev, &vi, NULL, &v) != VK_SUCCESS) {
         static int nfail;

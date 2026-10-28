@@ -20,11 +20,14 @@
 #else
 #include "imgui_impl_vulkan.h"
 extern "C" bool vk_imgui_backend_init(void);  // runtime/nvn/vulkan/imgui_glue.cpp
+extern "C" void vk_vr_request_enabled(bool enabled);  // device.c: applied after the current presented frame
 #endif
 
 extern "C" {
 #include "../hle.h"
 #include "../settings.h"
+#include "../vr/vr_settings.h"
+#include "../vr/vr.h"
 #include "menu.h"
 extern "C" bool input_free_cam_active(void);  // runtime/hle/input.c: free camera session toggle
 void input_reset(void);
@@ -462,11 +465,12 @@ static void tab_display(void) {
     }
     opt_toggle("Show FPS", &g_settings.show_fps, false, "Shows the frame rate in the top right corner.");
     if (g_is_skyward) {
-        const char *rates[] = {"60 FPS", "120 FPS (Experimental)"};
-        int rate = g_settings.frame_rate == 120;
-        if (opt_choice("Frame rate", &rate, rates, 2, 0,
-                       "Sets the rendering target while preserving game speed. 120 FPS requires faster hardware and a high refresh rate display."))
-            g_settings.frame_rate = rate ? 120 : 60;
+        const char *rates[] = {"60 FPS", "120 FPS (Experimental)", "144 FPS (Experimental)"};
+        int rate = g_settings.frame_rate == 144 ? 2 : g_settings.frame_rate == 120;
+        if (opt_choice("Frame rate", &rate, rates, 3, 0,
+                       "Sets the rendering target while preserving game speed. 120 / 144 FPS require faster hardware and a high "
+                       "refresh rate display. In VR the game always follows the headset's refresh rate."))
+            g_settings.frame_rate = rate == 2 ? 144 : rate ? 120 : 60;
     }
 
     opt_section("Rendering");
@@ -529,6 +533,24 @@ static void tab_display(void) {
     opt_choice("Anti-aliasing", &g_settings.antialias, aa, 2, AA_OFF,
                "Smooths jagged edges of the game image before it is scaled to the window. SMAA: finds the edges and "
                "blends only along them, so textures stay sharp. Most useful at a lower internal resolution.");
+    if (g_is_skyward) {  // (runtime/hle/vr_cull.c)
+        static const char *dd[] = {"Normal", "1.5x", "2x", "3x", "4x"};
+        static const float ddv[] = {1.0f, 1.5f, 2.0f, 3.0f, 4.0f};
+        int di = 0;
+        for (int i = 0; i < 5; i++) if (g_settings.draw_distance >= ddv[i] - 0.01f) di = i;
+        if (opt_choice("Draw distance", &di, dd, 5, 0,
+                       "How far away characters, objects, grass and effects start to appear. Normal: the game's own "
+                       "distances. Higher values fill in the distance (less pop-in, especially in VR) and cost CPU and "
+                       "GPU time. The level's own scenery is always drawn. Changes apply while playing."))
+            g_settings.draw_distance = ddv[di];
+    }
+#ifndef __APPLE__
+    if (opt_toggle("Multithreaded Rendering", &g_settings.async_replay, true,
+                   "Prepares each frame for the GPU on its own thread while the game works on the next one. Much "
+                   "higher frame rates at 120 / 144 FPS and in VR; input can lag by up to one frame when the CPU is "
+                   "the limit. Turn off if you see glitches. Applies on the next launch."))
+        settings_save();
+#endif
 
     opt_section("Game");
     opt_toggle("Remove blur", &g_settings.blur_removal, false,
@@ -581,6 +603,97 @@ static void tab_audio(void) {
     opt_toggle("Movie audio", &g_settings.movie_audio, true,
                "Sound in the game's movies (the opening and the ending). Applies the next time a movie starts.");
     opt_end();
+}
+
+// OpenXR starts and stops at a frame boundary; the remaining values are read live by the VR helpers.
+static void tab_vr_options(void) {
+    opt_begin("##vr_options", ImGui::GetFontSize() / 34);
+    opt_section("VR Mode");
+    bool changed = false;
+    if (opt_toggle("Enable VR Mode", &g_settings.vr, false,
+                   "Connects to OpenXR/SteamVR when enabled and returns to desktop rendering when disabled. Start "
+                   "your OpenXR runtime and connect a headset before enabling it.")) {
+#if !defined(__APPLE__)
+        vk_vr_request_enabled(g_settings.vr);
+#endif
+        changed = true;
+    }
+
+    opt_section("Rendering");
+    changed |= opt_slider("VR Resolution", &g_vr_config.resolution_scale, 0.5f, 2.0f, 0.1f, 1.0f, "%.1fx",
+                          "Resolution of each rendered eye relative to the size recommended by OpenXR. 1.0x is the "
+                          "headset runtime's recommendation. Higher values look sharper but require substantially "
+                          "more GPU performance. Changes apply live.");
+    changed |= opt_toggle("Desktop Mirror", &g_vr_config.desktop_mirror, true,
+                          "Shows the left eye in the desktop window. Turn this off to avoid the extra desktop "
+                          "presentation and any desktop post-processing while keeping headset quality unchanged. "
+                          "Opening this menu temporarily restores the mirror.");
+    {   // (nvn/vulkan/device.c: the mirror's own refresh, separate from the headset's)
+        static const char *mhz[] = {"30 Hz", "60 Hz", "90 Hz", "Headset rate"};
+        static const int mhz_v[] = {30, 60, 90, 0};
+        int mi = 1;
+        for (int i = 0; i < 4; i++) if (g_settings.vr_mirror_hz == mhz_v[i]) mi = i;
+        if (!g_vr_config.desktop_mirror) opt_disable_next();
+        if (opt_choice("Mirror Refresh Rate", &mi, mhz, 4, 1,
+                       "How often the desktop mirror is updated. The headset is not affected. Lower values leave more "
+                       "time for the headset: at 144 Hz, updating the mirror every frame cost about 7 fps. Headset "
+                       "rate: the mirror updates with every headset frame.")) {
+            g_settings.vr_mirror_hz = mhz_v[mi];
+            changed = true;
+        }
+    }
+    changed |= opt_toggle("Foveated Rendering", &g_settings.vr_foveation, false,
+                          "Renders the edges of each eye, which the lenses blur, at a lower shading rate. Saves a "
+                          "little GPU time (about 0.4 ms per frame on an RX 6000 card at 1.5x) at the cost of slightly "
+                          "softer edges. Needs a GPU with variable rate shading. Changes apply live.");
+    if (!g_settings.vr_foveation) opt_disable_next();
+    changed |= opt_slider("Foveation 2x2 Start", &g_settings.vr_foveation_inner, 0.25f, 1.0f, 0.05f, 0.60f, "%.2f",
+                          "Radius from the optical center where 2x2 shading starts. Lower values save more GPU time; "
+                          "higher values preserve a larger full-rate center.");
+    if (!g_settings.vr_foveation) opt_disable_next();
+    changed |= opt_slider("Foveation 4x4 Start", &g_settings.vr_foveation_outer, 0.30f, 1.25f, 0.05f, 0.80f, "%.2f",
+                          "Radius where 4x4 shading starts on supported GPUs. Other GPUs retain 2x2 in this region.");
+    if (g_settings.vr_foveation_outer < g_settings.vr_foveation_inner + 0.05f)
+        g_settings.vr_foveation_outer = g_settings.vr_foveation_inner + 0.05f;
+    changed |= opt_toggle("Fast VR Post-Processing", &g_settings.vr_fast_post, false,
+                          "Bypasses optional SMAA, upscale and sharpening passes. OpenXR output remains native-sized. "
+                          "Useful for measuring post-processing GPU cost. "
+                          "Changes apply live.");
+    changed |= opt_toggle("Adaptive VR Resolution", &g_vr_config.dynamic_resolution, false,
+                          "Keeps the highest resolution that fits the headset frame budget. It lowers resolution "
+                          "under sustained load and restores quality gradually when performance recovers.");
+    changed |= opt_slider("Adaptive Minimum", &g_vr_config.dynamic_resolution_min, 0.5f,
+                          g_vr_config.resolution_scale, 0.05f, 0.7f, "%.2fx",
+                          "Lowest resolution Adaptive VR Resolution may use. The VR Resolution value above remains "
+                          "the quality ceiling.");
+
+    opt_section("View");
+    changed |= opt_slider("World Scale", &g_vr_config.world_scale, 50.0f, 200.0f, 5.0f, 100.0f, "%g%%",
+                          "The apparent scale of the world, expressed as game units per metre. 100% is the default; "
+                          "lower values make the world feel larger and higher values make it feel smaller.");
+    static const char *view_modes[] = {"3rd Person", "1st Person"};
+    changed |= opt_choice("Default View Mode", &g_vr_config.view_mode, view_modes, 2, 0,
+                          "3rd Person follows Link from the game camera. 1st Person places the view at Link's head.");
+
+    changed |= opt_toggle("Level Horizon", &g_vr_config.level_horizon, true,
+                          "Keeps the VR horizon level when the game camera rolls or tilts.");
+    changed |= opt_slider("Camera Height", &g_vr_config.camera_height_offset, -50.0f, 50.0f, 5.0f, 0.0f, "%+g",
+                          "Raises or lowers your viewpoint, in game units (about a centimetre each). In 1st person this "
+                          "adjusts Link's eye height.");
+    changed |= opt_slider("Near Clip", &g_settings.vr_near_clip, 5.0f, 40.0f, 1.0f, 15.0f, "%g",
+                          "1st person: how close to your eyes geometry is still drawn, in game units (about a "
+                          "centimetre each). Higher hides Link's own head and hair from inside; lower lets you lean "
+                          "closer to walls and objects before they cut away. Changes apply live.");
+    changed |= opt_slider("Camera Distance", &g_vr_config.camera_distance_offset, -100.0f, 100.0f, 10.0f, 0.0f, "%+g",
+                          "3rd person: moves your viewpoint further behind the game camera (positive) or closer.");
+    if (vr_running() && opt_button("Recenter View",
+                                   "Your current head position and facing become the centre (1st person: facing Link's "
+                                   "direction again). SteamVR's own recenter does the same."))
+        vr_recenter();
+
+    opt_end();
+
+    if (changed) settings_save();  // (also writes g_vr_config to skyrecomp.ini's [VR] section)
 }
 
 // Quit: back to the start screen (in game: the game reboots to it) or out to the desktop. Each asks first (progress
@@ -755,7 +868,7 @@ extern void tab_mods(float scale);
 // false: nothing of the game is loaded yet - the tabs that need it are greyed out; prelaunch: the start screen's own
 // first tab, game files and fonts, drawn by launcher.mm).
 static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
-    // (id: the page; -1 = Prelaunch)
+    // (id: the page; -1 = Prelaunch, 11 = launcher-only VR Options)
     struct Tab { const char *name; int id; bool on; };
     Tab tabs[12];
     int ntabs = 0;
@@ -765,6 +878,9 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
     static const int order[] = {8, 0, 1, 10, 9};  // Controls, Video, Audio, Mods, Quit
     for (int i : order)  // (Quit: in game only - the start screen has its own QUIT)
         if (i != 9 || !prelaunch) tabs[ntabs++] = {names[i], i, true};
+#ifndef __APPLE__
+    tabs[ntabs++] = {"VR Options", 11, true};  // (start screen and in game: the view settings apply live)
+#endif
     int cur = 0;  // g_tab / g_tab_request hold ids
     for (int i = 0; i < ntabs; i++) if (tabs[i].id == g_tab) cur = i;
     if (!tabs[cur].on) cur = 0;
@@ -843,6 +959,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 case 1: tab_audio(); break;
                 case 8: tab_about(); break;
                 case 10: tab_mods(scale); break;
+                case 11: tab_vr_options(); break;
                 case 9: tab_quit(scale, in_game); break;
                 }
                 static const char *scroll_test = getenv("LARECOMP_MENU_SCROLL");  // test hook: page scroll, 0..1
@@ -932,7 +1049,11 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         ImGui::Begin("##fps", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing);
         ImGui::SetWindowFontScale(0.65f);   // small: just the number
-        ImGui::Text("%.0f", io.Framerate);
+        if (vr_running()) {
+            ImGui::Text("%.0f | GPU %.1f ms | %.2fx", io.Framerate, g_vr_gpu_ms, vr_resolution_factor());
+        } else {
+            ImGui::Text("%.0f", io.Framerate);
+        }
         ImGui::End();
         ImGui::PopStyleVar();
     }

@@ -1,0 +1,132 @@
+// Link's eye point (Skyward Sword HD), for the VR camera rig's 1st-person anchor.
+//
+// main+0x1829a30  vec3: Link's position at eye height (x, z of Link; y = the floor under him + 150), no animation
+//                 bob. A fixed global in the main module, verified 2026-10-25 in the Knight Academy: Link's room and
+//                 the hallway (a different area load), standing, walking and running (LARECOMP_FIND_MOVE,
+//                 LARECOMP_MEMDUMP). The same block holds pointers into Link's actor (main+0x18299d0 and its
+//                 neighbours), which stays at one address across those areas; the pointer is checked as a sign the
+//                 block is live.
+// (Superseded: main+0x182a9b0 tracked Link in his room only; after the next area load it pointed at a static
+// object.)
+// SKYRECOMP_PLAYER_TRACE=1 logs it every 30 frames.
+//
+// 0x7002bfda90    the game camera's view matrix, row-major 3x4 (world -> camera), stored three times in a row
+//                 (+0x30, +0x60). In the game's arena (allocated at boot, same address every run); no pointer to it
+//                 from main's static data was found. Found 2026-10-25 by searching memory for the scene block view
+//                 whose camera sat ~390 units behind Link in Skyloft. Draw blocks carry this view times a model
+//                 matrix, so it is the only reliable source of the camera itself. The VR rig (runtime/vr_rig.c)
+//                 trusts it only while some draw's view equals it (this frame or the last).
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "../hle.h"
+
+#define PLAYER_EYE (MAIN_BASE + 0x1829a30)
+#define PLAYER_ACTOR_REF (MAIN_BASE + 0x18299d0)
+
+static bool heap_ptr(uint64_t p) { return p > MAIN_BASE + 0x2000000 && p < 0x7400000000ull && !(p & 3); }
+
+static bool player_eye_live(float eye[3]) {
+    if (!heap_ptr(*(const uint64_t *)(uintptr_t)PLAYER_ACTOR_REF)) return false;  // (no Link: title, loading)
+    const float *e = (const float *)(uintptr_t)PLAYER_EYE;
+    for (int i = 0; i < 3; i++)
+        if (!isfinite(e[i]) || fabsf(e[i]) > 1e6f) return false;
+    if (e[0] == 0 && e[1] == 0 && e[2] == 0) return false;
+    if (eye) memcpy(eye, e, 12);
+    return true;
+}
+
+// Link's actor (the pointer at main+0x18299d0) +0x154: float, the world height of his feet (on land the eye point is
+// this + 150; in water the eye point stays at the surface while this goes below it, deep when diving). Measured
+// 2026-10-25 in Skyloft's lake (SKYRECOMP_PLAYER_SNAP).
+static bool player_feet_y_live(float *y) {
+    const uint64_t actor = *(const uint64_t *)(uintptr_t)PLAYER_ACTOR_REF;
+    if (!heap_ptr(actor)) return false;
+    const float v = *(const float *)(uintptr_t)(actor + 0x154);
+    if (!isfinite(v) || fabsf(v) > 1e6f) return false;
+    if (y) *y = v;
+    return true;
+}
+
+#define GAME_CAMERA_VIEW 0x7002bfda90ull
+
+static bool game_camera_view_live(float view[12]) {
+    const float *v = (const float *)(uintptr_t)GAME_CAMERA_VIEW;
+    float m[12];
+    memcpy(m, v, sizeof m);
+    for (int i = 0; i < 12; i++)
+        if (!isfinite(m[i]) || fabsf(m[i]) > 1e7f) return false;
+    for (int r = 0; r < 3; r++) {  // orthonormal rotation rows
+        const float *a = m + r * 4, *b = m + ((r + 1) % 3) * 4;
+        if (fabsf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2] - 1) > 1e-3f || fabsf(a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) > 1e-3f)
+            return false;
+    }
+    if (view) memcpy(view, m, sizeof m);
+    return true;
+}
+
+// ---- snapshots (nvn/async.c). With the command replay on its own thread, the game thread is already building the
+// next frame while a frame is drawn: what the draws need from game memory is taken when their list is submitted, and
+// the replay thread reads that instead of live memory.
+typedef struct PlayerSnap {
+    bool eye_ok, feet_ok, cam_ok;
+    float eye[3], feet, cam[12];
+} PlayerSnap;
+static __thread const PlayerSnap *tl_snap;
+
+size_t player_snapshot_size(void) { return sizeof(PlayerSnap); }
+void player_snapshot_take(void *out) {
+    PlayerSnap *s = out;
+    s->eye_ok = player_eye_live(s->eye);
+    s->feet_ok = player_feet_y_live(&s->feet);
+    s->cam_ok = game_camera_view_live(s->cam);
+}
+void player_snapshot_use(const void *snap) { tl_snap = snap; }  // (this thread; NULL: live memory again)
+
+bool player_eye(float eye[3]) {
+    if (!tl_snap) return player_eye_live(eye);
+    if (tl_snap->eye_ok && eye) memcpy(eye, tl_snap->eye, sizeof tl_snap->eye);
+    return tl_snap->eye_ok;
+}
+
+bool player_feet_y(float *y) {
+    if (!tl_snap) return player_feet_y_live(y);
+    if (tl_snap->feet_ok && y) *y = tl_snap->feet;
+    return tl_snap->feet_ok;
+}
+bool game_camera_view(float view[12]) {
+    if (!tl_snap) return game_camera_view_live(view);
+    if (tl_snap->cam_ok && view) memcpy(view, tl_snap->cam, sizeof tl_snap->cam);
+    return tl_snap->cam_ok;
+}
+
+// (game thread, once per frame) SKYRECOMP_PLAYER_TRACE=1
+void player_trace_tick(uint64_t frame) {
+    static int on = -1;
+    if (on < 0) on = getenv("SKYRECOMP_PLAYER_TRACE") != NULL;
+    {   // (RE) SKYRECOMP_PLAYER_SNAP=<file>: every 30 frames, Link's actor (0x3000 bytes from its pointer - 0x800) and
+        // the player globals (main+0x1829800, 0x800 bytes), to find state flags (e.g. swimming) by diffing
+        static FILE *snap;
+        static int init;
+        if (!init) {
+            init = 1;
+            const char *p = getenv("SKYRECOMP_PLAYER_SNAP");
+            if (p) snap = fopen(p, "wb");
+        }
+        float e[3];
+        if (snap && frame % 30 == 0 && player_eye(e)) {
+            const uint64_t actor = *(const uint64_t *)(uintptr_t)PLAYER_ACTOR_REF;
+            const uint64_t hdr[2] = {frame, actor};
+            fwrite(hdr, sizeof hdr, 1, snap);
+            fwrite(e, sizeof e, 1, snap);
+            fwrite((const void *)(uintptr_t)(actor - 0x800), 0x3000, 1, snap);
+            fwrite((const void *)(uintptr_t)(MAIN_BASE + 0x1829800), 0x800, 1, snap);
+            fflush(snap);
+        }
+    }
+    if (!on || frame % 30) return;
+    float e[3];
+    if (player_eye(e)) LOG("[player] frame %llu: eye %.1f %.1f %.1f\n", (unsigned long long)frame, e[0], e[1], e[2]);
+    else LOG("[player] frame %llu: none\n", (unsigned long long)frame);
+}

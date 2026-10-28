@@ -11,6 +11,7 @@
 #include "hle.h"
 #include "kernel.h"
 #include "rando.h"
+#include "vr/vr.h"
 
 const char *g_romfs_dir;
 
@@ -77,15 +78,16 @@ static bool diagnostic_stalled(uint64_t now) {
 
 static void *diagnostic_watchdog(void *arg) {
     (void)arg;
-    while (diagnostic_running) {
-        plat_sleep_until_ns(plat_now_ns() + 1000000000ull);
+    while (diagnostic_running && !IsVRExitRequested()) {
+        for (int i = 0; i < 100 && diagnostic_running && !IsVRExitRequested(); i++)
+            plat_sleep_until_ns(plat_now_ns() + 10000000ull);
         uint64_t now = plat_now_ns();
         if (!diagnostic_running || !diagnostic_stalled(now)) continue;
         uint64_t last = diagnostic_progress_ns;
-        LOG("[diagnostics] possible freeze: no presented frame for %llus (last frame %llu). "
+        LOG("[diagnostics] possible freeze: no presented frame for %llus (last frame %llu, VR stage: %s). "
             "Long loading or shader compilation can also cause this.\n",
             (unsigned long long)((now > last ? now - last : 0) / 1000000000ull),
-            (unsigned long long)diagnostic_frame);
+            (unsigned long long)diagnostic_frame, vr_debug_stage());
         if (!kernel_try_dump_threads()) LOG("[diagnostics] kernel lock busy; thread dump skipped to avoid blocking\n");
         fflush(stderr);
     }
@@ -146,7 +148,7 @@ void backend_clear_window(void);      // a black frame while the game is down
 static void reboot_idle(void) {  // (main thread, while guest threads stop) keep the window alive
     SDL_Event e;
     while (SDL_PollEvent(&e))
-        if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); exit(0); }
+        if (e.type == SDL_EVENT_QUIT) { LOG("window closed\n"); TriggerFastVRExit(); exit(0); }
 }
 
 static void teardown(void) {
@@ -184,6 +186,7 @@ static void boot(const char *root) {
     kernel_init();
     dispatch_init();
     { extern void custom_tex_init(void); custom_tex_init(); }
+    { extern void vr_cull_init(void); vr_cull_init(); }  // (VR: objects outside the game camera's view are drawn)
 
     uint32_t stack_size = 0x100000;
     int prio = 44;

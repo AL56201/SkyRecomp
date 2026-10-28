@@ -29,13 +29,24 @@ int main(void) {
     }
     g_settings.frame_rate = 0;
     assert(rt_frame_rate() == 60);
-    g_settings.frame_rate = 144;
+    g_settings.frame_rate = 100;
     assert(rt_frame_rate() == 60);
+    g_settings.frame_rate = 144;
+    assert(rt_frame_rate() == 144 && !rt_headset_paced());
+    g_rt_headset_hz = 90;  // (VR: a high target follows the headset, which paces)
+    assert(rt_frame_rate() == 90 && rt_headset_paced());
+    g_settings.frame_rate = 60;  // (an OpenXR session is the display clock whatever the desktop target)
+    assert(rt_frame_rate() == 90 && rt_headset_paced());
+    g_rt_headset_hz = 0;
     g_settings.frame_rate = 120;
     for (int actual = 60; actual <= 120; actual += 20) {
         g_settings.frame_rate = 60;
         assert(rt_sky_frame_step(0.5f) == 0.5f);
         assert(rt_sky_frame_ms(1000.0f / 60) == 1000.0f / 60);
+        g_settings.frame_rate = 144;
+        assert(fabsf(rt_sky_frame_step(0.5f) - 0.5f * 60 / 144) < 1e-6f);
+        g_settings.frame_rate = 60;
+        rt_sky_frame_step(0.5f);
         g_settings.frame_rate = 120;
         assert(rt_sky_frame_step(0.5f) == 0.25f);
         float ticks = 0, ms = 0;

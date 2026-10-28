@@ -37,6 +37,16 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, logic_op;
+    // VR fixed foveated shading (VK_KHR_fragment_shading_rate, attachment rates): texel size of the rate image and
+    // the coarsest rates the device supports (exec.c vrs_*)
+    bool vrs;
+    bool depth_bounds;
+    bool multiview;  // (VR: VK_KHR_multiview, both eyes rendered by one pass)
+    // GPU markers for profilers (Radeon GPU Profiler, RenderDoc): SKYRECOMP_GPU_MARKERS=1 (VK_EXT_debug_utils labels)
+    PFN_vkCmdBeginDebugUtilsLabelEXT label_begin;
+    PFN_vkCmdEndDebugUtilsLabelEXT label_end;  // (the depth bounds test: VR hidden-area rejection, exec.c begin_pass)
+    uint32_t vrs_texel_w, vrs_texel_h;
+    uint16_t vrs_rates;  // bit (log2 w) * 3 + log2 h of each supported rate up to 4x4
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
@@ -56,8 +66,16 @@ uint64_t vk_pending_seq(void);        // number the pending submission will get
 uint64_t vk_completed_seq(void);
 void vk_wait_seq(uint64_t seq);
 void vk_full_barrier(VkCommandBuffer cb);
+void vk_label_begin(VkCommandBuffer cb, const char *name);  // profiler markers (SKYRECOMP_GPU_MARKERS=1)
+void vk_label_end(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
+void vk_vr_gpu_frame_end(void);  // mark the most recently submitted VR work as the end of one measured frame
+// VkPipelineCache is externally synchronized by Vulkan. All pipeline creation
+// and cache serialization must go through these wrappers because shader builds
+// may run concurrently on worker threads.
+VkResult vk_create_graphics_pipelines(uint32_t count, const VkGraphicsPipelineCreateInfo *info, VkPipeline *pipelines);
+VkResult vk_create_compute_pipelines(uint32_t count, const VkComputePipelineCreateInfo *info, VkPipeline *pipelines);
 
 // Transient GPU-visible memory that lives until the submission it was allocated for completes.
 typedef struct { VkBuffer buf; uint64_t off; void *ptr; } VkSpan;
@@ -75,6 +93,7 @@ typedef struct TexBackend {
     uint32_t width, height, depth, layers, levels, samples;
     VkImageAspectFlags aspect;
     bool gpu_owned, uploaded, dynamic, custom, custom_enabled;
+    const void *custom_wait;  // (textures.c) its pack replacement, being decoded in the background (custom_tex.c)
     uint64_t data_hash, sample_hash, checked_frame, full_frame;
     uint32_t wgen;  // page write tracking generation at the last upload check (textures.c)
     uint32_t unchanged_frames;
@@ -89,9 +108,24 @@ typedef struct TexBackend {
     int tp;              // runtime/nvn/texpatch.c: 0 not checked yet, -1 none, else known UI texture + 1
     uint32_t tp_gen;     // texpatch_generation() it was last uploaded with
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
+    struct TexBackend *vr_eye;  // VR eye 1's own image of a GPU-written texture (textures.c), NULL until then
+    // VR: eye-sized render targets hold both eyes as two layers of one image (multiview). layer0: the first image
+    // layer this backend owns (1 for the eye-1 backend); layer_alias: the image belongs to the base texture;
+    // eye_layer: this base image has the spare layer 1 for its eye.
+    uint32_t layer0;
+    bool layer_alias, eye_layer;
 } TexBackend;
 
-TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
+// The backend image (uploads CPU contents unless for_render). While VR eye 1 is recording, a texture the GPU
+// writes resolves to its eye-1 image.
+TexBackend *vk_tex(NvnTexture *t, bool for_render);
+void vk_vr_set_eye(uint32_t eye);  // 0 or 1: which eye exec.c is recording
+void vk_vr_set_stereo(bool on);    // a stereo list is being recorded: GPU-written textures get their eye-1 image
+uint32_t vk_vr_eye(void);
+VkImage vk_vr_eye_image(NvnTexture *t, uint32_t eye);  // t's image for an eye (eye 1: NULL until rendered)
+void vk_vr_list_begin(void);        // begin conservative dependency tracking for one stereo command list
+bool vk_vr_list_shareable(void);    // true when eye 0 used no existing eye-specific rendered input
+void vk_vr_list_share_outputs(void);  // copy eye-0 outputs to eye 1 instead of replaying an independent list
 VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
 // View of t (optionally through an NVN texture view) for rendering or sampling.

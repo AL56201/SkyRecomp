@@ -2708,9 +2708,17 @@ void renderer_reset(void) {
 void backend_execute(uint64_t handle) {
     @autoreleasepool {
         exec_list(handle, 0);
-        static int sync_submit = -1;
-        if (sync_submit < 0) sync_submit = getenv("LARECOMP_SYNC_SUBMIT") ? 1 : 0;
-        if (sync_submit) renderer_flush();  // old behaviour: finish the GPU work before returning
-        else renderer_submit();  // the guest fences (nvnSyncWait) before reusing memory the GPU reads
+        static int each = -1;
+        if (each < 0) each = getenv("LARECOMP_METAL_SUBMIT_EACH_LIST") != NULL || getenv("LARECOMP_SYNC_SUBMIT") != NULL;
+        if (each) {
+            if (getenv("LARECOMP_SYNC_SUBMIT")) renderer_flush();
+            else renderer_submit();
+        }
     }
+}
+
+void backend_submit_commands(void) {
+    static int each = -1;
+    if (each < 0) each = getenv("LARECOMP_METAL_SUBMIT_EACH_LIST") != NULL || getenv("LARECOMP_SYNC_SUBMIT") != NULL;
+    if (!each) renderer_submit();  // guest fences (nvnSyncWait) protect memory reuse
 }

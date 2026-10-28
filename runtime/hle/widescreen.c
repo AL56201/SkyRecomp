@@ -7,6 +7,7 @@
 
 #include "../hle.h"
 #include "../settings.h"
+#include "../vr/vr_rig.h"
 
 #define BACKDROP_HASHES 0x71fe31bbf03c3515ull
 
@@ -72,6 +73,8 @@ float rt_aspect_site(int site) {
 float rt_cull_aspect(float orig) {
     static float last = -1;
     if (orig != last && ENV("LARECOMP_LOG_CULL")) { LOG("[widescreen] culling aspect field %f\n", orig); last = orig; }
+    float vr_fovy, vr_aspect;  // (VR: the headset eyes' field, runtime/vr_rig.h)
+    if (vr_rig_cull_fov(&vr_fovy, &vr_aspect)) return vr_aspect;
     return rt_aspect_site(6) * (orig > 0.1f && orig < 10.0f ? orig / (16.0f / 9.0f) : 1.0f);
 }
 
@@ -80,6 +83,8 @@ float rt_cull_aspect(float orig) {
 float rt_fovy(float orig) {
     static float last = -1;
     if (orig != last && ENV("LARECOMP_LOG_CULL")) { LOG("[widescreen] fovy field %f\n", orig); last = orig; }
+    float vr_fovy, vr_aspect;  // (VR: the headset eyes' field, runtime/vr_rig.h; the eye cameras replace the view's own)
+    if (orig > 0 && vr_rig_cull_fov(&vr_fovy, &vr_aspect)) return orig > 3.2f ? vr_fovy * 180.0f / (float)M_PI : vr_fovy;
     if (g_wide >= 1.0f || !(orig > 0)) return orig;
     bool degrees = orig > 3.2f;  // radians otherwise
     float half = (degrees ? orig * (float)M_PI / 180.0f : orig) * 0.5f;

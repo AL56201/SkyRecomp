@@ -86,6 +86,7 @@ typedef struct NvnWindow {
 typedef struct NvnSync {
     volatile int signaled;
     volatile uint64_t seq;  // GPU submission this fence belongs to (renderer_fence_seq), 0 = none
+    uint64_t ticket;        // (nvn/async.c) the replay queue item that signals it
 } NvnSync;
 
 // ---- command recording (stored in guest command memory)
@@ -131,6 +132,7 @@ enum {
 // renderer backend (runtime/nvn/metal.m)
 void backend_init(void);
 void backend_execute(uint64_t handle);            // run a recorded command list
+void backend_submit_commands(void);               // submit all lists from one nvnQueueSubmitCommands call
 void backend_set_window_crop(const int crop[4]);
 void backend_present(NvnTexture *tex);            // show a texture in the window
 void backend_texture_destroyed(NvnTexture *tex);
