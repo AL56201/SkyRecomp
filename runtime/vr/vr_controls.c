@@ -10,7 +10,6 @@
 #if SKYRECOMP_HAS_OPENXR
 #include "hle.h"
 #include "nvn/vulkan/JoyConTranslator.h"
-#include "vr_pointer.h"
 
 static bool controllers_off(void) {  // (test) SKYRECOMP_VR_NO_INPUT=1: controllers ignored, for scripted runs
     static int off = -1;
@@ -26,7 +25,8 @@ _Static_assert(sizeof(VrJoyConSensor) == sizeof(SkyJoyConSensor), "the same layo
 // The game turns the right Joy-Con's orientation, relative to its canonical centre, into a cursor like a flat screen:
 // offset = K tan(angle), with K = 1.298 screen widths horizontally (yaw about the Joy-Con's z) and 2.316 screen
 // heights vertically (pitch about x; down positive) - measured 2026-10-26 with SKYRECOMP_JOYCON_TEST=point. The
-// panel's hit (u, v) gives those angles back. Elsewhere the real orientation goes to the game (the sword follows it).
+// panel's hit (u, v) gives those angles back, clamped to the panel's edges (panel_uv). Outside the title / file
+// select and paused menus the real orientation goes to the game (the sword follows it).
 // SKYRECOMP_VR_PANEL_POINTER=0 turns it off.
 #define POINTER_KX 1.298f
 #define POINTER_KY 2.316f
@@ -76,6 +76,38 @@ static bool panel_pointer_on(void) {
            || !player_eye(NULL);  // (no Link: the title, file select, loading)
 }
 
+// Where the ray points on the panel, (u, v) in 0..1 (top left), clamped to its edges: the panel follows the head's
+// yaw, so a turned head can leave the controller pointing past it - the cursor then stays on the nearest edge
+// instead of leaving the screen (the game hides it off screen). A ray pointing away from the panel's plane goes to
+// the edge in its direction along the panel. False only for unusable matrices.
+static bool panel_uv(const float aim[16], const float hud[16], float *u, float *v) {
+    const float o[3] = {aim[3], aim[7], aim[11]}, d[3] = {-aim[2], -aim[6], -aim[10]};
+    const float c[3] = {hud[3], hud[7], hud[11]}, x[3] = {hud[0], hud[4], hud[8]}, y[3] = {hud[1], hud[5], hud[9]};
+    float n[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]};
+    const float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    const float xx = x[0] * x[0] + x[1] * x[1] + x[2] * x[2], yy = y[0] * y[0] + y[1] * y[1] + y[2] * y[2];
+    if (!(nl > 1e-6f) || !(xx > 1e-9f) || !(yy > 1e-9f)) return false;
+    for (int i = 0; i < 3; i++) n[i] /= nl;
+    const float dn = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+    const float co[3] = {c[0] - o[0], c[1] - o[1], c[2] - o[2]};
+    const float t = fabsf(dn) > 1e-6f ? (co[0] * n[0] + co[1] * n[1] + co[2] * n[2]) / dn : -1.0f;
+    float lx, ly;
+    if (t > 0) {  // (the plane is ahead: the hit, in panel units)
+        const float r[3] = {o[0] + d[0] * t - c[0], o[1] + d[1] * t - c[1], o[2] + d[2] * t - c[2]};
+        lx = (r[0] * x[0] + r[1] * x[1] + r[2] * x[2]) / xx;
+        ly = (r[0] * y[0] + r[1] * y[1] + r[2] * y[2]) / yy;
+    } else {  // (pointing away from it: the direction along the panel, pushed to the edge)
+        lx = (d[0] * x[0] + d[1] * x[1] + d[2] * x[2]) / sqrtf(xx) * 1e3f;
+        ly = (d[0] * y[0] + d[1] * y[1] + d[2] * y[2]) / sqrtf(yy) * 1e3f;
+    }
+    if (!isfinite(lx) || !isfinite(ly)) return false;
+    lx = fminf(1.0f, fmaxf(-1.0f, lx));
+    ly = fminf(1.0f, fmaxf(-1.0f, ly));
+    *u = lx * 0.5f + 0.5f;
+    *v = 0.5f - ly * 0.5f;  // (+y: the top of the screen)
+    return true;
+}
+
 static bool panel_pointer(SkyJoyConSensor *s) {
     pthread_mutex_lock(&g_ptr_lock);
     const bool on = panel_pointer_on() && g_ptr_aim_ok && g_ptr_hud_ok;
@@ -84,9 +116,9 @@ static bool panel_pointer(SkyJoyConSensor *s) {
     memcpy(hud, g_ptr_hud, sizeof hud);
     pthread_mutex_unlock(&g_ptr_lock);
     if (!on) return false;
-    VRPointerState p;
-    if (!ComputeVRPointerIntersection(&p, aim, hud) || !p.intersects) return false;  // (off the panel: the real pose)
-    pointer_direction(p.ui_space_x, p.ui_space_y, s->direction);
+    float u, v;
+    if (!panel_uv(aim, hud, &u, &v)) return false;
+    pointer_direction(u, v, s->direction);
     static int logged;
     if (!logged++) LOG("[vr] menu pointer: the game's cursor follows the right controller's ray on the HUD panel\n");
     return true;
