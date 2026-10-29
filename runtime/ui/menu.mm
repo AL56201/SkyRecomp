@@ -162,6 +162,13 @@ static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
 extern "C" bool menu_input_captured(void) { return capturing(); }
 // (VR: the settings menu or the name entry dialog - drawn on the HUD panel, used with the right controller)
 extern "C" bool menu_on_vr_panel(void) { return capturing(); }
+extern "C" bool inventory_overlay_wanted(void), tracker_overlay_wanted(void), chaos_overlay_wanted(void);
+// (VR: with the menu closed, the overlays - FPS counter, tracker, inventory, chaos, free camera - drawn on the panel
+// too, passively: no pointer, no input taken; it follows the view as the HUD does)
+extern "C" bool menu_vr_passive(void) {
+    return !capturing() && (g_settings.show_fps || g_settings.free_cam || inventory_overlay_wanted() ||
+                            tracker_overlay_wanted() || chaos_overlay_wanted());
+}
 
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;

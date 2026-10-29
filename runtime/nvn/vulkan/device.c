@@ -856,7 +856,8 @@ void backend_present(NvnTexture *t) {
                 if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
             }
             g_vr_menu_on_panel = false;
-            if (menu_on_vr_panel()) {  // (the settings menu / name entry on its own panel: exec.c, vr.c)
+            extern bool menu_vr_passive(void);
+            if (menu_on_vr_panel() || menu_vr_passive()) {  // (the settings menu / name entry / overlays: exec.c, vr.c)
                 extern TexBackend *vk_vr_menu_panel(void);
                 extern bool vr_record_menu_copy(void *cb, void *image, uint32_t w, uint32_t h);
                 extern void vr_menu_panel_frame(void);

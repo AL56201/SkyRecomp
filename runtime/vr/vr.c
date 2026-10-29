@@ -1246,7 +1246,7 @@ static bool menu_failed, beam_failed, beam_ready;
 static bool menu_acquired, menu_copied;
 static uint32_t menu_image_index;
 static float g_menu_world[16];  // world-from-panel: columns right, up, back (unit), centre
-static bool g_menu_placed;
+static bool g_menu_placed, g_menu_was_passive;
 
 static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
     VkPhysicalDeviceMemoryProperties mp;
@@ -1428,9 +1428,26 @@ static XrQuaternionf quat_from_columns(const float x[3], const float y[3], const
 
 // Each frame (vr_frame_end, and before the copy): place the panel when the menu comes up; while it is up, it is what
 // the controller's ray aims at.
+static float g_hud_world[16];  // (defined with hud_pose below)
+static bool g_hud_world_ok;
+static bool g_menu_passive;  // the panel shows only the overlays (menu closed): it follows the HUD panel, no pointer
 static void menu_panel_update(void) {
-    extern bool menu_on_vr_panel(void);
+    extern bool menu_on_vr_panel(void), menu_vr_passive(void);
+    g_menu_passive = !menu_on_vr_panel() && menu_vr_passive();
+    if (g_menu_passive) {  // (where the HUD panel is, as wide; columns made unit)
+        if (!g_hud_world_ok) { g_menu_placed = false; return; }
+        memcpy(g_menu_world, g_hud_world, sizeof g_menu_world);
+        for (int k = 0; k < 3; k++) {
+            const float l = sqrtf(g_menu_world[k] * g_menu_world[k] + g_menu_world[4 + k] * g_menu_world[4 + k] +
+                                  g_menu_world[8 + k] * g_menu_world[8 + k]);
+            if (l > 1e-6f) for (int r = 0; r < 3; r++) g_menu_world[r * 4 + k] /= l;
+        }
+        g_menu_placed = g_menu_was_passive = true;
+        return;
+    }
     if (!menu_on_vr_panel()) { g_menu_placed = false; return; }
+    if (g_menu_placed && g_menu_was_passive) g_menu_placed = false;  // (the menu opened over the overlays: re-place)
+    g_menu_was_passive = false;
     if (!frame.stereo && !g_menu_placed) return;
     if (!g_menu_placed) {  // level, in front of the gaze (yaw only)
         const XrPosef *a = &frame.views[0].pose, *b = &frame.views[1].pose;
@@ -1482,9 +1499,10 @@ static bool beam_pose(XrPosef *pose, float *length) {
 }
 
 // (the desktop mirror) Where the left eye sees the menu panel: as vr_mirror_hud_mvp.
+static float menu_panel_width(void) { return g_menu_passive ? 1.6f * g_vr_hud_config.hud_scale : g_vr_hud_config.menu_width; }
 bool vr_mirror_menu_mvp(float out[16]) {
     if (!g_menu_placed) return false;
-    const float hw = g_vr_hud_config.menu_width * 0.5f;
+    const float hw = menu_panel_width() * 0.5f;
     return mirror_quad_mvp(g_menu_world, hw, hw * MENU_H / MENU_W, out);
 }
 
@@ -1695,14 +1713,14 @@ void vr_frame_end(void) {
             beam_released = XR_SUCCEEDED(p_xrReleaseSwapchainImage(beam_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}));
         if (!beam_ready) beam_released = false;
     }
-    const float menu_w = g_vr_hud_config.menu_width;
+    const float menu_w = menu_panel_width();
     const XrCompositionLayerQuad menu_quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
         .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
         .subImage = {.swapchain = menu_swapchain, .imageRect = {{0, 0}, {MENU_W, MENU_H}}, .imageArrayIndex = 0},
         .pose = menu_ok ? menu_pose() : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}}, .size = {menu_w, menu_w * MENU_H / MENU_W}};
     XrPosef bp;
     float beam_len = 0;
-    const bool beam_ok = menu_ok && beam_pose(&bp, &beam_len);
+    const bool beam_ok = menu_ok && !g_menu_passive && beam_pose(&bp, &beam_len);
     const XrCompositionLayerQuad beam_quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
         .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
         .subImage = {.swapchain = beam_swapchain, .imageRect = {{0, 0}, {BEAM_W, BEAM_H}}, .imageArrayIndex = 0},
