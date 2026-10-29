@@ -899,6 +899,9 @@ void backend_present(NvnTexture *t) {
         if (mirror && mirror_hz > 0) {
             const uint64_t period = (uint64_t)(1e9 / mirror_hz);
             mirror_next = now_ns + period - period / 8 > mirror_next + period ? now_ns + period - period / 8 : mirror_next + period;
+            // (never more than a period ahead: frames forced while a menu is up - every headset frame - must not push
+            // it further and further out, or the mirror stays frozen that long after the menu closes)
+            if (mirror_next > now_ns + period) mirror_next = now_ns + period;
         }
         pt_mark(PT_MIRROR_ACQ);
         {   // SKYRECOMP_VR_PACE_TRACE: the mirror's actual refresh, every 2 s
