@@ -265,7 +265,27 @@ static void menu_input(SkyVrControllers *s) {
         }
     }
     was_captured = captured;
-    vr_pointer_set_aim(s->active && s->hand[hand].tracked, s->hand[hand].orientation, s->hand[hand].position);
+    // The pointer is held still while the trigger is being pulled (pulling it tilts the controller: the press would
+    // land beside where it aimed), and its small tremor is smoothed: tiny turns are followed gradually, quick ones
+    // at once.
+    static float aim_q[4];
+    static int aim_hand = -1;
+    const SkyVrHand *ah = &s->hand[hand];
+    if (!s->active || !ah->tracked) { aim_hand = -1; vr_pointer_set_aim(false, ah->orientation, ah->position); return; }
+    const float pull = hand ? s->zr : s->zl;
+    if (captured && !down && pull > 0.08f && aim_hand == hand) return;  // (held: the last aim stays)
+    const float *q = ah->orientation;
+    if (aim_hand != hand) memcpy(aim_q, q, sizeof aim_q), aim_hand = hand;
+    float dot = aim_q[0] * q[0] + aim_q[1] * q[1] + aim_q[2] * q[2] + aim_q[3] * q[3];
+    const float sign = dot < 0 ? -1.0f : 1.0f;
+    dot = fminf(1.0f, fabsf(dot));
+    const float angle = 2 * acosf(dot);  // (radians turned since the smoothed aim)
+    const float a = fminf(1.0f, fmaxf(0.12f, angle / 0.035f));
+    float l = 0;
+    for (int i = 0; i < 4; i++) aim_q[i] += (q[i] * sign - aim_q[i]) * a, l += aim_q[i] * aim_q[i];
+    l = sqrtf(l);
+    for (int i = 0; i < 4; i++) aim_q[i] /= l;
+    vr_pointer_set_aim(true, aim_q, ah->position);
 }
 
 static bool get_bool(int a) {

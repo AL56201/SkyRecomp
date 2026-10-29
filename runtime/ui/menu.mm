@@ -904,6 +904,19 @@ ImGuiKey vk_key_up = ImGuiKey_None;
 ImVec2 vk_pointer(-FLT_MAX, -FLT_MAX);
 }  // namespace
 
+// The key nearest (x, y) (distance to its rectangle), -1 off the keyboard.
+static int vk_nearest(float x, float y) {
+    if (!vk_shown || x < vk_min.x || x > vk_max.x || y < vk_min.y || y > vk_max.y) return -1;
+    int best = -1;
+    float best_d = FLT_MAX;
+    for (int i = 0; i < VK_COUNT; i++) {
+        const float dx = fmaxf(0.0f, fmaxf(vk_rects[i].mn.x - x, x - vk_rects[i].mx.x));
+        const float dy = fmaxf(0.0f, fmaxf(vk_rects[i].mn.y - y, y - vk_rects[i].mx.y));
+        if (dx * dx + dy * dy < best_d) best_d = dx * dx + dy * dy, best = i;
+    }
+    return best;
+}
+
 // (menu_render, before NewFrame) The pointer at (x, y) on the panel, trigger down: true when it is on the keyboard
 // (the key presses go to ImGui as typing; the pointer itself doesn't).
 static bool vr_keyboard_input(ImGuiIO &io, float x, float y, bool down) {
@@ -912,9 +925,7 @@ static bool vr_keyboard_input(ImGuiIO &io, float x, float y, bool down) {
     const bool edge = down && !vk_was_down;
     vk_was_down = down;
     if (!vk_shown || x < vk_min.x || x > vk_max.x || y < vk_min.y || y > vk_max.y) { vk_held = -1; return false; }
-    int hit = -1;
-    for (int i = 0; i < VK_COUNT; i++)
-        if (x >= vk_rects[i].mn.x && x <= vk_rects[i].mx.x && y >= vk_rects[i].mn.y && y <= vk_rects[i].mx.y) hit = i;
+    int hit = vk_nearest(x, y);  // (the nearest key: the gaps between keys count too)
     const double now = SDL_GetTicksNS() / 1e9;
     bool press = false;
     if (edge && hit >= 0) press = true, vk_held = hit, vk_repeat_at = now + 0.45;
@@ -933,10 +944,11 @@ static bool vr_keyboard_input(ImGuiIO &io, float x, float y, bool down) {
 
 // (menu_render, after the windows) The keyboard, while a text field takes input on the VR panel.
 static void vr_keyboard_draw(ImGuiIO &io) {
+    const int hover_key = vk_nearest(vk_pointer.x, vk_pointer.y);  // (last frame's keys: the one a press would type)
     vk_shown = false;
     if (!vr_running() || !capturing() || !io.WantTextInput) { vk_shift = false; return; }
     const float W = io.DisplaySize.x, H = io.DisplaySize.y, pad = W * 0.008f;
-    const float kb_w = W * 0.9f, unit = kb_w / VK_ROW_UNITS, key_h = unit * 0.78f, gap = unit * 0.08f;
+    const float kb_w = W * 0.9f, unit = kb_w / VK_ROW_UNITS, key_h = unit * 0.92f, gap = unit * 0.08f;
     const float kb_h = VK_ROWS * key_h + 2 * pad;
     const ImGuiContext &g = *ImGui::GetCurrentContext();  // (below the field's caret, or above it when low)
     const float caret_y = g.PlatformImeData.WantVisible ? g.PlatformImeData.InputPos.y : 0.0f;
@@ -956,7 +968,7 @@ static void vr_keyboard_draw(ImGuiIO &io) {
         const ImVec2 mn(x[k.row] + gap * 0.5f, top + k.row * key_h + gap * 0.5f), mx(x[k.row] + kw - gap * 0.5f, top + (k.row + 1) * key_h - gap * 0.5f);
         x[k.row] += kw;
         vk_rects[i] = {mn, mx};
-        const bool hover = vk_pointer.x >= mn.x && vk_pointer.x <= mx.x && vk_pointer.y >= mn.y && vk_pointer.y <= mx.y;
+        const bool hover = i == hover_key;
         const ImU32 fill = vk_held == i || (k.key == VK_SHIFT && vk_shift) ? IM_COL32(70, 130, 200, 255)
                            : hover ? IM_COL32(78, 84, 98, 255) : IM_COL32(48, 52, 62, 255);
         dl->AddRectFilled(mn, mx, fill, unit * 0.1f);
