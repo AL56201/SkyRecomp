@@ -1500,6 +1500,29 @@ static bool beam_pose(XrPosef *pose, float *length) {
 
 // (the desktop mirror) Where the left eye sees the menu panel: as vr_mirror_hud_mvp.
 static float menu_panel_width(void) { return g_menu_passive ? 1.6f * g_vr_hud_config.hud_scale : g_vr_hud_config.menu_width; }
+// (the desktop mirror, while the eyes show the frozen world) The frozen left-eye image as the headset reprojects it:
+// a quad far out along the frozen view, spanning its field of view, seen from the current left eye. False when the
+// eyes are live.
+bool vr_mirror_frozen_mvp(float out[16]);
+bool vr_mirror_frozen_mvp(float out[16]) {
+    if (!frame.frozen_used) return false;
+    const XrPosef *e = &frozen_views[0].pose;
+    const XrFovf *f = &frozen_views[0].fov;
+    const float x = e->orientation.x, y = e->orientation.y, z = e->orientation.z, w = e->orientation.w;
+    const float R[9] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+                        2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+                        2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)};
+    const float D = 50.0f, l = tanf(f->angleLeft), r = tanf(f->angleRight), u = tanf(f->angleUp), d = tanf(f->angleDown);
+    const float local[3] = {(l + r) / 2 * D, (u + d) / 2 * D, -D};
+    float m[16] = {0};
+    for (int i = 0; i < 3; i++) {
+        m[i * 4 + 0] = R[i * 3 + 0], m[i * 4 + 1] = R[i * 3 + 1], m[i * 4 + 2] = R[i * 3 + 2];
+        m[i * 4 + 3] = (&e->position.x)[i] + R[i * 3 + 0] * local[0] + R[i * 3 + 1] * local[1] + R[i * 3 + 2] * local[2];
+    }
+    m[15] = 1;
+    return mirror_quad_mvp(m, (r - l) / 2 * D, (u - d) / 2 * D, out);
+}
+
 bool vr_mirror_menu_mvp(float out[16]) {
     if (!g_menu_placed) return false;
     const float hw = menu_panel_width() * 0.5f;
