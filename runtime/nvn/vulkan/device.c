@@ -919,16 +919,7 @@ void backend_present(NvnTexture *t) {
         if (mirror) {
             VkExtent2D extent = vk_frame_extent();
             float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, 0, 0, 1, 1};
-            {   // the left eye; while the game waits (name entry) the headset reprojects its held frame as the head
-                // moves: the mirror does the same (a quad far out where it was seen, from the current eye)
-                extern bool vr_mirror_frozen_mvp(float out[16]);
-                extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
-                float fm[16];
-                if (g_representing && vr_mirror_frozen_mvp(fm))
-                    vk_present_hud_quad(vk_cmd(), mirror_src, fm, renderer_origin_lower_left(), true);
-                else
-                    vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
-            }
+            vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
             {   // the HUD panel's 2D layer (the HUD, menus, map) over it, as the headset shows it: 16:9 in the middle
                 extern bool vk_hud_layer_on(void), vk_hud_opaque(void), motion_vr_calibration_hidden(void);
                 extern TexBackend *vk_hud_backend(void);
