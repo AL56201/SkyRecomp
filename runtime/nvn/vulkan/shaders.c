@@ -251,6 +251,14 @@ static const char *builtin_src(const char *name, int *stage) {
                "  uv = pc.crop.xy + u * pc.crop.zw;\n"
                "}\n";
     }
+    if (!strcmp(name, "present_over.frag")) {  // (the VR HUD texture over the desktop mirror: premultiplied, blended)
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(location = 0) in vec2 uv;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() { o = texture(t, uv); }\n";
+    }
     if (!strcmp(name, "present.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

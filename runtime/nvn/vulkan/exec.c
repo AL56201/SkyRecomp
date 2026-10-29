@@ -4895,9 +4895,12 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
 static VkPipelineLayout present_layout;
 static VkDescriptorSetLayout present_set_layout;
 
-static VkPipeline present_pipeline(VkFormat fmt) {
-    static struct { VkFormat f; VkPipeline p; } cache[4];
-    for (int i = 0; i < 4; i++) if (cache[i].p && cache[i].f == fmt) return cache[i].p;
+static VkPipeline present_pipeline_ex(VkFormat fmt, bool over);
+static VkPipeline present_pipeline(VkFormat fmt) { return present_pipeline_ex(fmt, false); }
+// over: the premultiplied texture blended over what is there (the VR HUD on the desktop mirror)
+static VkPipeline present_pipeline_ex(VkFormat fmt, bool over) {
+    static struct { VkFormat f; bool over; VkPipeline p; } cache[8];
+    for (int i = 0; i < 8; i++) if (cache[i].p && cache[i].f == fmt && cache[i].over == over) return cache[i].p;
     if (!present_layout) {
         VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
@@ -4911,7 +4914,7 @@ static VkPipeline present_pipeline(VkFormat fmt) {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
          .module = vk_builtin_shader("present.vert"), .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .module = vk_builtin_shader("present.frag"), .pName = "main"}};
+         .module = vk_builtin_shader(over ? "present_over.frag" : "present.frag"), .pName = "main"}};
     VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
@@ -4921,6 +4924,12 @@ static VkPipeline present_pipeline(VkFormat fmt) {
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
                                                .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xF};
+    if (over) {
+        cba.blendEnable = VK_TRUE;
+        cba.srcColorBlendFactor = cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstColorBlendFactor = cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.colorBlendOp = cba.alphaBlendOp = VK_BLEND_OP_ADD;
+    }
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1,
                                               .pAttachments = &cba};
     VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -4934,7 +4943,7 @@ static VkPipeline present_pipeline(VkFormat fmt) {
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = present_layout};
     VkPipeline p;
     VK_CHECK(vk_create_graphics_pipelines(1, &pi, &p));
-    for (int i = 0; i < 4; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].p = p; break; }
+    for (int i = 0; i < 8; i++) if (!cache[i].p) { cache[i].f = fmt; cache[i].over = over; cache[i].p = p; break; }
     return p;
 }
 
@@ -5283,6 +5292,26 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     VkPipeline p = present_pipeline(g_vk.sc_format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
+                              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
+    VkViewport vp = {vx, vy, vw, vh, 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &vp);
+    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &full);
+}
+
+// (device.c, the VR desktop mirror) The HUD texture over the mirror in (vx, vy, vw, vh): blended (its premultiplied
+// alpha), or opaque for a full-screen 2D frame (the map), as the headset shows it.
+void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8], bool opaque) {
+    if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    VkPipeline p = present_pipeline_ex(g_vk.sc_format, !opaque);
+    VkDescriptorSet ds = vk_alloc_set(present_set_layout);
+    VkDescriptorImageInfo ii = {vk_default_sampler(true), raw_view(b), VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
                               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
     vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);

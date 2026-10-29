@@ -885,6 +885,18 @@ void backend_present(NvnTexture *t) {
             VkExtent2D extent = vk_frame_extent();
             float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, 0, 0, 1, 1};
             vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
+            {   // the HUD panel's 2D layer (the HUD, menus, map) over it, as the headset shows it: 16:9 in the middle
+                extern bool vk_hud_layer_on(void), vk_hud_opaque(void), motion_vr_calibration_hidden(void);
+                extern TexBackend *vk_hud_backend(void);
+                extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh,
+                                               const float pv[8], bool opaque);
+                TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() ? vk_hud_backend() : NULL;
+                if (hb) {
+                    const float ww = (float)extent.width, wh = (float)extent.height;
+                    const float w = fminf(ww, wh * 16.0f / 9.0f), h = w * 9.0f / 16.0f;
+                    vk_present_overlay(vk_cmd(), hb, (ww - w) / 2, (wh - h) / 2, w, h, pv, vk_hud_opaque());
+                }
+            }
             pt_mark(PT_MIRROR_DRAW);
             menu_render((void *)vk_cmd(), extent.width, extent.height);
             pt_mark(PT_MENU);
