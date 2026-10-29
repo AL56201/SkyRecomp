@@ -675,7 +675,10 @@ void backend_set_window_crop(const int crop[4]) {
 void backend_present(NvnTexture *t);
 static bool g_representing;
 static bool g_cinema;
-static bool g_blank;  // (this frame: a fade - no scene, only full-screen colour 2D: shown in the eyes, no panel)  // (this frame: a prerendered cutscene - vr.c cinema - the mirror shows it the same way)  // (backend_represent: the game is waiting - e.g. the name entry dialog)
+static bool g_blank;      // this frame is a full-screen colour fade: show it in the eyes, not on the panel
+static bool g_had_scene;  // this frame drew 3D: never put a full-screen copy on the panel
+static bool g_had_hud;    // this frame routed actual 2D-layer draws into the HUD texture
+static float g_vr_crop[4] = {0, 0, 1, 1};  // the eyes' part of the game image; the mirror shows the same crop
 void backend_represent(void) {
     extern bool nvn_async_on(void), nvn_async_is_replay_thread(void);
     extern void nvn_async_represent(void);
@@ -820,8 +823,10 @@ void backend_present(NvnTexture *t) {
         extern void vk_hud_present(NvnTexture *screen);  // (exec.c: full-screen 2D frames -> the HUD texture)
         vk_hud_present(t);
         {   // full-screen 2D (the map): the eyes keep the last 3D frame
-            extern bool vk_hud_layer_on(void), vk_hud_opaque(void), vk_hud_frame_had_scene(void);
+            extern bool vk_hud_layer_on(void), vk_hud_opaque(void), vk_hud_frame_had_scene(void), vk_hud_frame_had_content(void);
             const bool had_scene = vk_hud_frame_had_scene();
+            g_had_scene = had_scene;
+            g_had_hud = vk_hud_frame_had_content();
             extern bool vk_hud_frame_blank(void);  // (exec.c: no scene, and no 2D but full-screen colour - a fade)
             g_blank = !had_scene && vk_hud_frame_blank();
             {   // a prerendered cutscene (hle/movie.c) on its own screen: the panel, larger and still, in the dark
@@ -849,6 +854,15 @@ void backend_present(NvnTexture *t) {
                 if (p0 != b) renderer_save_texture_tex(p0, g_post_shot);
                 g_post_shot[0] = 0;
             }
+            {   // the game's window crop (its dynamic resolution's smaller frame): the eyes show that part, as the desktop
+                extern void vr_set_eye_crop(const float crop[4]);
+                float c[4] = {0, 0, 1, 1};
+                if (g_window_crop[2] > 0 && g_window_crop[3] > 0 && t->width > 0 && t->height > 0)
+                    c[0] = (float)g_window_crop[0] / t->width, c[1] = (float)g_window_crop[1] / t->height,
+                    c[2] = (float)g_window_crop[2] / t->width, c[3] = (float)g_window_crop[3] / t->height;
+                vr_set_eye_crop(c);
+                memcpy(g_vr_crop, c, sizeof g_vr_crop);
+            }
             vk_label_begin(vk_cmd(), "[VR] Eye copies");
             vr_record_eye_copies((void *)vk_cmd(), (void *)p0->image, p1 ? (void *)p1->image : NULL, p0->width, p0->height,
                                  renderer_origin_lower_left(), (uint32_t)p0->format, p0->layer0, p1 ? p1->layer0 : p0->layer0);
@@ -860,7 +874,8 @@ void backend_present(NvnTexture *t) {
             extern TexBackend *vk_hud_backend(void);
             extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the calibration prompt, hidden)
             // (a blank frame - a fade - fills the eyes as it is: no panel)
-            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank ? vk_hud_backend() : NULL;
+            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && (!g_had_scene || g_had_hud)
+                                 ? vk_hud_backend() : NULL;
             {   // (test) LARECOMP_MENU_AT=<frame>: the settings menu opens at that frame (as on the desktop below)
                 static long menu_at = -1;
                 if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
@@ -881,7 +896,7 @@ void backend_present(NvnTexture *t) {
             if (hb) {
                 vk_label_begin(vk_cmd(), "[VR] HUD Quad");
                 vr_record_hud_copy((void *)vk_cmd(), (void *)hb->image, hb->width, hb->height, renderer_origin_lower_left(),
-                               vk_hud_opaque());
+                               vk_hud_opaque() && !g_had_scene);
                 vk_label_end(vk_cmd());
             }
             pt_mark(PT_HUD);
@@ -932,7 +947,7 @@ void backend_present(NvnTexture *t) {
         }
         if (mirror) {
             VkExtent2D extent = vk_frame_extent();
-            float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, 0, 0, 1, 1};
+            float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, g_vr_crop[0], g_vr_crop[1], g_vr_crop[2], g_vr_crop[3]};
             if (!g_cinema) vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
             {   // the HUD panel's 2D layer (the HUD, menus, map) over it, as the headset shows it: 16:9 in the middle
                 extern bool vk_hud_layer_on(void), vk_hud_opaque(void), motion_vr_calibration_hidden(void);
@@ -944,7 +959,7 @@ void backend_present(NvnTexture *t) {
                 extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
                 float mvp[16];
                 if (hb && vr_mirror_hud_mvp(mvp)) {  // (where the left eye sees the panel)
-                    vk_present_hud_quad(vk_cmd(), hb, mvp, renderer_origin_lower_left(), vk_hud_opaque());
+                    vk_present_hud_quad(vk_cmd(), hb, mvp, renderer_origin_lower_left(), vk_hud_opaque() && !g_had_scene);
                 } else if (hb) {
                     const float ww = (float)extent.width, wh = (float)extent.height;
                     const float w = fminf(ww, wh * 16.0f / 9.0f), h = w * 9.0f / 16.0f;

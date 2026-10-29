@@ -28,6 +28,8 @@ static uint64_t stat_descriptor_hits, stat_descriptor_misses;
 static uint64_t stat_vr_shared_lists;
 static uint64_t stat_mv_passes, stat_mv_draws, stat_mv_skipped;  // (VR multiview, begin_pass)
 static bool g_stereo_camera_patched;
+static uint64_t g_last_scene_frame;  // (the HUD layer, below: the last frame that drew a 3D scene)
+static bool g_scene_since_present;
 // Scene depth and projection/decal passes are eye-dependent. A native,
 // depth-only offscreen shadow map is light-space data and can be shared.
 static bool g_stereo_shadow_or_depth;
@@ -2800,6 +2802,9 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                                                : vr_patch_scene_ubo(vk_vr_eye(), camera, source, size);
         if (camera_patched) {
             if (!vk_vr_eye()) g_stereo_camera_patched = true;
+            // (a draw seen through a per-eye camera: this frame has a 3D scene - also the sky-only shots the
+            // projection test in hud_mark_scene_targets misses; else they count as full-screen 2D, copied to the panel)
+            g_last_scene_frame = renderer_present_count(), g_scene_since_present = true;
             uint8_t local[0x800];
             VkSpan patched;
             if (size <= sizeof local) {
@@ -3844,8 +3849,6 @@ static void hud_clear_for_frame(void) {
 
 // Full-screen 2D (the map, menus with no 3D scene behind): the previous frame drew no scene. Nothing is redirected
 // then; at present the screen's 16:9 box goes to the HUD texture whole (vk_hud_present), opaque.
-static uint64_t g_last_scene_frame;
-static bool g_scene_since_present;  // a scene draw since the last present (vk_hud_frame_had_scene)
 static bool hud_full2d(void) { return renderer_present_count() > g_last_scene_frame + 1; }
 // (hle/vr_world.c) A full-screen menu pauses the game while the world keeps drawing behind it: its 2D layer is
 // redirected whole and shown opaque, drawn with the game's own blending (the map's parchment blends over its islands
@@ -3856,6 +3859,7 @@ bool vk_hud_opaque(void) { return hud_full2d() || vr_world_menu_active(); }
 static CmdRec *g_hud_rec;  // (the draw being routed)
 static bool g_hud_candidate;  // this draw is drawn like the 2D layer (decided in draw_ once its program is known)
 static bool g_hud_active;     // this draw renders into the HUD texture: draw() restores the targets afterwards
+static bool g_hud_content_since_present;  // at least one real 2D-layer draw was routed since the last present
 static RtState g_hud_saved_rt;
 
 // (device.c, at present, eye 0's screen) Full-screen 2D frames: the screen's centred 16:9 box (where the game's
@@ -3876,8 +3880,16 @@ bool vk_hud_frame_had_scene(void) {
     return had;
 }
 
+bool vk_hud_frame_had_content(void) {
+    const bool had = g_hud_content_since_present;
+    g_hud_content_since_present = false;
+    return had;
+}
+
 void vk_hud_present(NvnTexture *screen) {
-    if (!vk_hud_layer_on() || !hud_full2d() || !screen || !screen->backend) return;
+    // (not a frame that drew a 3D scene: right after a scene-less stretch - black title cards, a fade - the first
+    // scene frames still count as full-screen 2D, and the whole frame landed on the panel, a small copy of the view)
+    if (!vk_hud_layer_on() || !hud_full2d() || g_scene_since_present || !screen || !screen->backend) return;
     NvnTexture *hud = hud_texture(screen);
     TexBackend *d = vk_tex(hud, true), *s = (TexBackend *)screen->backend;
     float u = fminf(s->sx, s->sy);
@@ -3945,6 +3957,13 @@ static bool hud_route(Prog *pr) {
         if (unit) return true;  // (drawn normally, both eyes)
     }
     if (vk_vr_eye()) return false;
+    // Async replay can process the first draws of a new presented frame while renderer_present_count still names the
+    // previous one. The frame-number guard may therefore think the HUD was already cleared. The first draw actually
+    // routed after each present is an unambiguous boundary: force its transparent clear before preserving this draw.
+    if (!g_hud_content_since_present) {
+        g_hud_cleared = ~0ull;
+        hud_clear_for_frame();
+    }
     NvnTexture *hud = hud_texture(st.rt.color[0]);
     NvnTexture *hd = hud_depth(st.rt.depth);
     if (!hud->backend || (hd && !hd->backend)) {  // (first use: made now, cleared for this frame)
@@ -3962,6 +3981,7 @@ static bool hud_route(Prog *pr) {
     g_hud_sub_from = g_menu_screen = g_hud_saved_rt.color[0];
     g_hud_sub_to = hud;
     g_hud_active = true;
+    g_hud_content_since_present = true;
     return true;
 }
 

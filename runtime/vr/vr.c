@@ -858,6 +858,16 @@ static bool frozen_create(void) {
     return true;
 }
 
+// (device.c, each present) The part of the presented image the game shows, as fractions of it (origin, size): its
+// dynamic resolution draws a smaller frame into a corner, its window crop says which (the desktop applies it too).
+static float g_eye_crop[4] = {0, 0, 1, 1};
+void vr_set_eye_crop(const float crop[4]) {
+    const bool ok = crop && crop[2] > 0.05f && crop[3] > 0.05f && crop[0] >= 0 && crop[1] >= 0 && crop[0] + crop[2] <= 1.001f &&
+                    crop[1] + crop[3] <= 1.001f;
+    const float full[4] = {0, 0, 1, 1};
+    memcpy(g_eye_crop, ok ? crop : full, sizeof g_eye_crop);
+}
+
 bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_image, uint32_t sw, uint32_t sh, bool flip_y,
                           uint32_t source_format, uint32_t left_layer, uint32_t right_layer) {
     if (!vr_stereo_active() || frame.acquired || !command_buffer || !left_image || !sw || !sh) return false;
@@ -950,11 +960,14 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
             VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     // The game image fills the eye image whole: its projection already maps the headset's frustum to [-1, 1], so
     // the stretch restores the correct shape whatever the render target's aspect.
-    int32_t y0 = 0, y1 = (int32_t)sh;
-    if (flip_y) { y0 = (int32_t)sh; y1 = 0; }
+    // (vr_set_eye_crop: the part of the image the game shows - its dynamic resolution renders into a corner)
+    const int32_t cx0 = (int32_t)lroundf(g_eye_crop[0] * sw), cx1 = (int32_t)lroundf((g_eye_crop[0] + g_eye_crop[2]) * sw);
+    const int32_t cy0 = (int32_t)lroundf(g_eye_crop[1] * sh), cy1 = (int32_t)lroundf((g_eye_crop[1] + g_eye_crop[3]) * sh);
+    int32_t y0 = cy0, y1 = cy1;
+    if (flip_y) { y0 = cy1; y1 = cy0; }
     for (uint32_t eye = 0; eye < 2; eye++) {
         VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, eye ? right_layer : left_layer, 1},
-                            .srcOffsets = {{0, y0, 0}, {(int32_t)sw, y1, 1}},
+                            .srcOffsets = {{cx0, y0, 0}, {cx1, y1, 1}},
                             .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, eye, 1},
                             .dstOffsets = {{0, 0, 0}, {(int32_t)eye_width, (int32_t)eye_height, 1}}};
         vkCmdBlitImage(cb, src[eye], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, blit_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
