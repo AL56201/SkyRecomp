@@ -3858,6 +3858,7 @@ bool vk_hud_opaque(void) { return hud_full2d() || vr_world_menu_active(); }
 
 static CmdRec *g_hud_rec;  // (the draw being routed)
 static bool g_hud_candidate;  // this draw is drawn like the 2D layer (decided in draw_ once its program is known)
+static bool g_hud_fullscreen_draw;  // geometry fills the screen; draw_ decides whether it is actually a solid fade
 static bool g_hud_active;     // this draw renders into the HUD texture: draw() restores the targets afterwards
 static bool g_hud_content_since_present;  // at least one real 2D-layer draw was routed since the last present
 static RtState g_hud_saved_rt;
@@ -3868,9 +3869,11 @@ static RtState g_hud_saved_rt;
 // (device.c, at present) The frame being presented drew no 2D but full-screen quads (a fade, a flash, a blank screen);
 // resets for the next frame.
 static int g_2d_content;  // this frame's 2D-layer draws that are not full-screen quads
+static bool g_fullscreen_2d_since_present;  // a fade/flash covers the eyes; never show a panel over it
 bool vk_hud_frame_blank(void) {
-    const bool blank = g_2d_content == 0;
+    const bool blank = g_fullscreen_2d_since_present || g_2d_content == 0;
     g_2d_content = 0;
+    g_fullscreen_2d_since_present = false;
     return blank;
 }
 
@@ -3889,7 +3892,11 @@ bool vk_hud_frame_had_content(void) {
 void vk_hud_present(NvnTexture *screen) {
     // (not a frame that drew a 3D scene: right after a scene-less stretch - black title cards, a fade - the first
     // scene frames still count as full-screen 2D, and the whole frame landed on the panel, a small copy of the view)
-    if (!vk_hud_layer_on() || !hud_full2d() || g_scene_since_present || !screen || !screen->backend) return;
+    // Do not resurrect the previous panel during a scene-less fade.  The HUD image is persistent, so merely having
+    // a backend does not mean this frame supplied panel content.  Real full-screen 2D screens (map, file select,
+    // menus) contain layout draws; an all-screen fade does not.
+    if (!vk_hud_layer_on() || !hud_full2d() || g_scene_since_present || g_fullscreen_2d_since_present ||
+        g_2d_content == 0 || !screen || !screen->backend) return;
     NvnTexture *hud = hud_texture(screen);
     TexBackend *d = vk_tex(hud, true), *s = (TexBackend *)screen->backend;
     float u = fminf(s->sx, s->sy);
@@ -3903,6 +3910,9 @@ void vk_hud_present(NvnTexture *screen) {
                       .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, d->layer0, 1}, .dstOffsets = {{0, 0, 0}, {(int)d->width, (int)d->height, 1}}};
     vkCmdBlitImage(cb, s->image, VK_IMAGE_LAYOUT_GENERAL, d->image, VK_IMAGE_LAYOUT_GENERAL, 1, &bl, VK_FILTER_LINEAR);
     vk_full_barrier(cb);
+    // device.c samples and resets this immediately after vk_hud_present().  Mark the blit just like routed HUD
+    // draws so it is the only full-screen fallback allowed onto the OpenXR panel this frame.
+    g_hud_content_since_present = true;
 }
 
 static void draw(CmdRec *r, bool indexed) {
@@ -3916,8 +3926,11 @@ static void draw(CmdRec *r, bool indexed) {
         PROF_ADD(prof_draw);
         return;
     }
-    if (g_hud_candidate && hud_fullscreen_quad()) g_hud_candidate = false;  // (a fade: over the whole view, in the eyes)
-    if (vk_hud_layer_on() && st.program && !vk_vr_eye() && is_hud_draw() && !hud_fullscreen_quad()) g_2d_content++;  // (vk_hud_frame_blank)
+    const bool hud_draw = vk_hud_layer_on() && st.program && !vk_vr_eye() && is_hud_draw();
+    const bool fullscreen_2d = hud_draw && hud_fullscreen_quad();
+    g_hud_fullscreen_draw = fullscreen_2d;
+    if (g_hud_candidate && fullscreen_2d) g_hud_candidate = false;  // (a fade: over the whole view, in the eyes)
+    if (!fullscreen_2d && hud_draw) g_2d_content++;  // (vk_hud_frame_blank)
     // World behind a menu (hle/vr_world.c): the menu's own passes that read the screen back (the map's islands,
     // drawn there first, then captured into its map texture) read the HUD texture, where its 2D layer now is.
     const bool menu_sub = !g_hud_candidate && g_menu_screen && g_hud_tex.backend && vk_hud_layer_on() && vr_world_menu_active();
@@ -4032,6 +4045,14 @@ static void draw_(CmdRec *r, bool indexed) {
         if (mv && pr && atomic_load(&pr->state) == 2) mv_blacklist(mv_sig(), "shader");
         stat_skipped++;
         return;
+    }
+    // A textured full-screen quad can be the title or file-select background.  Only a textureless black/white fill
+    // owns the whole view as a fade; suppressing every full-screen quad makes those screens disappear in VR.
+    if (g_hud_fullscreen_draw && pr->fi->ntex == 0 && st.ubuf[1][0].addr && st.ubuf[1][0].size >= 12) {
+        const float *c = (const float *)(uintptr_t)st.ubuf[1][0].addr;
+        const bool black = c[0] < 0.01f && c[1] < 0.01f && c[2] < 0.01f;
+        const bool white = c[0] > 0.99f && c[1] > 0.99f && c[2] > 0.99f;
+        if (black || white) g_fullscreen_2d_since_present = true;
     }
     if (g_hud_candidate && !hud_route(pr)) { stat_skipped++; return; }  // (VR HUD layer, see draw())
     if (vk_hud_layer_on()) hud_mark_scene_targets(pr);

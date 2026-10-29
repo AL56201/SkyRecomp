@@ -828,7 +828,9 @@ void backend_present(NvnTexture *t) {
             g_had_scene = had_scene;
             g_had_hud = vk_hud_frame_had_content();
             extern bool vk_hud_frame_blank(void);  // (exec.c: no scene, and no 2D but full-screen colour - a fade)
-            g_blank = !had_scene && vk_hud_frame_blank();
+            // A fade may cover a live 3D scene (the Skyview void transition does exactly that).  It still owns the
+            // whole view and must suppress the floating panel; scene presence must not cancel the fade.
+            g_blank = vk_hud_frame_blank();
             {   // a prerendered cutscene (hle/movie.c) on its own screen: the panel, larger and still, in the dark
                 extern bool movie_playing(void);
                 extern void vr_cinema(bool on);
@@ -874,7 +876,9 @@ void backend_present(NvnTexture *t) {
             extern TexBackend *vk_hud_backend(void);
             extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the calibration prompt, hidden)
             // (a blank frame - a fade - fills the eyes as it is: no panel)
-            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && (!g_had_scene || g_had_hud)
+            // The HUD image persists between frames.  Submit it only when this present actually routed or copied
+            // panel content; otherwise black fades can reveal a stale, flat copy of the preceding 3D scene.
+            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && g_had_hud
                                  ? vk_hud_backend() : NULL;
             {   // (test) LARECOMP_MENU_AT=<frame>: the settings menu opens at that frame (as on the desktop below)
                 static long menu_at = -1;
@@ -954,7 +958,8 @@ void backend_present(NvnTexture *t) {
                 extern TexBackend *vk_hud_backend(void);
                 extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh,
                                                const float pv[8], bool opaque);
-                TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank ? vk_hud_backend() : NULL;
+                TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && g_had_hud
+                                     ? vk_hud_backend() : NULL;
                 extern bool vr_mirror_hud_mvp(float out[16]);
                 extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
                 float mvp[16];
