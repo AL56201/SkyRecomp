@@ -1272,7 +1272,8 @@ static XrPosef hud_pose(void) {
     float m[16];
     const float dt = frame.display_period > 0 ? (float)frame.display_period * 1e-9f : 1.0f / 90.0f;
     extern bool vr_menu_pointer_active(void);  // (vr_controls.c: the panel holds still while it is in use)
-    g_vr_hud_hold = vr_menu_pointer_active();
+    extern bool menu_is_open(void);
+    g_vr_hud_hold = vr_menu_pointer_active() || menu_is_open();  // (the settings menu on the panel too)
     ComputeHUDQuadMatrixDelta(m, head, NULL, dt);
     memcpy(g_hud_world, m, sizeof g_hud_world);
     g_hud_world_ok = true;

@@ -420,6 +420,23 @@ static const char *builtin_src(const char *name, int *stage) {
     // supersampling's anti-aliasing is lost. Here: a tent over one output pixel each way, 4 x 4 bilinear taps (each
     // averaging 2 x 2 texels), enough for up to ~2.5x. pc.a = (1 / input size, input pixels per output pixel),
     // pc.b.xy = output size.
+    if (!strcmp(name, "hud_menu.frag")) {  // (VR: the settings menu over the HUD texture, both premultiplied)
+        // binding 0: the HUD texture, 1: the menu; pc.a.xy: the output size, pc.a.z: the HUD texture is bottom-up,
+        // pc.a.w: no HUD texture (the menu alone)
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D h;\n"
+               "layout(set = 0, binding = 1) uniform sampler2D m;\n"
+               "layout(push_constant) uniform P { vec4 a; vec4 b; } pc;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "void main() {\n"
+               "  vec2 uv = gl_FragCoord.xy / pc.a.xy;\n"
+               "  vec2 muv = pc.a.z > 0.5 ? vec2(uv.x, 1.0 - uv.y) : uv;\n"
+               "  vec4 mc = texture(m, muv);\n"
+               "  vec4 hc = pc.a.w > 0.5 ? vec4(0.0) : texture(h, uv);\n"
+               "  o = mc + hc * (1.0 - mc.a);\n"
+               "}\n";
+    }
     if (!strcmp(name, "down.frag")) {
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

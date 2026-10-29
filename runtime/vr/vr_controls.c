@@ -4,6 +4,7 @@
 
 #include <math.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <SDL3/SDL_timer.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,7 +86,7 @@ bool vr_menu_pointer_active(void) { return panel_pointer_on(); }  // (vr.c: the 
 // yaw, so a turned head can leave the controller pointing past it - the cursor then stays on the nearest edge
 // instead of leaving the screen (the game hides it off screen). A ray pointing away from the panel's plane goes to
 // the edge in its direction along the panel. False only for unusable matrices.
-static bool panel_uv(const float aim[16], const float hud[16], float *u, float *v) {
+static bool panel_uv_ex(const float aim[16], const float hud[16], float *u, float *v, bool *inside) {
     const float o[3] = {aim[3], aim[7], aim[11]}, d[3] = {-aim[2], -aim[6], -aim[10]};
     const float c[3] = {hud[3], hud[7], hud[11]}, x[3] = {hud[0], hud[4], hud[8]}, y[3] = {hud[1], hud[5], hud[9]};
     float n[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]};
@@ -106,11 +107,31 @@ static bool panel_uv(const float aim[16], const float hud[16], float *u, float *
         ly = (d[0] * y[0] + d[1] * y[1] + d[2] * y[2]) / sqrtf(yy) * 1e3f;
     }
     if (!isfinite(lx) || !isfinite(ly)) return false;
+    if (inside) *inside = t > 0 && fabsf(lx) <= 1.0f && fabsf(ly) <= 1.0f;
     lx = fminf(1.0f, fmaxf(-1.0f, lx));
     ly = fminf(1.0f, fmaxf(-1.0f, ly));
     *u = lx * 0.5f + 0.5f;
     *v = 0.5f - ly * 0.5f;  // (+y: the top of the screen)
     return true;
+}
+
+static bool panel_uv(const float aim[16], const float hud[16], float *u, float *v) {
+    return panel_uv_ex(aim, hud, u, v, NULL);
+}
+
+// (menu.mm, the settings menu on the HUD panel) Where the right controller's ray meets the panel, (u, v) in 0..1 from
+// the top left; false when it misses the panel. click: the right trigger is held.
+_Atomic bool g_vr_right_trigger;  // (vr_input.c)
+bool vr_menu_ray(float *u, float *v, bool *click) {
+    pthread_mutex_lock(&g_ptr_lock);
+    const bool ok = g_ptr_aim_ok && g_ptr_hud_ok;
+    float aim[16], hud[16];
+    memcpy(aim, g_ptr_aim, sizeof aim);
+    memcpy(hud, g_ptr_hud, sizeof hud);
+    pthread_mutex_unlock(&g_ptr_lock);
+    bool inside = false;
+    if (click) *click = atomic_load(&g_vr_right_trigger);
+    return ok && panel_uv_ex(aim, hud, u, v, &inside) && inside;
 }
 
 static bool panel_pointer(SkyJoyConSensor *s) {
@@ -178,6 +199,7 @@ bool vr_joycon_sensor(int device, VrJoyConSensor *sensor) {
 }
 
 #else
+bool vr_menu_ray(float *u, float *v, bool *click) { (void)u; (void)v; if (click) *click = false; return false; }
 bool vr_menu_pointer_active(void) { return false; }
 void vr_pointer_direction(float u, float v, float out[9]) {
     (void)u; (void)v;

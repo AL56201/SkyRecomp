@@ -738,6 +738,9 @@ static void pt_report(void) {
     pt_frames = 0;
 }
 
+static bool g_vr_menu_on_panel;  // (this frame: the settings menu was drawn onto the VR HUD panel)
+static TexBackend *g_vr_panel_img;  // (this frame: the panel's image - the HUD texture, or it with the menu)
+
 void backend_present(NvnTexture *t) {
     pt_last = SDL_GetTicksNS();
     vr_poll();
@@ -832,10 +835,23 @@ void backend_present(NvnTexture *t) {
             extern TexBackend *vk_hud_backend(void);
             extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the calibration prompt, hidden)
             TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() ? vk_hud_backend() : NULL;
+            {   // (test) LARECOMP_MENU_AT=<frame>: the settings menu opens at that frame (as on the desktop below)
+                static long menu_at = -1;
+                if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
+                if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
+            }
+            if (vk_hud_layer_on() && menu_is_open()) {  // (the settings menu, on the panel: exec.c)
+                extern TexBackend *vk_vr_menu_over_hud(TexBackend *hud, bool flip);
+                hb = vk_vr_menu_over_hud(hb, renderer_origin_lower_left());
+                g_vr_menu_on_panel = true;
+            } else {
+                g_vr_menu_on_panel = false;
+            }
+            g_vr_panel_img = hb;
             if (hb) {
                 vk_label_begin(vk_cmd(), "[VR] HUD Quad");
                 vr_record_hud_copy((void *)vk_cmd(), (void *)hb->image, hb->width, hb->height, renderer_origin_lower_left(),
-                                   vk_hud_opaque());
+                               vk_hud_opaque());
                 vk_label_end(vk_cmd());
             }
             pt_mark(PT_HUD);
@@ -891,6 +907,7 @@ void backend_present(NvnTexture *t) {
                 extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh,
                                                const float pv[8], bool opaque);
                 TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() ? vk_hud_backend() : NULL;
+                if (g_vr_menu_on_panel) hb = g_vr_panel_img;  // (with the settings menu)
                 extern bool vr_mirror_hud_mvp(float out[16]);
                 extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
                 float mvp[16];
@@ -903,7 +920,7 @@ void backend_present(NvnTexture *t) {
                 }
             }
             pt_mark(PT_MIRROR_DRAW);
-            menu_render((void *)vk_cmd(), extent.width, extent.height);
+            if (!g_vr_menu_on_panel) menu_render((void *)vk_cmd(), extent.width, extent.height);  // (else: on the panel)
             pt_mark(PT_MENU);
             vk_frame_end(NULL);
             pt_mark(PT_MIRROR_END);

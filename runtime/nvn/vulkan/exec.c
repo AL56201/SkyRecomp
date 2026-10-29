@@ -5034,7 +5034,7 @@ static VkPipeline post_pipeline(const char *fs) {
 // Post image `i` at w x h (RGBA8, kept until the size changes). 0, 1: SMAA edges / weights, 2: SMAA output,
 // 3, 4: FSR EASU / RCAS. VR eye e (vk_vr_eye_post): 5 + 5 e + the same.
 static TexBackend *post_image(int i, uint32_t w, uint32_t h) {
-    static TexBackend img[15];  // (0-4 desktop, 5-14 VR eyes)
+    static TexBackend img[16];  // (0-4 desktop, 5-14 VR eyes, 15 VR HUD + settings menu)
     TexBackend *d = &img[i];
     if (d->image && (d->width != w || d->height != h)) {
         vk_views_forget(d);
@@ -5351,6 +5351,58 @@ void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16],
     pc[16] = flip ? 1.0f : 0.0f, pc[17] = pc[18] = pc[19] = 0;
     vkCmdPushConstants(cb, quad_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
     vkCmdDraw(cb, 6, 1, 0, 0);
+}
+
+// ---- VR: the settings menu (ImGui) on the HUD panel. It is drawn into its own image (the window's format: the
+// menu's pipeline is built for it), then over the HUD texture into post image 15, which the panel shows instead.
+static TexBackend g_menu_img;
+static TexBackend *menu_image(uint32_t w, uint32_t h) {
+    TexBackend *d = &g_menu_img;
+    if (d->image && (d->width != w || d->height != h || d->format != g_vk.sc_format)) {
+        vk_views_forget(d);
+        vk_defer_image(d->image, d->mem);
+        d->image = VK_NULL_HANDLE;
+        d->mem = VK_NULL_HANDLE;
+    }
+    if (!d->image) {
+        VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
+                                .format = g_vk.sc_format, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                                .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
+        d->format = g_vk.sc_format; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
+        d->samples = 1; d->aspect = VK_IMAGE_ASPECT_COLOR_BIT; d->base_type = VK_IMAGE_VIEW_TYPE_2D;
+        vk_image_init_layout(vk_cmd(), d->image, d->aspect);
+    }
+    return d;
+}
+
+// (device.c, VR present, the menu open) The HUD panel's image with the settings menu over the game's 2D layer
+// (hud: the HUD texture, or NULL), 1920 x 1080. flip: the HUD texture is bottom-up (the menu is drawn top-down).
+TexBackend *vk_vr_menu_over_hud(TexBackend *hud, bool flip) {
+    enum { W = 1920, H = 1080 };
+    extern void menu_render(void *cmd, uint32_t target_w, uint32_t target_h);
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    TexBackend *m = menu_image(W, H);
+    TexBackend *out = post_image(15, W, H);
+    VkPipeline pipe = post_pipeline("hud_menu.frag");  // (created before any rendering begins: post_pass)
+    vk_full_barrier(cb);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(m),
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {W, H}}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    menu_render((void *)cb, W, H);
+    vkCmdEndRendering(cb);
+    (void)pipe;
+    const VkImageView srcs[2] = {hud ? raw_view(hud) : post_view(m), post_view(m)};
+    const float pc[8] = {(float)W, (float)H, flip ? 1.0f : 0.0f, hud ? 0.0f : 1.0f};
+    post_pass(cb, "hud_menu.frag", srcs, 2, out, pc, false);
+    vk_full_barrier(cb);
+    return out;
 }
 
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.

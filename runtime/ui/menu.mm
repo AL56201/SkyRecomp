@@ -71,6 +71,7 @@ static void push(const QEvent &e) {
 bool menu_is_open(void) { return g_open.load(); }
 static std::atomic<bool> g_vr_close{false};
 extern "C" void menu_vr_close(void) { g_vr_close.store(true); }
+extern "C" bool vr_menu_ray(float *u, float *v, bool *click);  // (vr_controls.c: the settings menu on the VR HUD panel)
 static void set_open(bool open);
 extern "C" void menu_test_open(void) {
     set_open(true);
@@ -1053,6 +1054,16 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     io.DeltaTime = last > 0 && now > last ? (float)(now - last) : 1.0f / 60;
     last = now;
     drain_events(io);
+    if (vr_running() && g_open.load()) {  // VR: the right controller's ray on the HUD panel is the mouse, its trigger the click
+        float u, v;
+        bool click = false;
+        static bool was_click, was_on;
+        const bool on = vr_menu_ray(&u, &v, &click);
+        if (on) io.AddMousePosEvent(u * (float)tw, v * (float)th);
+        else if (was_on) io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+        if (click != was_click) io.AddMouseButtonEvent(0, click);
+        was_click = click, was_on = on;
+    }
     // fonts are built at 34/56 px for a ~1080 px tall output; scale to the window
     float scale = (float)(th / 1080.0);
     if (scale < 0.45f) scale = 0.45f;
