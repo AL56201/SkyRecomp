@@ -878,10 +878,14 @@ void backend_present(NvnTexture *t) {
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void);
             extern TexBackend *vk_hud_backend(void);
             extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the calibration prompt, hidden)
+            extern bool vr_world_menu_active(void);
             // (a blank frame - a fade - fills the eyes as it is: no panel)
             // The HUD image persists between frames.  Submit it only when this present actually routed or copied
             // panel content; otherwise black fades can reveal a stale, flat copy of the preceding 3D scene.
-            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && g_had_hud
+            // A retained full-screen screen (file select/title) must also disappear as soon as live 3D resumes.
+            // Merely making it non-opaque is insufficient: those textures contain alpha 1 over every pixel.
+            const bool panel_allowed = !g_had_scene || !vk_hud_opaque() || vr_world_menu_active();
+            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && g_had_hud && panel_allowed
                                  ? vk_hud_backend() : NULL;
             {   // (test) LARECOMP_MENU_AT=<frame>: the settings menu opens at that frame (as on the desktop below)
                 static long menu_at = -1;
@@ -959,9 +963,11 @@ void backend_present(NvnTexture *t) {
             {   // the HUD panel's 2D layer (the HUD, menus, map) over it, as the headset shows it: 16:9 in the middle
                 extern bool vk_hud_layer_on(void), vk_hud_opaque(void), motion_vr_calibration_hidden(void);
                 extern TexBackend *vk_hud_backend(void);
+                extern bool vr_world_menu_active(void);
                 extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh,
                                                const float pv[8], bool opaque);
-                TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && g_had_hud
+                const bool panel_allowed = !g_had_scene || !vk_hud_opaque() || vr_world_menu_active();
+                TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && g_had_hud && panel_allowed
                                      ? vk_hud_backend() : NULL;
                 extern bool vr_mirror_hud_mvp(float out[16]);
                 extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
