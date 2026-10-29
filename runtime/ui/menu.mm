@@ -1049,7 +1049,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     io.DisplaySize = ImVec2((float)tw, (float)th);
     io.DisplayFramebufferScale = ImVec2(1, 1);
     static double last;
-    double now = SDL_GetTicks() / 1000.0;
+    double now = SDL_GetTicksNS() / 1e9;  // (whole milliseconds made the FPS counter coarse at high rates)
     io.DeltaTime = last > 0 && now > last ? (float)(now - last) : 1.0f / 60;
     last = now;
     drain_events(io);

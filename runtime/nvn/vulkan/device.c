@@ -866,6 +866,21 @@ void backend_present(NvnTexture *t) {
             mirror_next = now_ns + period - period / 8 > mirror_next + period ? now_ns + period - period / 8 : mirror_next + period;
         }
         pt_mark(PT_MIRROR_ACQ);
+        {   // SKYRECOMP_VR_PACE_TRACE: the mirror's actual refresh, every 2 s
+            static int trace = -1;
+            static uint64_t t0_ns, n_mirror, n_frames;
+            if (trace < 0) trace = getenv("SKYRECOMP_VR_PACE_TRACE") != NULL;
+            if (trace) {
+                n_frames++, n_mirror += mirror;
+                if (!t0_ns) t0_ns = now_ns;
+                if (now_ns - t0_ns >= 2000000000ull) {
+                    const double sec = (now_ns - t0_ns) / 1e9;
+                    LOG("[vr] mirror: %.1f per second (setting %.0f, headset frames %.1f per second, menu %s)\n",
+                        n_mirror / sec, mirror_hz, n_frames / sec, menu_is_open() ? "open" : "closed");
+                    t0_ns = now_ns, n_mirror = n_frames = 0;
+                }
+            }
+        }
         if (mirror) {
             VkExtent2D extent = vk_frame_extent();
             float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, 0, 0, 1, 1};
