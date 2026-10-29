@@ -891,7 +891,12 @@ void backend_present(NvnTexture *t) {
                 extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh,
                                                const float pv[8], bool opaque);
                 TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() ? vk_hud_backend() : NULL;
-                if (hb) {
+                extern bool vr_mirror_hud_mvp(float out[16]);
+                extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
+                float mvp[16];
+                if (hb && vr_mirror_hud_mvp(mvp)) {  // (where the left eye sees the panel)
+                    vk_present_hud_quad(vk_cmd(), hb, mvp, renderer_origin_lower_left(), vk_hud_opaque());
+                } else if (hb) {
                     const float ww = (float)extent.width, wh = (float)extent.height;
                     const float w = fminf(ww, wh * 16.0f / 9.0f), h = w * 9.0f / 16.0f;
                     vk_present_overlay(vk_cmd(), hb, (ww - w) / 2, (wh - h) / 2, w, h, pv, vk_hud_opaque());

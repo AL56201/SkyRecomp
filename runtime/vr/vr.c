@@ -1221,6 +1221,44 @@ bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint3
     return true;
 }
 
+static float g_hud_world[16];  // (hud_pose) the panel last placed: world-from-panel, columns right, up, back (scaled)
+static bool g_hud_world_ok;
+
+// (device.c, the desktop mirror) The panel as the left eye sees it this frame: column-major clip-from-panel, the
+// panel's (x, y) in -1..1 over its half extents (0.8 x 0.45 m at HUD scale 1). False: no stereo frame or no panel.
+bool vr_mirror_hud_mvp(float out[16]) {
+    if (!frame.begun || !frame.stereo || !g_hud_world_ok) return false;
+    const XrPosef *e = &frame.views[0].pose;
+    const XrFovf *f = &frame.views[0].fov;
+    const float x = e->orientation.x, y = e->orientation.y, z = e->orientation.z, w = e->orientation.w;
+    const float R[9] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+                        2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+                        2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)};
+    const float p[3] = {e->position.x, e->position.y, e->position.z};
+    // panel point (u, v) -> world: c + u * 0.8 * X + v * 0.45 * Y; -> eye: R^T (q - p)
+    float cols[3][3];  // eye-space images of the panel's x half extent, y half extent, centre
+    const float *m = g_hud_world;
+    const float ax[3] = {m[0] * 0.8f, m[4] * 0.8f, m[8] * 0.8f}, ay[3] = {m[1] * 0.45f, m[5] * 0.45f, m[9] * 0.45f};
+    const float c[3] = {m[3] - p[0], m[7] - p[1], m[11] - p[2]};
+    for (int r = 0; r < 3; r++) {
+        cols[0][r] = R[0 * 3 + r] * ax[0] + R[1 * 3 + r] * ax[1] + R[2 * 3 + r] * ax[2];
+        cols[1][r] = R[0 * 3 + r] * ay[0] + R[1 * 3 + r] * ay[1] + R[2 * 3 + r] * ay[2];
+        cols[2][r] = R[0 * 3 + r] * c[0] + R[1 * 3 + r] * c[1] + R[2 * 3 + r] * c[2];
+    }
+    const float l = tanf(f->angleLeft), rt = tanf(f->angleRight), u = tanf(f->angleUp), d = tanf(f->angleDown);
+    // eye (ex, ey, ez) -> clip: x = (2 ex + (rt + l) ez) / (rt - l), y (down) = -(2 ey + (u + d) ez) / (u - d), z = 0,
+    // w = -ez (in front: ez < 0)
+    const float P[4][3] = {{2 / (rt - l), 0, (rt + l) / (rt - l)}, {0, -2 / (u - d), -(u + d) / (u - d)}, {0, 0, 0}, {0, 0, -1}};
+    // out (column-major): column k = clip of basis k: (ax, 0), (ay, 0), (0 for z), (centre, 1)
+    for (int row = 0; row < 4; row++) {
+        out[0 * 4 + row] = P[row][0] * cols[0][0] + P[row][1] * cols[0][1] + P[row][2] * cols[0][2];
+        out[1 * 4 + row] = P[row][0] * cols[1][0] + P[row][1] * cols[1][1] + P[row][2] * cols[1][2];
+        out[2 * 4 + row] = 0;
+        out[3 * 4 + row] = P[row][0] * cols[2][0] + P[row][1] * cols[2][1] + P[row][2] * cols[2][2];
+    }
+    return true;
+}
+
 // The quad layer's pose: vr_hud.h's world-from-HUD matrix from the head (between the eyes), in the local space.
 static XrPosef hud_pose(void) {
     const XrPosef *a = &frame.views[0].pose, *b = &frame.views[1].pose;
@@ -1234,6 +1272,8 @@ static XrPosef hud_pose(void) {
     extern bool vr_menu_pointer_active(void);  // (vr_controls.c: the panel holds still while it is in use)
     g_vr_hud_hold = vr_menu_pointer_active();
     ComputeHUDQuadMatrixDelta(m, head, NULL, dt);
+    memcpy(g_hud_world, m, sizeof g_hud_world);
+    g_hud_world_ok = true;
     {   // (the menu pointer, vr_controls.c) the panel with its half extents as axes
         const float hw = 0.8f * g_vr_hud_config.hud_scale, hh = hw * HUD_H / HUD_W;
         float h[16];

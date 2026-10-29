@@ -251,6 +251,20 @@ static const char *builtin_src(const char *name, int *stage) {
                "  uv = pc.crop.xy + u * pc.crop.zw;\n"
                "}\n";
     }
+    if (!strcmp(name, "hud_quad.vert")) {  // (the VR HUD panel on the desktop mirror, seen from the left eye)
+        // pc.mvp: panel (x, y in -1..1 over its half extents) -> clip; pc.a.x: flip (lower-left origin texture)
+        *stage = STAGE_VERTEX;
+        return "#version 450\n"
+               "layout(push_constant) uniform P { mat4 mvp; vec4 a; } pc;\n"
+               "layout(location = 0) out vec2 uv;\n"
+               "const vec2 c[6] = vec2[6](vec2(-1,-1), vec2(1,-1), vec2(1,1), vec2(-1,-1), vec2(1,1), vec2(-1,1));\n"
+               "void main() {\n"
+               "  vec2 p = c[gl_VertexIndex];\n"
+               "  gl_Position = pc.mvp * vec4(p, 0.0, 1.0);\n"
+               "  uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);\n"
+               "  if (pc.a.x > 0.5) uv.y = 1.0 - uv.y;\n"
+               "}\n";
+    }
     if (!strcmp(name, "present_over.frag")) {  // (the VR HUD texture over the desktop mirror: premultiplied, blended)
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"
