@@ -821,11 +821,18 @@ void backend_present(NvnTexture *t) {
                 LOG("[vr] eye shots at frame %ld: eye 1 image %s\n", at[i], b->vr_eye ? "saved" : "missing");
             }
         }
+        // Scene targets carry the present generation that produced them.  Consult it before vk_hud_present: the
+        // async replay boolean can arrive one present late, which used to copy the void cutscene into the HUD first
+        // and then show the same scene both stereoscopically and as a flat floating panel.
+        const uint64_t present_gen = renderer_present_count();
+        const bool target_had_scene = b->scene_frame && b->scene_frame <= present_gen + 1 &&
+                                      b->scene_frame + 1 >= present_gen;
         extern void vk_hud_present(NvnTexture *screen);  // (exec.c: full-screen 2D frames -> the HUD texture)
-        vk_hud_present(t);
+        if (!target_had_scene) vk_hud_present(t);
         {   // full-screen 2D (the map): the eyes keep the last 3D frame
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void), vk_hud_frame_had_scene(void), vk_hud_frame_had_content(void);
-            const bool had_scene = vk_hud_frame_had_scene();
+            const bool replay_had_scene = vk_hud_frame_had_scene();  // always consume/reset the async marker
+            const bool had_scene = target_had_scene || replay_had_scene;
             g_had_scene = had_scene;
             extern bool vk_hud_frame_had_fullscreen_quad(void);
             g_fade = vk_hud_frame_had_fullscreen_quad();
