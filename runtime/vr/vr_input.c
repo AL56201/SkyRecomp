@@ -12,6 +12,7 @@
 #if !defined(__APPLE__) && !defined(SKYRECOMP_NO_OPENXR) && __has_include(<openxr/openxr.h>) && \
     __has_include(<openxr/openxr_platform.h>)
 
+#include <SDL3/SDL_timer.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -29,6 +30,7 @@ enum {
     ACT_A, ACT_B, ACT_X, ACT_PLUS, ACT_MINUS, ACT_LSTICK, ACT_RSTICK, ACT_DPAD_PRESS,  // boolean
     ACT_LEFT_AIM, ACT_RIGHT_AIM,                                    // pose used by the Joy-Con motion emulation
     ACT_LEFT_GRIP, ACT_RIGHT_GRIP,                                  // grip poses: the wrist HUD
+    ACT_LEFT_HAPTIC, ACT_RIGHT_HAPTIC,                              // vibration (the settings menu's clicks)
     ACT_COUNT
 };
 
@@ -52,11 +54,14 @@ static const struct { const char *name, *label; XrActionType type; uint32_t butt
     [ACT_RIGHT_AIM] = {"right_joycon", "Joy-Con (R) pose", XR_ACTION_TYPE_POSE_INPUT, 0},
     [ACT_LEFT_GRIP] = {"left_hand", "Left hand grip pose", XR_ACTION_TYPE_POSE_INPUT, 0},
     [ACT_RIGHT_GRIP] = {"right_hand", "Right hand grip pose", XR_ACTION_TYPE_POSE_INPUT, 0},
+    [ACT_LEFT_HAPTIC] = {"left_haptic", "Left vibration", XR_ACTION_TYPE_VIBRATION_OUTPUT, 0},
+    [ACT_RIGHT_HAPTIC] = {"right_haptic", "Right vibration", XR_ACTION_TYPE_VIBRATION_OUTPUT, 0},
 };
 
 typedef struct { int action; const char *path; } Binding;
 #define L(p) "/user/hand/left/input/" p
 #define R(p) "/user/hand/right/input/" p
+#define HAPTICS {ACT_LEFT_HAPTIC, "/user/hand/left/output/haptic"}, {ACT_RIGHT_HAPTIC, "/user/hand/right/output/haptic"}
 
 static const Binding index_bindings[] = {
     {ACT_LEFT_STICK, L("thumbstick")}, {ACT_LSTICK, L("thumbstick/click")}, {ACT_ZL, L("trigger/value")},
@@ -64,7 +69,7 @@ static const Binding index_bindings[] = {
     {ACT_DPAD_PRESS, L("trackpad/force")}, {ACT_LEFT_AIM, L("aim/pose")}, {ACT_LEFT_GRIP, L("grip/pose")},
     {ACT_RIGHT_STICK, R("thumbstick")}, {ACT_ZR, R("trigger/value")},
     {ACT_R, R("squeeze/value")}, {ACT_A, R("a/click")}, {ACT_B, R("b/click")}, {ACT_X, R("trackpad/force")},
-    {ACT_RIGHT_AIM, R("aim/pose")}, {ACT_RIGHT_GRIP, R("grip/pose")},
+    {ACT_RIGHT_AIM, R("aim/pose")}, {ACT_RIGHT_GRIP, R("grip/pose")}, HAPTICS,
 };
 static const Binding touch_bindings[] = {
     {ACT_LEFT_STICK, L("thumbstick")}, {ACT_LSTICK, L("thumbstick/click")}, {ACT_ZL, L("trigger/value")},
@@ -72,13 +77,13 @@ static const Binding touch_bindings[] = {
     {ACT_LEFT_GRIP, L("grip/pose")},
     {ACT_RIGHT_STICK, R("thumbstick")}, {ACT_ZR, R("trigger/value")},
     {ACT_R, R("squeeze/value")}, {ACT_A, R("a/click")}, {ACT_B, R("b/click")}, {ACT_RIGHT_AIM, R("aim/pose")},
-    {ACT_RIGHT_GRIP, R("grip/pose")},
+    {ACT_RIGHT_GRIP, R("grip/pose")}, HAPTICS,
 };
 static const Binding vive_bindings[] = {
     {ACT_LEFT_STICK, L("trackpad")}, {ACT_LSTICK, L("trackpad/click")}, {ACT_ZL, L("trigger/value")},
     {ACT_L, L("squeeze/click")}, {ACT_PLUS, L("menu/click")}, {ACT_LEFT_AIM, L("aim/pose")}, {ACT_LEFT_GRIP, L("grip/pose")},
     {ACT_RIGHT_STICK, R("trackpad")}, {ACT_A, R("trackpad/click")}, {ACT_ZR, R("trigger/value")},
-    {ACT_R, R("squeeze/click")}, {ACT_RIGHT_AIM, R("aim/pose")}, {ACT_RIGHT_GRIP, R("grip/pose")},
+    {ACT_R, R("squeeze/click")}, {ACT_RIGHT_AIM, R("aim/pose")}, {ACT_RIGHT_GRIP, R("grip/pose")}, HAPTICS,
 };
 static const Binding wmr_bindings[] = {
     {ACT_LEFT_STICK, L("thumbstick")}, {ACT_LSTICK, L("thumbstick/click")}, {ACT_ZL, L("trigger/value")},
@@ -86,11 +91,11 @@ static const Binding wmr_bindings[] = {
     {ACT_DPAD_PRESS, L("trackpad/click")}, {ACT_LEFT_AIM, L("aim/pose")}, {ACT_LEFT_GRIP, L("grip/pose")},
     {ACT_RIGHT_STICK, R("thumbstick")}, {ACT_ZR, R("trigger/value")},
     {ACT_R, R("squeeze/click")}, {ACT_MINUS, R("menu/click")}, {ACT_A, R("trackpad/click")},
-    {ACT_RIGHT_AIM, R("aim/pose")}, {ACT_RIGHT_GRIP, R("grip/pose")},
+    {ACT_RIGHT_AIM, R("aim/pose")}, {ACT_RIGHT_GRIP, R("grip/pose")}, HAPTICS,
 };
 static const Binding simple_bindings[] = {
     {ACT_ZL, L("select/click")}, {ACT_PLUS, L("menu/click")}, {ACT_LEFT_AIM, L("aim/pose")}, {ACT_LEFT_GRIP, L("grip/pose")},
-    {ACT_A, R("select/click")}, {ACT_MINUS, R("menu/click")}, {ACT_RIGHT_AIM, R("aim/pose")}, {ACT_RIGHT_GRIP, R("grip/pose")},
+    {ACT_A, R("select/click")}, {ACT_MINUS, R("menu/click")}, {ACT_RIGHT_AIM, R("aim/pose")}, {ACT_RIGHT_GRIP, R("grip/pose")}, HAPTICS,
 };
 #undef L
 #undef R
@@ -174,6 +179,95 @@ void vr_input_destroy(void) {
     session = XR_NULL_HANDLE;
 }
 
+// A short vibration on one hand (amplitude 0..1).
+static void haptic(int hand, float amplitude, float ms) {
+    if (!session || !p_xrApplyHapticFeedback) return;
+    XrHapticActionInfo hi = {.type = XR_TYPE_HAPTIC_ACTION_INFO, .action = actions[hand ? ACT_RIGHT_HAPTIC : ACT_LEFT_HAPTIC]};
+    XrHapticVibration v = {.type = XR_TYPE_HAPTIC_VIBRATION, .duration = (XrDuration)(ms * 1e6f),
+                           .frequency = XR_FREQUENCY_UNSPECIFIED, .amplitude = amplitude};
+    p_xrApplyHapticFeedback(session, &hi, (const XrHapticBaseHeader *)&v);
+}
+
+// The settings menu / name entry on the VR panel (ui/menu.mm), from the controllers (after ShipWright VR):
+//  - holding the left stick click 0.6 s opens / closes the settings menu; a tap still reaches the game, as a short
+//    press when released (at press time a tap can't be told from the start of a hold);
+//  - the pointer is the hand that last pulled its trigger (the right one first); the trigger clicks past 0.55 and
+//    lets go under 0.35; that hand's stick scrolls; B closes the menu; a click on the panel buzzes;
+//  - whatever is held when the menu closes stays hidden from the game until released (the closing click doesn't
+//    swing the sword).
+static void menu_input(SkyVrControllers *s) {
+    extern bool menu_is_open(void), menu_input_captured(void);
+    extern void menu_vr_close(void), menu_vr_toggle(void);
+    extern bool vr_menu_ray(float *u, float *v, bool *click);
+    extern _Atomic bool g_vr_right_trigger;   // (vr_controls.c: the menu's click)
+    extern _Atomic float g_vr_right_stick_y;  // (vr_controls.c: the menu's scrolling)
+    const double now = SDL_GetTicksNS() / 1e9;
+    static bool stick_was, stick_pending, b_was;
+    static double stick_down_at, pulse_until;
+    static int hand = 1;
+    static bool down, was_captured;
+    static uint32_t latch_buttons;
+    static bool latch_trigger[2], latch_grip[2], latch_stick[2];
+
+    // Left stick click: hold toggles the settings menu, a tap goes to the game on release.
+    const bool stick = (s->buttons & SKY_JC_LSTICK) != 0;
+    if (stick && !stick_was) stick_pending = true, stick_down_at = now;
+    if (stick_pending && stick && now - stick_down_at >= 0.6) {
+        stick_pending = false;
+        menu_vr_toggle();
+        haptic(0, 0.4f, 30);
+    } else if (stick_pending && !stick) {
+        stick_pending = false;
+        if (menu_is_open()) menu_vr_close();
+        else pulse_until = now + 0.12;  // (over a few game frames: it can't be missed)
+    }
+    stick_was = stick;
+    s->buttons &= ~SKY_JC_LSTICK;
+    if (now < pulse_until) s->buttons |= SKY_JC_LSTICK;
+
+    const bool b = (s->buttons & SKY_JC_B) != 0;  // (OpenXR bypasses SDL, where the menu gets its Back)
+    if (b && !b_was && menu_is_open()) menu_vr_close();
+    b_was = b;
+
+    const bool captured = menu_input_captured();
+    if (captured) {
+        const float trig[2] = {s->zl, s->zr};
+        for (int h = 0; h < 2; h++)  // (the pointer follows the hand that pulls its trigger)
+            if (h != hand && !down && trig[h] > 0.55f && s->hand[h].tracked) hand = h;
+        const bool was_down = down;
+        if (!down && trig[hand] > 0.55f) down = true;
+        else if (down && trig[hand] < 0.35f) down = false;
+        float u, v;
+        bool click;
+        if (down && !was_down && vr_menu_ray(&u, &v, &click)) haptic(hand, 0.25f, 15);
+        atomic_store(&g_vr_right_trigger, down);
+        atomic_store(&g_vr_right_stick_y, s->stick[hand][1]);
+    } else {
+        down = false;
+        atomic_store(&g_vr_right_trigger, false);
+        atomic_store(&g_vr_right_stick_y, 0.0f);
+        if (was_captured) {  // (just closed: hold back what is still pressed)
+            latch_buttons = s->buttons;
+            latch_trigger[0] = s->zl > 0.2f, latch_trigger[1] = s->zr > 0.2f;
+            latch_grip[0] = s->l > 0.2f, latch_grip[1] = s->r > 0.2f;
+            for (int h = 0; h < 2; h++) latch_stick[h] = fabsf(s->stick[h][0]) > 0.25f || fabsf(s->stick[h][1]) > 0.25f;
+        }
+        latch_buttons &= s->buttons;
+        s->buttons &= ~latch_buttons;
+        float *trig[2] = {&s->zl, &s->zr}, *grip[2] = {&s->l, &s->r};
+        for (int h = 0; h < 2; h++) {
+            if (latch_trigger[h]) latch_trigger[h] = *trig[h] > 0.2f, *trig[h] = 0;
+            if (latch_grip[h]) latch_grip[h] = *grip[h] > 0.2f, *grip[h] = 0;
+            if (latch_stick[h]) {
+                latch_stick[h] = fabsf(s->stick[h][0]) > 0.25f || fabsf(s->stick[h][1]) > 0.25f;
+                s->stick[h][0] = s->stick[h][1] = 0;
+            }
+        }
+    }
+    was_captured = captured;
+    vr_pointer_set_aim(s->active && s->hand[hand].tracked, s->hand[hand].orientation, s->hand[hand].position);
+}
+
 static bool get_bool(int a) {
     XrActionStateGetInfo gi = {.type = XR_TYPE_ACTION_STATE_GET_INFO, .action = actions[a]};
     XrActionStateBoolean st = {.type = XR_TYPE_ACTION_STATE_BOOLEAN};
@@ -232,11 +326,6 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
         }
         s.zl = get_float(ACT_ZL);
         s.zr = get_float(ACT_ZR);
-        {   extern _Atomic bool g_vr_right_trigger;  // (vr_controls.c: the settings menu's click)
-            atomic_store(&g_vr_right_trigger, s.zr > 0.5f); }
-        {   extern _Atomic float g_vr_right_stick_y;  // (vr_controls.c: the settings menu's scrolling)
-            const XrVector2f rs = get_vec2(ACT_RIGHT_STICK);
-            atomic_store(&g_vr_right_stick_y, rs.y); }
         s.l = get_float(ACT_L);
         s.r = get_float(ACT_R);
         const XrVector2f ls = get_vec2(ACT_LEFT_STICK), rs = get_vec2(ACT_RIGHT_STICK);
@@ -244,16 +333,7 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
         s.stick[1][0] = rs.x; s.stick[1][1] = rs.y;
         for (int h = 0; h < 2; h++) locate_hand(aim_space[h], space, time, &s.hand[h]);
     }
-    {   // OpenXR actions bypass SDL, while the ImGui menu normally receives its Back/B action through SDL.
-        // Bridge the rising edge explicitly so the menu can always be dismissed from inside the headset.
-        static bool b_was_down;
-        const bool b_down = (s.buttons & SKY_JC_B) != 0;
-        extern bool menu_is_open(void);
-        extern void menu_vr_close(void);
-        if (b_down && !b_was_down && menu_is_open()) menu_vr_close();
-        b_was_down = b_down;
-    }
-    vr_pointer_set_aim(s.active && s.hand[1].tracked, s.hand[1].orientation, s.hand[1].position);  // (menu pointer)
+    menu_input(&s);
     // The game's motion sensors follow the aim poses (where each controller points); the grip poses (the controller
     // in the palm) place the wrist HUD.
     SkyVrHand grip[2] = {0};

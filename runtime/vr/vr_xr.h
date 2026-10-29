@@ -16,7 +16,8 @@
     X(xrDestroySwapchain) X(xrEnumerateSwapchainImages) X(xrAcquireSwapchainImage) X(xrWaitSwapchainImage)        \
     X(xrReleaseSwapchainImage) X(xrStringToPath) X(xrCreateActionSet) X(xrDestroyActionSet) X(xrCreateAction)     \
     X(xrSuggestInteractionProfileBindings) X(xrAttachSessionActionSets) X(xrSyncActions) X(xrCreateActionSpace)  \
-    X(xrGetActionStateBoolean) X(xrGetActionStateFloat) X(xrGetActionStateVector2f) X(xrDestroyInstance)
+    X(xrGetActionStateBoolean) X(xrGetActionStateFloat) X(xrGetActionStateVector2f) X(xrDestroyInstance)          \
+    X(xrApplyHapticFeedback)
 
 #define XR_DECLARE_EXTERN(name) extern PFN_##name p_##name;
 XR_INSTANCE_FUNCTIONS(XR_DECLARE_EXTERN)

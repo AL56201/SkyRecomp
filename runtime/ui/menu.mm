@@ -72,6 +72,8 @@ static void push(const QEvent &e) {
 bool menu_is_open(void) { return g_open.load(); }
 static std::atomic<bool> g_vr_close{false};
 extern "C" void menu_vr_close(void) { g_vr_close.store(true); }
+static std::atomic<bool> g_vr_toggle{false};
+extern "C" void menu_vr_toggle(void) { g_vr_toggle.store(true); }  // (vr_input.c: the left stick click, held)
 extern "C" bool vr_menu_ray(float *u, float *v, bool *click);
 extern "C" float vr_menu_scroll(void);  // (vr_controls.c: the right stick's y, up +)  // (vr_controls.c: the settings menu on the VR HUD panel)
 static void set_open(bool open);
@@ -1141,6 +1143,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     const double tw = target_w, th = target_h;
 #endif
     if (g_vr_close.exchange(false) && g_open.load()) set_open(false);  // (VR controllers: B)
+    if (g_vr_toggle.exchange(false) && g_kbd.load() != 1) set_open(!g_open.load());  // (VR: left stick click, held)
     bool open = g_open.load();
     bool inv = !open && inventory_overlay_wanted();
     bool trk = !open && tracker_overlay_wanted();
@@ -1163,6 +1166,9 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     double now = SDL_GetTicksNS() / 1e9;  // (whole milliseconds made the FPS counter coarse at high rates)
     io.DeltaTime = last > 0 && now > last ? (float)(now - last) : 1.0f / 60;
     last = now;
+    // (VR: every queued event this frame - the ray moves the mouse and the stick scrolls every frame; trickled one a
+    // frame, the backlog and the pointer's lag would grow while the stick is held)
+    io.ConfigInputTrickleEventQueue = !(vr_running() && capturing());
     drain_events(io);
     if (vr_running() && capturing()) {  // VR: the right controller's ray on the HUD panel is the mouse, its trigger the click
         float u, v;
