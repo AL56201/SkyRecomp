@@ -673,12 +673,15 @@ void backend_set_window_crop(const int crop[4]) {
 }
 
 void backend_present(NvnTexture *t);
+static bool g_representing;  // (backend_represent: the game is waiting - e.g. the name entry dialog)
 void backend_represent(void) {
     extern bool nvn_async_on(void), nvn_async_is_replay_thread(void);
     extern void nvn_async_represent(void);
     if (nvn_async_on() && !nvn_async_is_replay_thread()) { nvn_async_represent(); return; }
+    g_representing = true;  // (VR: the frozen world - the last 3D frame stays put in the world, the head moves freely)
     if (g_last_presented) backend_present(g_last_presented);
     else SDL_Delay(16);
+    g_representing = false;
 }
 
 // Each presented frame, the hooks that act on the game (scripted input, warps, tests, the save editor): on the
@@ -816,7 +819,8 @@ void backend_present(NvnTexture *t) {
         {   // full-screen 2D (the map): the eyes keep the last 3D frame
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void), vk_hud_frame_had_scene(void);
             const bool had_scene = vk_hud_frame_had_scene();
-            vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene, had_scene);  // (world mode: live)
+            if (g_representing) vr_freeze_world(true, false);  // (the game waiting: its last frame, held in the world)
+            else vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene, had_scene);  // (world mode: live)
         }
         pt_mark(PT_FREEZE);
         TexBackend *mirror_src = b;  // (the desktop mirror shows eye 0 as the headset gets it: no second post chain)
