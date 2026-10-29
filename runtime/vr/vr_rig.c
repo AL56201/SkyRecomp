@@ -149,6 +149,16 @@ static int g_water_hits_now, g_water_hits_before;  // Link's draws found at the 
 // The game camera from game memory is trusted while draws show it is live: some draw's view equalled it this frame
 // or the previous one (in a cutscene the address might hold another camera than the one drawing).
 static bool g_memory_seen_now, g_memory_seen_before;
+// The memory camera matched a draw within the last MEMORY_TRUST_FRAMES frames. On the title screen it matches only
+// every other frame or so (it holds the next camera while the slowly panning one is drawn); deciding per frame
+// switched the eye cameras' and the culling's source every 2-3 frames, and islands / clouds flickered.
+enum { MEMORY_TRUST_FRAMES = 60 };
+static _Atomic uint64_t g_memory_seen_frame;  // (present count + 1; 0 never)
+static bool memory_recent(void) {
+    extern uint64_t renderer_present_count(void);
+    const uint64_t f = atomic_load(&g_memory_seen_frame);
+    return f && renderer_present_count() + 1 <= f + MEMORY_TRUST_FRAMES;
+}
 
 float vr_rig_units_per_metre(void) {
     static float env = -1;
@@ -340,7 +350,11 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
     static int no_memory = -1;  // SKYRECOMP_VR_NO_GAME_CAMERA=1: only the block's own view (the earlier behaviour)
     if (no_memory < 0) no_memory = getenv("SKYRECOMP_VR_NO_GAME_CAMERA") != NULL;
     const bool memory = !no_memory && game_camera_view(camera);
-    if (memory && same_view(camera, mono + 16)) g_memory_seen_now = true;
+    if (memory && same_view(camera, mono + 16)) {
+        extern uint64_t renderer_present_count(void);
+        g_memory_seen_now = true;
+        atomic_store(&g_memory_seen_frame, renderer_present_count() + 1);
+    }
     // Without the memory camera (the title screen, file select, cutscenes: another camera draws), a plain camera
     // block of the same render pass (its targets; this frame or kept from an earlier one) stands for Vg in that
     // pass's blocks that are Vg times a model matrix: otherwise those (the sky dome, the cloud ring and sea) kept
@@ -352,7 +366,7 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
     int pc = -1;
     for (int i = 0; i < PASS_CAMERAS; i++)
         if (pass_camera[i].pass == g_vr_pass_id) pc = i;
-    if (memory && (g_memory_seen_now || g_memory_seen_before) && det3(mono + 16) > 0) game = camera, source = 0;
+    if (memory && memory_recent() && det3(mono + 16) > 0) game = camera, source = 0;
     else if (sky_vr_is_scene_camera(mono, 28 * sizeof(float))) {
         game = mono + 16, source = 1;
         if (det3(mono + 16) > 0 && g_vr_pass_id) {
@@ -491,7 +505,7 @@ static uint64_t g_cull_view_frame;
 // Whether the cull view stands on the real game camera (from game memory, matched by the draws: gameplay). On the
 // title / file select another camera draws and the rig's camera is a substitute (a pass's plain camera block): the
 // headset frustum built on it culled objects the eyes were looking at (islands flickering, vanishing).
-bool vr_rig_cull_trusted(void) { return g_memory_seen_now || g_memory_seen_before; }
+bool vr_rig_cull_trusted(void) { return memory_recent(); }
 
 bool vr_rig_cull_view(float view[12], float tangents[4]) {
     extern uint64_t renderer_present_count(void);
