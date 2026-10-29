@@ -55,8 +55,9 @@ static void eye_plane(float *out, const float v[12], float nx, float ny, float n
 
 static void headset_frustum(float *f) {
     float view[12], t[4];  // (t: left, right, down, up)
-    const bool eyes = vr_rig_cull_view(view, t);
-    if (!eyes && mode() != 2) return;  // (no stereo frame yet: the game's own)
+    const bool have = vr_rig_cull_view(view, t);
+    if (!have && mode() != 2) return;  // (no stereo frame yet: the game's own)
+    const bool eyes = have && vr_rig_cull_trusted();  // (else - title, file select - nothing is culled: below)
     for (int i = 0; i < 3; i++) {
         f[0x168 / 4 + i] = -1e30f;  // (the box around the frustum: everything)
         f[0x174 / 4 + i] = 1e30f;

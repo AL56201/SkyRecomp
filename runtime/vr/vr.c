@@ -594,7 +594,9 @@ static bool locate_views(void) {
         if (comma) pin_pitch = (float)atof(comma + 1) * (float)(M_PI / 180.0);
     }
     if (ok && pin) {
-        const float turn = pin_turn;
+        static float spin = -1;  // (test) SKYRECOMP_VR_PIN_HEAD_SPIN=<degrees per second>: the pinned head keeps turning
+        if (spin < 0) spin = getenv("SKYRECOMP_VR_PIN_HEAD_SPIN") ? (float)atof(getenv("SKYRECOMP_VR_PIN_HEAD_SPIN")) : 0;
+        const float turn = pin_turn + spin * (float)(M_PI / 180.0) * (float)(SDL_GetTicksNS() / 1e9);
         const float ty = sinf(turn / 2), tw = cosf(turn / 2);  // reference (yaw only) * yaw(turn)
         const XrQuaternionf q = {0, reference_pose[1] * tw + reference_pose[3] * ty, 0, reference_pose[3] * tw - reference_pose[1] * ty};
         const float c = 1 - 2 * q.y * q.y, s = 2 * q.y * q.w;  // (the eyes' axis turns with the head)

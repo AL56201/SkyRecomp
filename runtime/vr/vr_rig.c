@@ -488,6 +488,11 @@ static pthread_mutex_t g_cull_lock = PTHREAD_MUTEX_INITIALIZER;
 static float g_cull_view[12], g_cull_tan[4];  // (under g_cull_lock)
 static uint64_t g_cull_view_frame;
 
+// Whether the cull view stands on the real game camera (from game memory, matched by the draws: gameplay). On the
+// title / file select another camera draws and the rig's camera is a substitute (a pass's plain camera block): the
+// headset frustum built on it culled objects the eyes were looking at (islands flickering, vanishing).
+bool vr_rig_cull_trusted(void) { return g_memory_seen_now || g_memory_seen_before; }
+
 bool vr_rig_cull_view(float view[12], float tangents[4]) {
     extern uint64_t renderer_present_count(void);
     pthread_mutex_lock(&g_cull_lock);

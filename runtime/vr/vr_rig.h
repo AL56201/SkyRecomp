@@ -48,6 +48,7 @@ bool vr_rig_cull_fov(float *fovy_radians, float *aspect);
 // ---- game thread: eye 0's view in the game world (row-major 3x4) and both eyes' field as tangents (left, right,
 // down, up) while VR renders (runtime/hle/vr_cull.c); false outside VR.
 bool vr_rig_cull_view(float view[12], float tangents[4]);
+bool vr_rig_cull_trusted(void);  // the cull view is built on the real game camera (false: title, file select)
 // 1st person: geometry nearer than this many game units is clipped (VR Options > Near Clip; default 15).
 void vr_rig_set_near_clip(float units);
 
