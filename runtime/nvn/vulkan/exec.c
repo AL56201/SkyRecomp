@@ -3984,16 +3984,21 @@ static bool hud_route(Prog *pr) {
     for (int i = 0; i < pr->fi->ntex && i < 64 && !reads_scene; i++) {
         NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
         const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
-        reads_scene = b && b->scene_frame == fr1 && !recently_presented(t);
+        // Async replay may leave the producer and consumer one present generation apart.  Treat either adjacent
+        // generation as the live scene; otherwise a cutscene composite can be mistaken for 2D UI and become a
+        // floating rectangular card (notably the flare in the void dream sequence).
+        reads_scene = b && b->scene_frame && b->scene_frame <= fr1 + 1 && b->scene_frame + 1 >= fr1 &&
+                      !recently_presented(t);
     }
     if (reads_scene) {
-        // Full-screen scene composites (the title's haze, the additive glow) are unit quads (vertex positions 0..1)
-        // and stay in the eyes. A panel's frosted backdrop reads the scene too, but sits in the 2D layout (canvas
-        // positions, e.g. the file's info box): it belongs on the panel.
+        // A live-scene composite is part of the stereo view even when its quad is not the canonical 0..1 shape.
+        // The old unit-quad requirement routed cutscene bloom/flares to the HUD, exposing their rectangular bounds.
+        // Only an intentionally active world-menu panel may use a scene sample as its frosted HUD backdrop.
+        if (!vr_world_menu_active()) return true;
         const float *vb = st.vbuf[0].addr && st.vbuf[0].size >= 48 ? (const float *)(uintptr_t)st.vbuf[0].addr : NULL;
         bool unit = vb && g_hud_rec && g_hud_rec->x[2] <= 6;
         for (int i = 0; unit && i < 12; i++) unit = isfinite(vb[i]) && vb[i] >= -0.01f && vb[i] <= 1.01f;
-        if (unit) return true;  // (drawn normally, both eyes)
+        if (unit) return true;  // full-screen menu composite: drawn normally in both eyes
     }
     if (vk_vr_eye()) return false;
     // Async replay can process the first draws of a new presented frame while renderer_present_count still names the
