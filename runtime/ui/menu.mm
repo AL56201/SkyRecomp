@@ -71,7 +71,8 @@ static void push(const QEvent &e) {
 bool menu_is_open(void) { return g_open.load(); }
 static std::atomic<bool> g_vr_close{false};
 extern "C" void menu_vr_close(void) { g_vr_close.store(true); }
-extern "C" bool vr_menu_ray(float *u, float *v, bool *click);  // (vr_controls.c: the settings menu on the VR HUD panel)
+extern "C" bool vr_menu_ray(float *u, float *v, bool *click);
+extern "C" float vr_menu_scroll(void);  // (vr_controls.c: the right stick's y, up +)  // (vr_controls.c: the settings menu on the VR HUD panel)
 static void set_open(bool open);
 extern "C" void menu_test_open(void) {
     set_open(true);
@@ -1064,6 +1065,11 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         if (click != was_click) io.AddMouseButtonEvent(0, click);
         was_click = click, was_on = on;
         io.MouseDrawCursor = on;  // (no system cursor in the headset: ImGui draws one where the ray points)
+        {   // the right stick scrolls what the ray points at: up to 12 lines a second, past a 0.2 deadzone
+            const float y = vr_menu_scroll();
+            const float a = fabsf(y) > 0.2f ? (fabsf(y) - 0.2f) / 0.8f : 0.0f;
+            if (on && a > 0) io.AddMouseWheelEvent(0, (y > 0 ? 1.0f : -1.0f) * a * a * 12.0f * io.DeltaTime);
+        }
     } else {
         io.MouseDrawCursor = false;
     }

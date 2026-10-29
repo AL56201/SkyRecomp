@@ -122,6 +122,8 @@ static bool panel_uv(const float aim[16], const float hud[16], float *u, float *
 // (menu.mm, the settings menu on the HUD panel) Where the right controller's ray meets the panel, (u, v) in 0..1 from
 // the top left; false when it misses the panel. click: the right trigger is held.
 _Atomic bool g_vr_right_trigger;  // (vr_input.c)
+_Atomic float g_vr_right_stick_y;  // (vr_input.c: up +)
+float vr_menu_scroll(void) { return atomic_load(&g_vr_right_stick_y); }  // (menu.mm: the stick scrolls the menu)
 bool vr_menu_ray(float *u, float *v, bool *click) {
     pthread_mutex_lock(&g_ptr_lock);
     const bool ok = g_ptr_aim_ok && g_ptr_hud_ok;
@@ -199,6 +201,7 @@ bool vr_joycon_sensor(int device, VrJoyConSensor *sensor) {
 }
 
 #else
+float vr_menu_scroll(void) { return 0; }
 bool vr_menu_ray(float *u, float *v, bool *click) { (void)u; (void)v; if (click) *click = false; return false; }
 bool vr_menu_pointer_active(void) { return false; }
 void vr_pointer_direction(float u, float v, float out[9]) {

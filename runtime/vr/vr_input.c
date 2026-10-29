@@ -234,6 +234,9 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
         s.zr = get_float(ACT_ZR);
         {   extern _Atomic bool g_vr_right_trigger;  // (vr_controls.c: the settings menu's click)
             atomic_store(&g_vr_right_trigger, s.zr > 0.5f); }
+        {   extern _Atomic float g_vr_right_stick_y;  // (vr_controls.c: the settings menu's scrolling)
+            const XrVector2f rs = get_vec2(ACT_RIGHT_STICK);
+            atomic_store(&g_vr_right_stick_y, rs.y); }
         s.l = get_float(ACT_L);
         s.r = get_float(ACT_R);
         const XrVector2f ls = get_vec2(ACT_LEFT_STICK), rs = get_vec2(ACT_RIGHT_STICK);
