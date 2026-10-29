@@ -676,6 +676,9 @@ static void tab_vr_options(void) {
                           "Bypasses optional SMAA, upscale and sharpening passes. OpenXR output remains native-sized. "
                           "Useful for measuring post-processing GPU cost. "
                           "Changes apply live.");
+    changed |= opt_toggle("Depth of Field", &g_settings.vr_dof, false,
+                          "The game's background blur in cutscenes. In the headset it looks blocky around characters, "
+                          "and your eyes already focus by themselves, so it is off by default. Changes apply live.");
     changed |= opt_toggle("World Behind Menus", &g_settings.vr_world_in_menus, true,
                           "Keeps the 3D world around you while the map and other full-screen menus are open; the menu "
                           "floats in front of it. Off: the classic black background. Applies from the next menu opened.");

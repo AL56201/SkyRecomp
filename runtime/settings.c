@@ -42,6 +42,7 @@ Settings g_settings = {
     .vr_foveation_outer = 0.80f,
     .async_replay = true,
     .vr_world_in_menus = true,
+    .vr_dof = false,
     .vr_near_clip = 15.0f,
     .reshade = true,
     .frame_rate = 60,
@@ -228,6 +229,7 @@ void settings_load(void) {
         }
         else if (!strcmp(key, "vr_fast_post")) g_settings.vr_fast_post = atoi(val) != 0;
         else if (!strcmp(key, "vr_world_in_menus")) g_settings.vr_world_in_menus = atoi(val) != 0;
+        else if (!strcmp(key, "vr_dof")) g_settings.vr_dof = atoi(val) != 0;
         else if (!strcmp(key, "async_replay")) g_settings.async_replay = atoi(val) != 0;
         else if (!strcmp(key, "vr_near_clip")) {
             const float v = (float)atof(val);
@@ -312,8 +314,8 @@ void settings_save(void) {
     fprintf(f, "draw_distance = %.2f\n", g_settings.draw_distance);
     fprintf(f, "async_replay = %d\n", g_settings.async_replay);
     fprintf(f, "vr_near_clip = %.1f\n", g_settings.vr_near_clip);
-    fprintf(f, "vr_mirror_hz = %d\nvr_foveation = %d\nvr_world_in_menus = %d\n", g_settings.vr_mirror_hz,
-            g_settings.vr_foveation, g_settings.vr_world_in_menus);
+    fprintf(f, "vr_mirror_hz = %d\nvr_foveation = %d\nvr_world_in_menus = %d\nvr_dof = %d\n", g_settings.vr_mirror_hz,
+            g_settings.vr_foveation, g_settings.vr_world_in_menus, g_settings.vr_dof);
     fprintf(f, "vr_foveation_inner = %.2f\nvr_foveation_outer = %.2f\nvr_fast_post = %d\n",
             g_settings.vr_foveation_inner, g_settings.vr_foveation_outer, g_settings.vr_fast_post);
     fprintf(f, "volume = %.2f\n", g_settings.volume);

@@ -4102,6 +4102,10 @@ static void draw_(CmdRec *r, bool indexed) {
         // Skyward Sword's outdoor water surface composites two full-resolution scene-colour textures, projected with
         // its own matrix: cbuf_info re-projects that per eye (screen-space texture projections). LARECOMP_VR_NO_WATER_SURFACE=1 omits
         // the surface in VR instead (the earlier workaround: transparent water without the surface layer).
+        // Depth of field (cutscenes): the game's blur of what is out of focus, from a small low-resolution copy of the
+        // scene - at the headset's resolution its edges turn blocky around characters, and in VR the eyes focus by
+        // themselves. Skipping this pass (the first of its chain) leaves the scene sharp. VR Options: Depth of Field.
+        if (last_hash == 0x3dffee7e4b168544ull && vr_stereo_active() && !g_settings.vr_dof) { stat_skipped++; return; }
         if (last_hash == WATER_SURFACE_FS && vr_stereo_active() && getenv("LARECOMP_VR_NO_WATER_SURFACE")) {
             stat_skipped++;
             return;
