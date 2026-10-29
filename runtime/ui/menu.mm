@@ -850,10 +850,112 @@ RT_ON_RESET(menu_reset) {
     pthread_mutex_unlock(&q_lock);
 }
 
+// ---- VR keyboard ---------------------------------------------------------------------------------------------
+// While a text field takes input on the VR panel (the name entry, a menu field), a QWERTY keyboard across the
+// panel's lower part (upper part when the field is down there), clicked with the controller's pointer. Drawn on the
+// foreground list and hit-tested here, never as ImGui widgets: a click on an item would take the focus from the
+// field being typed into. (After ShipWright VR's panel keyboard.)
+namespace {
+struct VrKey { int row; const char *label, *shift_label; char ch, shift_ch; ImGuiKey key; float width; };
+const ImGuiKey VK_SHIFT = ImGuiKey_LeftShift;  // (toggles a one-shot shift; never sent)
+const VrKey vr_keys[] = {
+    {0, "1", "!", '1', '!'}, {0, "2", "@", '2', '@'}, {0, "3", "#", '3', '#'}, {0, "4", "$", '4', '$'},
+    {0, "5", "%", '5', '%'}, {0, "6", "^", '6', '^'}, {0, "7", "&", '7', '&'}, {0, "8", "*", '8', '*'},
+    {0, "9", "(", '9', '('}, {0, "0", ")", '0', ')'}, {0, "-", "_", '-', '_'}, {0, "Back", "Back", 0, 0, ImGuiKey_Backspace, 2.0f},
+    {1, "q", "Q", 'q', 'Q'}, {1, "w", "W", 'w', 'W'}, {1, "e", "E", 'e', 'E'}, {1, "r", "R", 'r', 'R'},
+    {1, "t", "T", 't', 'T'}, {1, "y", "Y", 'y', 'Y'}, {1, "u", "U", 'u', 'U'}, {1, "i", "I", 'i', 'I'},
+    {1, "o", "O", 'o', 'O'}, {1, "p", "P", 'p', 'P'},
+    {2, "a", "A", 'a', 'A'}, {2, "s", "S", 's', 'S'}, {2, "d", "D", 'd', 'D'}, {2, "f", "F", 'f', 'F'},
+    {2, "g", "G", 'g', 'G'}, {2, "h", "H", 'h', 'H'}, {2, "j", "J", 'j', 'J'}, {2, "k", "K", 'k', 'K'},
+    {2, "l", "L", 'l', 'L'}, {2, "'", "\"", '\'', '"'}, {2, "Done", "Done", 0, 0, ImGuiKey_Enter, 2.0f},
+    {3, "Shift", "SHIFT", 0, 0, VK_SHIFT, 2.0f}, {3, "z", "Z", 'z', 'Z'}, {3, "x", "X", 'x', 'X'},
+    {3, "c", "C", 'c', 'C'}, {3, "v", "V", 'v', 'V'}, {3, "b", "B", 'b', 'B'}, {3, "n", "N", 'n', 'N'},
+    {3, "m", "M", 'm', 'M'}, {3, ",", "<", ',', '<'}, {3, ".", ">", '.', '>'}, {3, "?", "!", '?', '!'},
+    {4, "<", "<", 0, 0, ImGuiKey_LeftArrow, 1.5f}, {4, "Space", "Space", ' ', ' ', ImGuiKey_None, 7.0f},
+    {4, ">", ">", 0, 0, ImGuiKey_RightArrow, 1.5f},
+};
+const int VK_COUNT = (int)(sizeof vr_keys / sizeof vr_keys[0]), VK_ROWS = 5;
+const float VK_ROW_UNITS = 13.0f;  // (the widest row, in key widths)
+float vk_width(const VrKey &k) { return k.width > 0 ? k.width : 1.0f; }
+struct VkRect { ImVec2 mn, mx; };
+VkRect vk_rects[64];
+ImVec2 vk_min, vk_max;
+bool vk_shown, vk_shift, vk_was_down;
+int vk_held = -1;
+double vk_repeat_at;
+ImGuiKey vk_key_up = ImGuiKey_None;
+ImVec2 vk_pointer(-FLT_MAX, -FLT_MAX);
+}  // namespace
+
+// (menu_render, before NewFrame) The pointer at (x, y) on the panel, trigger down: true when it is on the keyboard
+// (the key presses go to ImGui as typing; the pointer itself doesn't).
+static bool vr_keyboard_input(ImGuiIO &io, float x, float y, bool down) {
+    if (vk_key_up != ImGuiKey_None) { io.AddKeyEvent(vk_key_up, false); vk_key_up = ImGuiKey_None; }  // (a frame after)
+    vk_pointer = ImVec2(x, y);
+    const bool edge = down && !vk_was_down;
+    vk_was_down = down;
+    if (!vk_shown || x < vk_min.x || x > vk_max.x || y < vk_min.y || y > vk_max.y) { vk_held = -1; return false; }
+    int hit = -1;
+    for (int i = 0; i < VK_COUNT; i++)
+        if (x >= vk_rects[i].mn.x && x <= vk_rects[i].mx.x && y >= vk_rects[i].mn.y && y <= vk_rects[i].mx.y) hit = i;
+    const double now = SDL_GetTicksNS() / 1e9;
+    bool press = false;
+    if (edge && hit >= 0) press = true, vk_held = hit, vk_repeat_at = now + 0.45;
+    else if (down && hit >= 0 && hit == vk_held && vr_keys[hit].key == ImGuiKey_Backspace && now >= vk_repeat_at)
+        press = true, vk_repeat_at = now + 0.06;  // (Back repeats while held)
+    if (!down) vk_held = -1;
+    if (press) {
+        const VrKey &k = vr_keys[hit];
+        if (k.key == VK_SHIFT) vk_shift = !vk_shift;
+        else if (k.key == ImGuiKey_None) io.AddInputCharacter((unsigned char)(vk_shift ? k.shift_ch : k.ch)), vk_shift = false;
+        else if (k.key == ImGuiKey_Enter && g_kbd.load() == 1) g_kbd = 2;  // (the name entry: confirmed)
+        else io.AddKeyEvent(k.key, true), vk_key_up = k.key;
+    }
+    return true;
+}
+
+// (menu_render, after the windows) The keyboard, while a text field takes input on the VR panel.
+static void vr_keyboard_draw(ImGuiIO &io) {
+    vk_shown = false;
+    if (!vr_running() || !capturing() || !io.WantTextInput) { vk_shift = false; return; }
+    const float W = io.DisplaySize.x, H = io.DisplaySize.y, pad = W * 0.008f;
+    const float kb_w = W * 0.9f, unit = kb_w / VK_ROW_UNITS, key_h = unit * 0.78f, gap = unit * 0.08f;
+    const float kb_h = VK_ROWS * key_h + 2 * pad;
+    const ImGuiContext &g = *ImGui::GetCurrentContext();  // (below the field's caret, or above it when low)
+    const float caret_y = g.PlatformImeData.WantVisible ? g.PlatformImeData.InputPos.y : 0.0f;
+    const float top = caret_y > H * 0.55f ? pad : H - kb_h + pad, left = (W - kb_w) * 0.5f;
+    vk_min = ImVec2(left - pad, top - pad);
+    vk_max = ImVec2(left + kb_w + pad, top + kb_h - pad);
+    ImDrawList *dl = ImGui::GetForegroundDrawList();
+    dl->AddRectFilled(vk_min, vk_max, IM_COL32(18, 20, 26, 240), unit * 0.15f);
+    ImFont *font = ImGui::GetFont();
+    const float font_size = key_h * 0.42f;
+    float row_units[VK_ROWS] = {}, x[VK_ROWS];
+    for (int i = 0; i < VK_COUNT; i++) row_units[vr_keys[i].row] += vk_width(vr_keys[i]);
+    for (int r = 0; r < VK_ROWS; r++) x[r] = left + (kb_w - row_units[r] * unit) * 0.5f;
+    for (int i = 0; i < VK_COUNT; i++) {
+        const VrKey &k = vr_keys[i];
+        const float kw = vk_width(k) * unit;
+        const ImVec2 mn(x[k.row] + gap * 0.5f, top + k.row * key_h + gap * 0.5f), mx(x[k.row] + kw - gap * 0.5f, top + (k.row + 1) * key_h - gap * 0.5f);
+        x[k.row] += kw;
+        vk_rects[i] = {mn, mx};
+        const bool hover = vk_pointer.x >= mn.x && vk_pointer.x <= mx.x && vk_pointer.y >= mn.y && vk_pointer.y <= mx.y;
+        const ImU32 fill = vk_held == i || (k.key == VK_SHIFT && vk_shift) ? IM_COL32(70, 130, 200, 255)
+                           : hover ? IM_COL32(78, 84, 98, 255) : IM_COL32(48, 52, 62, 255);
+        dl->AddRectFilled(mn, mx, fill, unit * 0.1f);
+        const char *label = vk_shift ? k.shift_label : k.label;
+        const ImVec2 ts = font->CalcTextSizeA(font_size, FLT_MAX, 0, label);
+        dl->AddText(font, font_size, ImVec2((mn.x + mx.x - ts.x) * 0.5f, (mn.y + mx.y - ts.y) * 0.5f), IM_COL32(235, 238, 245, 255), label);
+    }
+    vk_shown = true;
+}
+
 static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 120));
     float w = fminf(io.DisplaySize.x * 0.9f, 1100 * scale);
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    // (VR: in the panel's upper part - the VR keyboard takes the lower part)
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * (vr_running() ? 0.04f : 0.5f)), ImGuiCond_Always,
+                            ImVec2(0.5f, vr_running() ? 0.0f : 0.5f));
     ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
     ImGui::Begin("##kbd", NULL, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
                                     ImGuiWindowFlags_AlwaysAutoResize);
@@ -861,11 +963,12 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
     ImGui::TextColored(ImVec4(0.93f, 0.76f, 0.33f, 1), "Enter your name");
     ImGui::PopFont();
     static bool was_open, was_pad;
-    // (VR: always the on-screen keyboard - clicked with the controller's pointer; no keyboard in the headset)
-    bool pad = g_last_pad.load() || vr_running(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
+    // (VR: the text field, typed with the VR keyboard - vr_keyboard_draw)
+    bool pad = g_last_pad.load() && !vr_running(), appearing = !was_open || pad != was_pad;  // (switching device: focus the new one)
     was_open = true, was_pad = pad;
     if (!pad) {  // keyboard: type straight into the field
-        if (appearing) ImGui::SetKeyboardFocusHere();
+        // (VR: the field keeps the focus - the VR keyboard types into it, and a stray click mustn't hide it)
+        if (appearing || (vr_running() && !ImGui::IsAnyItemActive())) ImGui::SetKeyboardFocusHere();
         ImGui::SetNextItemWidth(-1);
         ImGui::PushFont(g_font_big);
         ImGui::InputText("##name", g_kbd_text, (size_t)(g_kbd_max * 4 + 1 < (int)sizeof g_kbd_text ? g_kbd_max * 4 + 1 : sizeof g_kbd_text),
@@ -873,7 +976,8 @@ static void keyboard_draw(ImGuiIO &io, float scale) {
                          [](ImGuiInputTextCallbackData *d) -> int { return d->EventChar < 0x20 ? 1 : 0; });
         ImGui::PopFont();
         if ((int)strlen(g_kbd_text) > g_kbd_max) g_kbd_text[g_kbd_max] = 0;
-        ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", (int)strlen(g_kbd_text), g_kbd_max);
+        if (vr_running()) ImGui::TextDisabled("Done  confirm      (%d / %d)", (int)strlen(g_kbd_text), g_kbd_max);
+        else ImGui::TextDisabled("Enter  confirm      Esc  cancel      (%d / %d)", (int)strlen(g_kbd_text), g_kbd_max);
     } else {  // controller: on-screen keyboard (osk.mm, shared with our menus' text fields)
         int r = osk_keys(g_kbd_text, sizeof g_kbd_text, g_kbd_max, appearing, scale, g_font_big);
         if (r) g_kbd = r > 0 ? 2 : 3;  // (Start / + confirms in menu_handle_event too)
@@ -1065,10 +1169,17 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         bool click = false;
         static bool was_click, was_on;
         const bool on = vr_menu_ray(&u, &v, &click);
-        if (on) io.AddMousePosEvent(u * (float)tw, v * (float)th);
-        else if (was_on) io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
-        if (click != was_click) io.AddMouseButtonEvent(0, click);
-        was_click = click, was_on = on;
+        if (on && vr_keyboard_input(io, u * (float)tw, v * (float)th, click)) {
+            // (on the VR keyboard: ImGui doesn't see the pointer - a click would take focus from the text field)
+            io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+            if (was_click) io.AddMouseButtonEvent(0, false);
+            was_click = false, was_on = false;
+        } else {
+            if (on) io.AddMousePosEvent(u * (float)tw, v * (float)th);
+            else if (was_on) io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+            if (click != was_click) io.AddMouseButtonEvent(0, click);
+            was_click = click, was_on = on;
+        }
         io.MouseDrawCursor = on;  // (no system cursor in the headset: ImGui draws one where the ray points)
         {   // the right stick scrolls the page wherever the ray points (an open dropdown: that list), up to 12 lines a
             // second past a 0.2 deadzone
@@ -1193,6 +1304,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     }
 
     if (kbd) keyboard_draw(io, scale);
+    vr_keyboard_draw(io);
     ImGui::Render();
     g_text_busy = open && ui_text_busy();
 #ifdef __APPLE__
