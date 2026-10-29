@@ -8,6 +8,7 @@
 //   opt_end();
 #pragma once
 
+void opt_vr_scroll(void);
 void opt_begin(const char *id, float scale);
 void opt_section(const char *title);
 bool opt_toggle(const char *label, bool *v, bool def, const char *desc);

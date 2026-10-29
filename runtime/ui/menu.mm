@@ -47,6 +47,7 @@ void controls_bindings_draw(float scale);  // controls_ui.mm
 
 // ------------------------------------------------------------------ state shared with the main thread
 static std::atomic<bool> g_open{false};
+float g_vr_scroll_lines;  // (VR: the right stick's scrolling this frame, lines, + up: option_rows.mm opt_vr_scroll)
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
 static std::atomic<bool> g_want_fullscreen_apply{false};
 
@@ -985,6 +986,7 @@ static void tabs_body(float scale, bool in_game, void (*prelaunch)(float)) {
                 ImGui::Spacing();
                 ImGui::BeginChild("##page", ImVec2(0, 0), ImGuiChildFlags_None,  // (the rest of the window: no hint line)
                                   ImGuiWindowFlags_NavFlattened);
+                opt_vr_scroll();  // (VR: the right stick)
                 // Down from the tab bar, pages that aren't option rows (Prelaunch, Controls): their first control
                 // (option-row pages: opt_focus_first)
                 if (down_from_tab && (t.id == -1 || t.id == 8 || t.id == 10)) {
@@ -1065,13 +1067,17 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         if (click != was_click) io.AddMouseButtonEvent(0, click);
         was_click = click, was_on = on;
         io.MouseDrawCursor = on;  // (no system cursor in the headset: ImGui draws one where the ray points)
-        {   // the right stick scrolls what the ray points at: up to 12 lines a second, past a 0.2 deadzone
+        {   // the right stick scrolls the page wherever the ray points (an open dropdown: that list), up to 12 lines a
+            // second past a 0.2 deadzone
             const float y = vr_menu_scroll();
             const float a = fabsf(y) > 0.2f ? (fabsf(y) - 0.2f) / 0.8f : 0.0f;
-            if (on && a > 0) io.AddMouseWheelEvent(0, (y > 0 ? 1.0f : -1.0f) * a * a * 12.0f * io.DeltaTime);
+            const float lines = (y > 0 ? 1.0f : -1.0f) * a * a * 12.0f * io.DeltaTime;
+            if (a > 0 && ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId)) io.AddMouseWheelEvent(0, lines);
+            else g_vr_scroll_lines = a > 0 ? lines : 0.0f;
         }
     } else {
         io.MouseDrawCursor = false;
+        g_vr_scroll_lines = 0;
     }
     // fonts are built at 34/56 px for a ~1080 px tall output; scale to the window
     float scale = (float)(th / 1080.0);

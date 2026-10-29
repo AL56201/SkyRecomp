@@ -33,6 +33,14 @@ static void draw_diamond(ImDrawList *dl, ImVec2 c, float rx, float ry, ImU32 col
     dl->AddConvexPolyFilled(pts, 4, col);
 }
 
+// VR: the right stick's scrolling (menu.mm g_vr_scroll_lines) for the region just begun - wherever the pointer is.
+// A region whose content fits doesn't move (SetScrollY clamps), so the page and its rows can both take it.
+void opt_vr_scroll(void) {
+    extern float g_vr_scroll_lines;
+    if (g_vr_scroll_lines == 0) return;
+    ImGui::SetScrollY(ImGui::GetScrollY() - g_vr_scroll_lines * ImGui::GetTextLineHeightWithSpacing());
+}
+
 void opt_begin(const char *id, float scale) {
     g_scale = scale;
     g_take_first = g_focus_req;
@@ -44,6 +52,7 @@ void opt_begin(const char *id, float scale) {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     ImGui::PushID(id);
     ImGui::BeginChild("##rows", ImVec2(avail.x * 0.50f, avail.y), ImGuiChildFlags_None, ImGuiWindowFlags_NavFlattened);
+    opt_vr_scroll();
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ImGui::GetStyle().ItemSpacing.x, 6 * scale));  // (rows close)
     g_desc_first.clear();
     g_title_first.clear();
