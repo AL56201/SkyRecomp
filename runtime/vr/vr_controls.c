@@ -124,6 +124,31 @@ static bool panel_uv(const float aim[16], const float hud[16], float *u, float *
 _Atomic bool g_vr_right_trigger;  // (vr_input.c)
 _Atomic float g_vr_right_stick_y;  // (vr_input.c: up +)
 float vr_menu_scroll(void) { return atomic_load(&g_vr_right_stick_y); }  // (menu.mm: the stick scrolls the menu)
+// (vr.c, the menu's beam) The pointing controller's ray: origin, direction (unit), and its length to the panel
+// (1.5 m when it misses).
+bool vr_menu_beam(float o[3], float d[3], float *len);
+bool vr_menu_beam(float o[3], float d[3], float *len) {
+    pthread_mutex_lock(&g_ptr_lock);
+    const bool ok = g_ptr_aim_ok && g_ptr_hud_ok;
+    float aim[16], hud[16];
+    memcpy(aim, g_ptr_aim, sizeof aim);
+    memcpy(hud, g_ptr_hud, sizeof hud);
+    pthread_mutex_unlock(&g_ptr_lock);
+    if (!ok) return false;
+    o[0] = aim[3], o[1] = aim[7], o[2] = aim[11];
+    d[0] = -aim[2], d[1] = -aim[6], d[2] = -aim[10];
+    *len = 1.5f;
+    float u, v;
+    bool inside = false;
+    if (panel_uv_ex(aim, hud, &u, &v, &inside) && inside) {  // (the hit: back to metres along the ray)
+        const float c[3] = {hud[3], hud[7], hud[11]}, x[3] = {hud[0], hud[4], hud[8]}, y[3] = {hud[1], hud[5], hud[9]};
+        const float n[3] = {x[1] * y[2] - x[2] * y[1], x[2] * y[0] - x[0] * y[2], x[0] * y[1] - x[1] * y[0]};
+        const float dn = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+        if (fabsf(dn) > 1e-9f) *len = ((c[0] - o[0]) * n[0] + (c[1] - o[1]) * n[1] + (c[2] - o[2]) * n[2]) / dn;
+    }
+    return *len > 0.01f;
+}
+
 bool vr_menu_ray(float *u, float *v, bool *click) {
     pthread_mutex_lock(&g_ptr_lock);
     const bool ok = g_ptr_aim_ok && g_ptr_hud_ok;
@@ -201,6 +226,7 @@ bool vr_joycon_sensor(int device, VrJoyConSensor *sensor) {
 }
 
 #else
+bool vr_menu_beam(float o[3], float d[3], float *len) { (void)o; (void)d; (void)len; return false; }
 float vr_menu_scroll(void) { return 0; }
 bool vr_menu_ray(float *u, float *v, bool *click) { (void)u; (void)v; if (click) *click = false; return false; }
 bool vr_menu_pointer_active(void) { return false; }

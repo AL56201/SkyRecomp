@@ -72,6 +72,12 @@ void sanitize_config(void) {
     g_vr_hud_config.wrist_hud_forward = std::clamp(g_vr_hud_config.wrist_hud_forward, -0.20f, 0.25f);
     g_vr_hud_config.wrist_hud_tilt = std::clamp(g_vr_hud_config.wrist_hud_tilt, -90.0f, 90.0f);
     g_vr_hud_config.wrist_hud_background = std::clamp(g_vr_hud_config.wrist_hud_background, 0.0f, 0.85f);
+    if (!std::isfinite(g_vr_hud_config.menu_distance)) g_vr_hud_config.menu_distance = kDefaults.menu_distance;
+    if (!std::isfinite(g_vr_hud_config.menu_width)) g_vr_hud_config.menu_width = kDefaults.menu_width;
+    if (!std::isfinite(g_vr_hud_config.menu_height)) g_vr_hud_config.menu_height = kDefaults.menu_height;
+    g_vr_hud_config.menu_distance = std::clamp(g_vr_hud_config.menu_distance, 0.4f, 3.0f);
+    g_vr_hud_config.menu_width = std::clamp(g_vr_hud_config.menu_width, 0.4f, 3.0f);
+    g_vr_hud_config.menu_height = std::clamp(g_vr_hud_config.menu_height, -1.0f, 1.0f);
 }
 
 void composed_head(float out[16], const float head_pose[16], const float camera_pose[16]) {

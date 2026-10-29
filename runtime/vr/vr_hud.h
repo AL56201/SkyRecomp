@@ -78,6 +78,22 @@ typedef struct VRHUDConfig {
         = 0.46f
 #endif
         ;                         // dark backing opacity (0..0.85)
+    // The settings menu's own panel (vr.c): placed level in front of the gaze when it opens, then still.
+    float menu_distance
+#ifdef __cplusplus
+        = 1.0f
+#endif
+        ;                         // metres in front of the head (0.4..3)
+    float menu_width
+#ifdef __cplusplus
+        = 1.2f
+#endif
+        ;                         // metres (0.4..3); 16:10
+    float menu_height
+#ifdef __cplusplus
+        = -0.1f
+#endif
+        ;                         // metres above (+) / below (-) eye level (-1..1)
 } VRHUDConfig;
 
 extern VRHUDConfig g_vr_hud_config;

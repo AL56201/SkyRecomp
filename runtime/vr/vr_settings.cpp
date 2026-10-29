@@ -85,7 +85,10 @@ bool any_section(const std::string &line) {
 
 std::vector<std::string> vr_lines() {
     std::ostringstream resolution, resolution_min, world, height, distance, hud_distance, hud_scale, hud_offset,
-        wrist_size, wrist_side, wrist_up, wrist_forward, wrist_tilt, wrist_background;
+        wrist_size, wrist_side, wrist_up, wrist_forward, wrist_tilt, wrist_background, menu_distance, menu_width, menu_height;
+    menu_distance << std::fixed << std::setprecision(2) << g_vr_hud_config.menu_distance;
+    menu_width << std::fixed << std::setprecision(2) << g_vr_hud_config.menu_width;
+    menu_height << std::fixed << std::setprecision(2) << g_vr_hud_config.menu_height;
     hud_distance << std::fixed << std::setprecision(2) << g_vr_hud_config.hud_distance;
     hud_scale << std::fixed << std::setprecision(2) << g_vr_hud_config.hud_scale;
     hud_offset << std::fixed << std::setprecision(2) << g_vr_hud_config.hud_vertical_offset;
@@ -117,7 +120,9 @@ std::vector<std::string> vr_lines() {
             std::string("wrist_hud_swap_hands = ") + (g_vr_hud_config.wrist_hud_swap_hands ? "true" : "false"),
             "wrist_hud_size = " + wrist_size.str(), "wrist_hud_side = " + wrist_side.str(),
             "wrist_hud_up = " + wrist_up.str(), "wrist_hud_forward = " + wrist_forward.str(),
-            "wrist_hud_tilt = " + wrist_tilt.str(), "wrist_hud_background = " + wrist_background.str()};
+            "wrist_hud_tilt = " + wrist_tilt.str(), "wrist_hud_background = " + wrist_background.str(),
+            "menu_distance = " + menu_distance.str(), "menu_width = " + menu_width.str(),
+            "menu_height = " + menu_height.str()};
 }
 } // namespace
 
@@ -166,6 +171,9 @@ extern "C" void LoadVRConfig(const char *filepath) {
         else if (key == "wrist_hud_forward") parse_float(value, g_vr_hud_config.wrist_hud_forward);
         else if (key == "wrist_hud_tilt") parse_float(value, g_vr_hud_config.wrist_hud_tilt);
         else if (key == "wrist_hud_background") parse_float(value, g_vr_hud_config.wrist_hud_background);
+        else if (key == "menu_distance") parse_float(value, g_vr_hud_config.menu_distance);
+        else if (key == "menu_width") parse_float(value, g_vr_hud_config.menu_width);
+        else if (key == "menu_height") parse_float(value, g_vr_hud_config.menu_height);
     }
     validate(g_vr_config);
     ValidateVRHUDConfig();

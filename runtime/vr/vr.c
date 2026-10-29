@@ -187,6 +187,8 @@ bool vr_eye_fov(int eye, float fov[4]) {  // this frame's eye field of view: tan
 
 
 static void hud_destroy(void);
+static void menu_destroy(void);
+static bool mirror_quad_mvp(const float m[16], float hx, float hy, float out[16]);
 static void frozen_destroy(void);
 extern bool vk_hud_layer_enabled(void);  // (exec.c: SKYRECOMP_VR_HUD_LAYER)
 
@@ -499,6 +501,7 @@ void vr_shutdown(void) {
     if (swapchain && p_xrDestroySwapchain) p_xrDestroySwapchain(swapchain);
     swapchain = XR_NULL_HANDLE;
     hud_destroy();
+    menu_destroy();
     frozen_destroy();
     XrSpace *spaces[] = {&view_space, &local_space};
     for (size_t i = 0; i < SDL_arraysize(spaces); i++) {
@@ -1227,13 +1230,277 @@ bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint3
     return true;
 }
 
+// ================================================================== the settings menu's panel and its beam
+// (After ShipWright VR.) The settings menu / name entry (ui/menu.mm) in its own 1600 x 1000 quad layer: placed level
+// in front of the gaze when it opens (g_vr_hud_config.menu_*), then still in the world. The controller's ray aims at
+// it (vr_controls.c); a beam quad runs from the pointing controller to where it hits, fading out toward the far end.
+enum { MENU_W = 1600, MENU_H = 1000, BEAM_W = 4, BEAM_H = 128 };
+static XrSwapchain menu_swapchain, beam_swapchain;
+static XrSwapchainImageVulkanKHR *menu_images, beam_image;
+static uint32_t menu_count;
+static VkImage menu_staging;
+static VkDeviceMemory menu_staging_memory;
+static VkBuffer beam_buffer;
+static VkDeviceMemory beam_buffer_memory;
+static bool menu_failed, beam_failed, beam_ready;
+static bool menu_acquired, menu_copied;
+static uint32_t menu_image_index;
+static float g_menu_world[16];  // world-from-panel: columns right, up, back (unit), centre
+static bool g_menu_placed;
+
+static uint32_t memory_type(uint32_t bits, VkMemoryPropertyFlags want) {
+    VkPhysicalDeviceMemoryProperties mp;
+    vkGetPhysicalDeviceMemoryProperties(vk_physical_device, &mp);
+    for (uint32_t i = 0; i < mp.memoryTypeCount; i++)
+        if ((bits & (1u << i)) && (mp.memoryTypes[i].propertyFlags & want) == want) return i;
+    return UINT32_MAX;
+}
+
+static void menu_destroy(void) {
+    if (vk_device) {
+        if (menu_staging) vkDestroyImage(vk_device, menu_staging, NULL);
+        if (menu_staging_memory) vkFreeMemory(vk_device, menu_staging_memory, NULL);
+        if (beam_buffer) vkDestroyBuffer(vk_device, beam_buffer, NULL);
+        if (beam_buffer_memory) vkFreeMemory(vk_device, beam_buffer_memory, NULL);
+    }
+    menu_staging = VK_NULL_HANDLE, menu_staging_memory = VK_NULL_HANDLE;
+    beam_buffer = VK_NULL_HANDLE, beam_buffer_memory = VK_NULL_HANDLE;
+    SDL_free(menu_images);
+    menu_images = NULL;
+    menu_count = 0;
+    if (menu_swapchain && p_xrDestroySwapchain) p_xrDestroySwapchain(menu_swapchain);
+    if (beam_swapchain && p_xrDestroySwapchain) p_xrDestroySwapchain(beam_swapchain);
+    menu_swapchain = beam_swapchain = XR_NULL_HANDLE;
+    menu_failed = beam_failed = beam_ready = false;
+    menu_acquired = menu_copied = false;
+    g_menu_placed = false;
+}
+
+static bool menu_create(void) {
+    if (menu_swapchain) return true;
+    if (menu_failed || !xr_session || swapchain_format == VK_FORMAT_UNDEFINED) return false;
+    menu_failed = true;  // (until it all succeeds)
+    XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+                                .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
+                                .format = swapchain_format, .sampleCount = 1, .width = MENU_W, .height = MENU_H,
+                                .faceCount = 1, .arraySize = 1, .mipCount = 1};
+    if (!xr_ok(p_xrCreateSwapchain(xr_session, &ci, &menu_swapchain), "xrCreateSwapchain (menu)") ||
+        !xr_ok(p_xrEnumerateSwapchainImages(menu_swapchain, 0, &menu_count, NULL), "xrEnumerateSwapchainImages (menu)") ||
+        !menu_count)
+        return false;
+    menu_images = SDL_calloc(menu_count, sizeof *menu_images);
+    if (!menu_images) return false;
+    for (uint32_t i = 0; i < menu_count; i++) menu_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+    if (!xr_ok(p_xrEnumerateSwapchainImages(menu_swapchain, menu_count, &menu_count, (XrSwapchainImageBaseHeader *)menu_images),
+               "xrEnumerateSwapchainImages (menu)"))
+        return false;
+    // (as the eyes and the HUD: display-ready bytes into the sRGB swapchain through a UNORM image, no second encoding)
+    const VkFormat f = swapchain_format == VK_FORMAT_R8G8B8A8_SRGB ? VK_FORMAT_R8G8B8A8_UNORM
+                     : swapchain_format == VK_FORMAT_B8G8R8A8_SRGB ? VK_FORMAT_B8G8R8A8_UNORM : VK_FORMAT_UNDEFINED;
+    if (f != VK_FORMAT_UNDEFINED) {
+        VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = f,
+                                .extent = {MENU_W, MENU_H, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
+                                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                                .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+        if (vkCreateImage(vk_device, &ii, NULL, &menu_staging) != VK_SUCCESS) return false;
+        VkMemoryRequirements mr;
+        vkGetImageMemoryRequirements(vk_device, menu_staging, &mr);
+        const uint32_t type = memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = type};
+        if (type == UINT32_MAX || vkAllocateMemory(vk_device, &ai, NULL, &menu_staging_memory) != VK_SUCCESS ||
+            vkBindImageMemory(vk_device, menu_staging, menu_staging_memory, 0) != VK_SUCCESS)
+            return false;
+    }
+    menu_failed = false;
+    LOG("[vr] menu panel swapchain: %ux%u, %u images\n", MENU_W, MENU_H, menu_count);
+    return true;
+}
+
+// The beam's strip, once: a static image, transparent at the top (the far end) and fading in toward the hand.
+static void beam_fill(VkCommandBuffer cb) {
+    if (beam_ready || beam_failed || !xr_session || swapchain_format == VK_FORMAT_UNDEFINED) return;
+    beam_failed = true;  // (until it all succeeds)
+    XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO, .createFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT,
+                                .usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT,
+                                .format = swapchain_format, .sampleCount = 1, .width = BEAM_W, .height = BEAM_H,
+                                .faceCount = 1, .arraySize = 1, .mipCount = 1};
+    uint32_t n = 1;
+    beam_image.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+    if (!xr_ok(p_xrCreateSwapchain(xr_session, &ci, &beam_swapchain), "xrCreateSwapchain (beam)") ||
+        !xr_ok(p_xrEnumerateSwapchainImages(beam_swapchain, 1, &n, (XrSwapchainImageBaseHeader *)&beam_image),
+               "xrEnumerateSwapchainImages (beam)"))
+        return;
+    const VkDeviceSize size = BEAM_W * BEAM_H * 4;
+    VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = size, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+    if (vkCreateBuffer(vk_device, &bi, NULL, &beam_buffer) != VK_SUCCESS) return;
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(vk_device, beam_buffer, &mr);
+    const uint32_t type = memory_type(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkMemoryAllocateInfo ai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = type};
+    uint8_t *px;
+    if (type == UINT32_MAX || vkAllocateMemory(vk_device, &ai, NULL, &beam_buffer_memory) != VK_SUCCESS ||
+        vkBindBufferMemory(vk_device, beam_buffer, beam_buffer_memory, 0) != VK_SUCCESS ||
+        vkMapMemory(vk_device, beam_buffer_memory, 0, size, 0, (void **)&px) != VK_SUCCESS)
+        return;
+    const bool bgra = swapchain_format == VK_FORMAT_B8G8R8A8_SRGB || swapchain_format == VK_FORMAT_B8G8R8A8_UNORM;
+    for (int y = 0; y < BEAM_H; y++) {
+        const float a = 0.85f * (float)(y + 1) / BEAM_H;  // (premultiplied light blue)
+        const uint8_t r = (uint8_t)(0.55f * a * 255), g = (uint8_t)(0.85f * a * 255), b = (uint8_t)(a * 255), al = (uint8_t)(a * 255);
+        for (int x = 0; x < BEAM_W; x++) {
+            uint8_t *p = px + (y * BEAM_W + x) * 4;
+            p[0] = bgra ? b : r, p[1] = g, p[2] = bgra ? r : b, p[3] = al;
+        }
+    }
+    vkUnmapMemory(vk_device, beam_buffer_memory);
+    uint32_t index;
+    if (!xr_ok(p_xrAcquireSwapchainImage(beam_swapchain, &(XrSwapchainImageAcquireInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO}, &index),
+               "xrAcquireSwapchainImage (beam)") ||
+        !xr_ok(p_xrWaitSwapchainImage(beam_swapchain, &(XrSwapchainImageWaitInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+                                                                                    .timeout = XR_INFINITE_DURATION}),
+               "xrWaitSwapchainImage (beam)"))
+        return;
+    barrier_layers(cb, beam_image.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 1);
+    const VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {BEAM_W, BEAM_H, 1}};
+    vkCmdCopyBufferToImage(cb, beam_buffer, beam_image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    barrier_layers(cb, beam_image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT, 1);
+    // (released at this frame's end, after the copy is recorded: the runtime waits for the submission)
+    beam_failed = false;
+    beam_ready = true;
+}
+
+// (device.c, VR present, the menu up) The menu's image (ImGui, top-down, premultiplied; layout GENERAL) into the
+// menu panel's swapchain.
+bool vr_record_menu_copy(void *command_buffer, void *menu_image, uint32_t w, uint32_t h) {
+    if (!vr_stereo_active() || menu_acquired || !command_buffer || !menu_image || !w || !h || !menu_create()) return false;
+    VkCommandBuffer cb = command_buffer;
+    static int acquire_logged;
+    if (!xr_frame_ok(p_xrAcquireSwapchainImage(menu_swapchain, &(XrSwapchainImageAcquireInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO},
+                                               &menu_image_index), "xrAcquireSwapchainImage (menu)", &acquire_logged) ||
+        menu_image_index >= menu_count)
+        return false;
+    XrSwapchainImageWaitInfo wait = {.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .timeout = 100000000ll};
+    XrResult r = XR_TIMEOUT_EXPIRED;
+    for (int tries = 0; r == XR_TIMEOUT_EXPIRED && tries < 20; tries++) r = p_xrWaitSwapchainImage(menu_swapchain, &wait);
+    if (r != XR_SUCCESS) return false;
+    menu_acquired = true;
+    const bool fill_beam = !beam_ready;
+    if (fill_beam) beam_fill(cb);
+    VkImage dst = menu_images[menu_image_index].image, blit_dst = menu_staging ? menu_staging : dst;
+    if (menu_staging) barrier_layers(cb, menu_staging, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 1);
+    barrier_layers(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                   VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT, 1);
+    VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}},
+                        .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffsets = {{0, 0, 0}, {MENU_W, MENU_H, 1}}};
+    vkCmdBlitImage(cb, menu_image, VK_IMAGE_LAYOUT_GENERAL, blit_dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    if (menu_staging) {
+        barrier_layers(cb, menu_staging, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT, 1);
+        const VkImageCopy copy = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {MENU_W, MENU_H, 1}};
+        vkCmdCopyImage(cb, menu_staging, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    }
+    barrier_layers(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT, 1);
+    menu_copied = true;
+    return true;
+}
+
+static XrQuaternionf quat_from_columns(const float x[3], const float y[3], const float z[3]) {
+    const float r00 = x[0], r01 = y[0], r02 = z[0], r10 = x[1], r11 = y[1], r12 = z[1], r20 = x[2], r21 = y[2], r22 = z[2];
+    const float tr = r00 + r11 + r22;
+    if (tr > 0) {
+        const float s4 = sqrtf(tr + 1) * 2;
+        return (XrQuaternionf){(r21 - r12) / s4, (r02 - r20) / s4, (r10 - r01) / s4, s4 / 4};
+    } else if (r00 > r11 && r00 > r22) {
+        const float s4 = sqrtf(1 + r00 - r11 - r22) * 2;
+        return (XrQuaternionf){s4 / 4, (r01 + r10) / s4, (r02 + r20) / s4, (r21 - r12) / s4};
+    } else if (r11 > r22) {
+        const float s4 = sqrtf(1 + r11 - r00 - r22) * 2;
+        return (XrQuaternionf){(r01 + r10) / s4, s4 / 4, (r12 + r21) / s4, (r02 - r20) / s4};
+    }
+    const float s4 = sqrtf(1 + r22 - r00 - r11) * 2;
+    return (XrQuaternionf){(r02 + r20) / s4, (r12 + r21) / s4, s4 / 4, (r10 - r01) / s4};
+}
+
+// Each frame (vr_frame_end, and before the copy): place the panel when the menu comes up; while it is up, it is what
+// the controller's ray aims at.
+static void menu_panel_update(void) {
+    extern bool menu_on_vr_panel(void);
+    if (!menu_on_vr_panel()) { g_menu_placed = false; return; }
+    if (!frame.stereo && !g_menu_placed) return;
+    if (!g_menu_placed) {  // level, in front of the gaze (yaw only)
+        const XrPosef *a = &frame.views[0].pose, *b = &frame.views[1].pose;
+        const float x = a->orientation.x, y = a->orientation.y, z = a->orientation.z, w = a->orientation.w;
+        float fx = -(2 * (x * z + y * w)), fz = -(1 - 2 * (x * x + y * y));  // (-Z of the head, flattened)
+        const float len = sqrtf(fx * fx + fz * fz);
+        if (len > 1e-4f) fx /= len, fz /= len; else fx = 0, fz = -1;
+        const float d = g_vr_hud_config.menu_distance;
+        const float c[3] = {(a->position.x + b->position.x) / 2 + fx * d, (a->position.y + b->position.y) / 2 + g_vr_hud_config.menu_height,
+                            (a->position.z + b->position.z) / 2 + fz * d};
+        // columns: right = (-fz, 0, fx), up = (0, 1, 0), back (toward the player) = (-fx, 0, -fz)
+        const float m[16] = {-fz, 0, -fx, c[0], 0, 1, 0, c[1], fx, 0, -fz, c[2], 0, 0, 0, 1};
+        memcpy(g_menu_world, m, sizeof m);
+        g_menu_placed = true;
+    }
+    const float hw = g_vr_hud_config.menu_width * 0.5f, hh = hw * MENU_H / MENU_W;
+    float h[16];
+    memcpy(h, g_menu_world, sizeof h);
+    for (int r = 0; r < 3; r++) h[r * 4 + 0] *= hw, h[r * 4 + 1] *= hh;
+    vr_controls_set_hud_panel(h);
+}
+
+void vr_menu_panel_frame(void);
+void vr_menu_panel_frame(void) { menu_panel_update(); }
+
+static XrPosef menu_pose(void) {
+    const float *m = g_menu_world;
+    const float x[3] = {m[0], m[4], m[8]}, y[3] = {m[1], m[5], m[9]}, z[3] = {m[2], m[6], m[10]};
+    return (XrPosef){quat_from_columns(x, y, z), {m[3], m[7], m[11]}};
+}
+
+// The beam's quad: from the controller along its ray to the hit (or 1.5 m), turned about the ray to face the head.
+static bool beam_pose(XrPosef *pose, float *length) {
+    extern bool vr_menu_beam(float o[3], float d[3], float *len);
+    float o[3], d[3], len;
+    if (!beam_ready || !vr_menu_beam(o, d, &len)) return false;
+    const XrPosef *a = &frame.views[0].pose, *b = &frame.views[1].pose;
+    const float c[3] = {o[0] + d[0] * len / 2, o[1] + d[1] * len / 2, o[2] + d[2] * len / 2};
+    const float to_head[3] = {(a->position.x + b->position.x) / 2 - c[0], (a->position.y + b->position.y) / 2 - c[1],
+                              (a->position.z + b->position.z) / 2 - c[2]};
+    float x[3] = {d[1] * to_head[2] - d[2] * to_head[1], d[2] * to_head[0] - d[0] * to_head[2], d[0] * to_head[1] - d[1] * to_head[0]};
+    const float xl = sqrtf(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+    if (!(xl > 1e-5f)) return false;
+    for (int i = 0; i < 3; i++) x[i] /= xl;
+    const float z[3] = {x[1] * d[2] - x[2] * d[1], x[2] * d[0] - x[0] * d[2], x[0] * d[1] - x[1] * d[0]};
+    *pose = (XrPosef){quat_from_columns(x, d, z), {c[0], c[1], c[2]}};
+    *length = len;
+    return true;
+}
+
+// (the desktop mirror) Where the left eye sees the menu panel: as vr_mirror_hud_mvp.
+bool vr_mirror_menu_mvp(float out[16]) {
+    if (!g_menu_placed) return false;
+    const float hw = g_vr_hud_config.menu_width * 0.5f;
+    return mirror_quad_mvp(g_menu_world, hw, hw * MENU_H / MENU_W, out);
+}
+
 static float g_hud_world[16];  // (hud_pose) the panel last placed: world-from-panel, columns right, up, back (scaled)
 static bool g_hud_world_ok;
 
 // (device.c, the desktop mirror) The panel as the left eye sees it this frame: column-major clip-from-panel, the
 // panel's (x, y) in -1..1 over its half extents (0.8 x 0.45 m at HUD scale 1). False: no stereo frame or no panel.
 bool vr_mirror_hud_mvp(float out[16]) {
-    if (!frame.begun || !frame.stereo || !g_hud_world_ok) return false;
+    if (!g_hud_world_ok) return false;
+    return mirror_quad_mvp(g_hud_world, 0.8f, 0.45f, out);
+}
+
+// m: world-from-quad (columns right, up, back, centre); hx, hy: the half extents along its first two columns.
+static bool mirror_quad_mvp(const float m[16], float hx, float hy, float out[16]) {
+    if (!frame.begun || !frame.stereo) return false;
     const XrPosef *e = &frame.views[0].pose;
     const XrFovf *f = &frame.views[0].fov;
     const float x = e->orientation.x, y = e->orientation.y, z = e->orientation.z, w = e->orientation.w;
@@ -1243,8 +1510,7 @@ bool vr_mirror_hud_mvp(float out[16]) {
     const float p[3] = {e->position.x, e->position.y, e->position.z};
     // panel point (u, v) -> world: c + u * 0.8 * X + v * 0.45 * Y; -> eye: R^T (q - p)
     float cols[3][3];  // eye-space images of the panel's x half extent, y half extent, centre
-    const float *m = g_hud_world;
-    const float ax[3] = {m[0] * 0.8f, m[4] * 0.8f, m[8] * 0.8f}, ay[3] = {m[1] * 0.45f, m[5] * 0.45f, m[9] * 0.45f};
+    const float ax[3] = {m[0] * hx, m[4] * hx, m[8] * hx}, ay[3] = {m[1] * hy, m[5] * hy, m[9] * hy};
     const float c[3] = {m[3] - p[0], m[7] - p[1], m[11] - p[2]};
     for (int r = 0; r < 3; r++) {
         cols[0][r] = R[0 * 3 + r] * ax[0] + R[1 * 3 + r] * ax[1] + R[2 * 3 + r] * ax[2];
@@ -1277,7 +1543,7 @@ static XrPosef hud_pose(void) {
     const float dt = frame.display_period > 0 ? (float)frame.display_period * 1e-9f : 1.0f / 90.0f;
     extern bool vr_menu_pointer_active(void);  // (vr_controls.c: the panel holds still while it is in use)
     extern bool menu_is_open(void), menu_on_vr_panel(void);
-    g_vr_hud_hold = vr_menu_pointer_active() || menu_on_vr_panel();  // (the settings menu on the panel too)
+    g_vr_hud_hold = vr_menu_pointer_active();  // (the settings menu has its own panel)
     ComputeHUDQuadMatrixDelta(m, head, NULL, dt);
     memcpy(g_hud_world, m, sizeof g_hud_world);
     g_hud_world_ok = true;
@@ -1286,7 +1552,7 @@ static XrPosef hud_pose(void) {
         float h[16];
         memcpy(h, m, sizeof h);
         for (int r = 0; r < 3; r++) h[r * 4 + 0] *= hw, h[r * 4 + 1] *= hh;
-        vr_controls_set_hud_panel(h);
+        if (!menu_on_vr_panel()) vr_controls_set_hud_panel(h);  // (else the menu's panel: menu_panel_update)
         static uint64_t next;  // (diagnostics, with the menu pointer's [vr-pointer] lines) the head and the panel
         const uint64_t now = SDL_GetTicksNS();
         if (now >= next) {
@@ -1418,6 +1684,29 @@ void vr_frame_end(void) {
                                    .subImage = {.swapchain = hud_swapchain, .imageRect = {{0, 0}, {HUD_W, HUD_H}}, .imageArrayIndex = 0},
                                    .pose = hud_ok ? hud_pose() : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}},
                                    .size = {hud_w, hud_w * HUD_H / HUD_W}};
+    // The settings menu's panel and the beam (menu_panel_update, vr_record_menu_copy), in front of everything.
+    static int menu_release_logged;
+    const bool menu_ok = menu_acquired &&
+        xr_frame_ok(p_xrReleaseSwapchainImage(menu_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
+                    "xrReleaseSwapchainImage (menu)", &menu_release_logged) && menu_copied && g_menu_placed;
+    menu_acquired = menu_copied = false;
+    {   static bool beam_released;  // (the static image: released once, after its fill was recorded)
+        if (beam_ready && !beam_released)
+            beam_released = XR_SUCCEEDED(p_xrReleaseSwapchainImage(beam_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}));
+        if (!beam_ready) beam_released = false;
+    }
+    const float menu_w = g_vr_hud_config.menu_width;
+    const XrCompositionLayerQuad menu_quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+        .subImage = {.swapchain = menu_swapchain, .imageRect = {{0, 0}, {MENU_W, MENU_H}}, .imageArrayIndex = 0},
+        .pose = menu_ok ? menu_pose() : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}}, .size = {menu_w, menu_w * MENU_H / MENU_W}};
+    XrPosef bp;
+    float beam_len = 0;
+    const bool beam_ok = menu_ok && beam_pose(&bp, &beam_len);
+    const XrCompositionLayerQuad beam_quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+        .subImage = {.swapchain = beam_swapchain, .imageRect = {{0, 0}, {BEAM_W, BEAM_H}}, .imageArrayIndex = 0},
+        .pose = beam_ok ? bp : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}}, .size = {0.006f, beam_len}};
     XrCompositionLayerQuad wrist[2];
     uint32_t wrist_count = 0;
     extern bool player_eye(float eye[3]);
@@ -1450,12 +1739,14 @@ void vr_frame_end(void) {
         quad.subImage.imageRect = (XrRect2Di){{480, 0}, {960, HUD_H}};
         quad.size.width = hud_w * 960.0f / HUD_W;
     }
-    const XrCompositionLayerBaseHeader *layers[6];
+    const XrCompositionLayerBaseHeader *layers[8];
     uint32_t nlayers = 0;
     if (submit) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&layer;
     if (submit && hud_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&quad;
     if (submit && use_wrist)
         for (uint32_t i = 0; i < wrist_count; i++) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&wrist[i];
+    if (submit && menu_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&menu_quad;
+    if (submit && beam_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&beam_quad;
     if (g_vr_config.dynamic_resolution && frame.work_start_ns && frame.display_period > 0) {
         adaptive_work_sum += (double)(SDL_GetTicksNS() - frame.work_start_ns);
         adaptive_budget_sum += (double)frame.display_period;

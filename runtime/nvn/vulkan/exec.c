@@ -5368,7 +5368,8 @@ static TexBackend *menu_image(uint32_t w, uint32_t h) {
         VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D,
                                 .format = g_vk.sc_format, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                                 .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL,
-                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
+                                .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT};  // (+ the VR menu panel's copy)
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &d->image, &d->mem, NULL));
         d->format = g_vk.sc_format; d->width = w; d->height = h; d->depth = 1; d->layers = 1; d->levels = 1;
@@ -5403,6 +5404,27 @@ TexBackend *vk_vr_menu_over_hud(TexBackend *hud, bool flip) {
     post_pass(cb, "hud_menu.frag", srcs, 2, out, pc, false);
     vk_full_barrier(cb);
     return out;
+}
+
+// (device.c, VR present, the menu up) The settings menu / name entry alone, 1600 x 1000 (its own panel: vr.c),
+// top-down, premultiplied (ImGui over a clear transparent image), layout GENERAL.
+TexBackend *vk_vr_menu_panel(void) {
+    enum { W = 1600, H = 1000 };
+    extern void menu_render(void *cmd, uint32_t target_w, uint32_t target_h);
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    TexBackend *m = menu_image(W, H);
+    vk_full_barrier(cb);
+    VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = post_view(m),
+                                    .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+                                    .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {W, H}}, .layerCount = 1,
+                          .colorAttachmentCount = 1, .pColorAttachments = &ca};
+    vkCmdBeginRendering(cb, &ri);
+    menu_render((void *)cb, W, H);
+    vkCmdEndRendering(cb);
+    vk_full_barrier(cb);
+    return m;
 }
 
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.

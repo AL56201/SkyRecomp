@@ -680,6 +680,14 @@ static void tab_vr_options(void) {
                           "Lowest resolution Adaptive VR Resolution may use. The VR Resolution value above remains "
                           "the quality ceiling.");
 
+    opt_section("Menu Panel");
+    changed |= opt_slider("Menu Distance", &g_vr_hud_config.menu_distance, 0.4f, 3.0f, 0.05f, 1.0f, "%.2f m",
+                          "How far in front of you this menu (and the name entry) appears when it opens.");
+    changed |= opt_slider("Menu Width", &g_vr_hud_config.menu_width, 0.4f, 3.0f, 0.05f, 1.2f, "%.2f m",
+                          "The menu panel's width. Applies the next time the menu opens.");
+    changed |= opt_slider("Menu Height", &g_vr_hud_config.menu_height, -1.0f, 1.0f, 0.05f, -0.1f, "%+.2f m",
+                          "Above or below eye level. Applies the next time the menu opens.");
+
     opt_section("Wrist HUD");
     changed |= opt_toggle("Enable Wrist HUD", &g_vr_hud_config.wrist_hud, true,
                           "During gameplay, places the status modules on the left wrist and item modules on the "
@@ -953,7 +961,7 @@ static void vr_keyboard_draw(ImGuiIO &io) {
 }
 
 static void keyboard_draw(ImGuiIO &io, float scale) {
-    ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 120));
+    if (!vr_running()) ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 120));
     float w = fminf(io.DisplaySize.x * 0.9f, 1100 * scale);
     // (VR: in the panel's upper part - the VR keyboard takes the lower part)
     ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * (vr_running() ? 0.04f : 0.5f)), ImGuiCond_Always,
@@ -1266,7 +1274,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
 
     if (open) {
         // dim the game behind the menu
-        ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 110));
+        if (!vr_running()) ImGui::GetBackgroundDrawList()->AddRectFilled(ImVec2(0, 0), io.DisplaySize, IM_COL32(0, 0, 0, 110));
         float w = fminf(io.DisplaySize.x * 0.9f, 1500 * scale), h = io.DisplaySize.y - 2 * 18 * scale;  // (all the height: a slim margin)
         ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
         ImGui::SetNextWindowSize(ImVec2(w, h), ImGuiCond_Always);
