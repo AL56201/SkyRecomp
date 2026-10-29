@@ -281,7 +281,20 @@ static void motion_sample(uint8_t device, SensorState *s) {
         return;
     }
     VrJoyConSensor v;
-    if (device > DEVICE_RIGHT || !vr_joycon_sensor(device, &v)) return;
+    if (device > DEVICE_RIGHT) return;
+    // The settings menu has the controllers (its pointer, menu.mm): the game keeps their last pose, held still
+    // (its cursor and sword don't follow the menu's pointing).
+    static VrJoyConSensor last[2];
+    static bool have_last[2];
+    extern bool menu_input_captured(void);
+    if (menu_input_captured()) {
+        if (!have_last[device]) return;
+        v = last[device];
+        memset(v.gyro, 0, sizeof v.gyro);
+    } else {
+        if (!vr_joycon_sensor(device, &v)) return;
+        last[device] = v, have_last[device] = true;
+    }
     memcpy(s->accel, v.accel, sizeof s->accel);
     memcpy(s->gyro, v.gyro, sizeof s->gyro);
     memcpy(s->angle, v.angle, sizeof s->angle);

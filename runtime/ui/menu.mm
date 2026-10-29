@@ -1063,6 +1063,9 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
         else if (was_on) io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
         if (click != was_click) io.AddMouseButtonEvent(0, click);
         was_click = click, was_on = on;
+        io.MouseDrawCursor = on;  // (no system cursor in the headset: ImGui draws one where the ray points)
+    } else {
+        io.MouseDrawCursor = false;
     }
     // fonts are built at 34/56 px for a ~1080 px tall output; scale to the window
     float scale = (float)(th / 1080.0);
