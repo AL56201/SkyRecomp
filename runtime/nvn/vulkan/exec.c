@@ -3746,6 +3746,33 @@ static bool is_hud_draw(void) {
     return fabsf(f[15] - 1) < 1e-4f && fabsf(f[12]) < 1e-4f && fabsf(f[13]) < 1e-4f && fabsf(f[14]) < 1e-4f;
 }
 
+// A cutscene's letterbox bar: a 2D quad wider than the screen, thin, against its top or bottom edge, not rotated.
+// In VR the scene fills the view: the bars only hid its edges on a TV, and on the HUD panel they are two black
+// stripes across the view. (The 2D camera block: the ortho projection's rows 0-1, then the quad's model rows; the
+// quad spans 0..1 in its own x and y.)
+static bool hud_letterbox_bar(void) {
+    const Range c0 = st.ubuf[0][0];
+    if (!c0.addr || c0.size != 192) return false;
+    const float *f = (const float *)(uintptr_t)c0.addr;
+    if (fabsf(f[17]) > 1e-3f || fabsf(f[20]) > 1e-3f) return false;  // (rotated or skewed)
+    const float x0 = f[0] * f[19] + f[3], x1 = f[0] * (f[16] + f[19]) + f[3];
+    const float y0 = f[5] * f[23] + f[7], y1 = f[5] * (f[21] + f[23]) + f[7];
+    const float xl = fminf(x0, x1), xr = fmaxf(x0, x1), yb = fminf(y0, y1), yt = fmaxf(y0, y1);
+    return xr - xl > 2.2f && xl <= -1.0f && xr >= 1.0f && yt - yb < 0.35f && (yt >= 0.98f || yb <= -0.98f);
+}
+
+// A 2D quad over the whole screen (a fade to / from black or white, a flash): drawn in the eyes rather than on the
+// HUD panel, it covers the whole view - on the panel it is a coloured rectangle floating in a world left unfaded.
+static bool hud_fullscreen_quad(void) {
+    const Range c0 = st.ubuf[0][0];
+    if (!c0.addr || c0.size != 192) return false;
+    const float *f = (const float *)(uintptr_t)c0.addr;
+    if (fabsf(f[17]) > 1e-3f || fabsf(f[20]) > 1e-3f) return false;
+    const float x0 = f[0] * f[19] + f[3], x1 = f[0] * (f[16] + f[19]) + f[3];
+    const float y0 = f[5] * f[23] + f[7], y1 = f[5] * (f[21] + f[23]) + f[7];
+    return fminf(x0, x1) <= -0.98f && fmaxf(x0, x1) >= 0.98f && fminf(y0, y1) <= -0.98f && fmaxf(y0, y1) >= 0.98f;
+}
+
 // The HUD texture's backend (NULL before the first HUD draw).
 TexBackend *vk_hud_backend(void) { return g_hud_tex.backend; }
 
@@ -3834,6 +3861,15 @@ static RtState g_hud_saved_rt;
 // (device.c, at present, eye 0's screen) Full-screen 2D frames: the screen's centred 16:9 box (where the game's
 // layout sits; the eye image's taller or wider rest shows what a 16:9 screen would not) becomes the HUD texture.
 // (device.c, at present) Whether the frame being presented drew a 3D scene; resets for the next frame.
+// (device.c, at present) The frame being presented drew no 2D but full-screen quads (a fade, a flash, a blank screen);
+// resets for the next frame.
+static int g_2d_content;  // this frame's 2D-layer draws that are not full-screen quads
+bool vk_hud_frame_blank(void) {
+    const bool blank = g_2d_content == 0;
+    g_2d_content = 0;
+    return blank;
+}
+
 bool vk_hud_frame_had_scene(void) {
     const bool had = g_scene_since_present;
     g_scene_since_present = false;
@@ -3862,12 +3898,14 @@ static void draw(CmdRec *r, bool indexed) {
     g_hud_rec = r;
     g_hud_candidate = vk_hud_layer_on() && st.program && (hud_clear_for_frame(), !hud_full2d()) && is_hud_draw();
     extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the motion calibration prompt, answered for the
-    if (g_hud_candidate && motion_vr_calibration_hidden()) {  // player, is never shown)
+    if (g_hud_candidate && (motion_vr_calibration_hidden() || hud_letterbox_bar())) {  // player, is never shown)
         g_hud_candidate = false;
         stat_skipped++;
         PROF_ADD(prof_draw);
         return;
     }
+    if (g_hud_candidate && hud_fullscreen_quad()) g_hud_candidate = false;  // (a fade: over the whole view, in the eyes)
+    if (vk_hud_layer_on() && st.program && !vk_vr_eye() && is_hud_draw() && !hud_fullscreen_quad()) g_2d_content++;  // (vk_hud_frame_blank)
     // World behind a menu (hle/vr_world.c): the menu's own passes that read the screen back (the map's islands,
     // drawn there first, then captured into its map texture) read the HUD texture, where its 2D layer now is.
     const bool menu_sub = !g_hud_candidate && g_menu_screen && g_hud_tex.backend && vk_hud_layer_on() && vr_world_menu_active();

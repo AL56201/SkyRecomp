@@ -674,7 +674,8 @@ void backend_set_window_crop(const int crop[4]) {
 
 void backend_present(NvnTexture *t);
 static bool g_representing;
-static bool g_cinema;  // (this frame: a prerendered cutscene - vr.c cinema - the mirror shows it the same way)  // (backend_represent: the game is waiting - e.g. the name entry dialog)
+static bool g_cinema;
+static bool g_blank;  // (this frame: a fade - no scene, only full-screen colour 2D: shown in the eyes, no panel)  // (this frame: a prerendered cutscene - vr.c cinema - the mirror shows it the same way)  // (backend_represent: the game is waiting - e.g. the name entry dialog)
 void backend_represent(void) {
     extern bool nvn_async_on(void), nvn_async_is_replay_thread(void);
     extern void nvn_async_represent(void);
@@ -821,6 +822,8 @@ void backend_present(NvnTexture *t) {
         {   // full-screen 2D (the map): the eyes keep the last 3D frame
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void), vk_hud_frame_had_scene(void);
             const bool had_scene = vk_hud_frame_had_scene();
+            extern bool vk_hud_frame_blank(void);  // (exec.c: no scene, and no 2D but full-screen colour - a fade)
+            g_blank = !had_scene && vk_hud_frame_blank();
             {   // a prerendered cutscene (hle/movie.c) on its own screen: the panel, larger and still, in the dark
                 extern bool movie_playing(void);
                 extern void vr_cinema(bool on);
@@ -828,7 +831,7 @@ void backend_present(NvnTexture *t) {
                 vr_cinema(g_cinema);
             }
             if (g_representing) vr_freeze_world(true, false);  // (the game waiting: its last frame, held in the world)
-            else vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene, had_scene);  // (world mode: live)
+            else vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene && !g_blank, had_scene);  // (world mode: live)
         }
         pt_mark(PT_FREEZE);
         TexBackend *mirror_src = b;  // (the desktop mirror shows eye 0 as the headset gets it: no second post chain)
@@ -856,7 +859,8 @@ void backend_present(NvnTexture *t) {
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void);
             extern TexBackend *vk_hud_backend(void);
             extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the calibration prompt, hidden)
-            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() ? vk_hud_backend() : NULL;
+            // (a blank frame - a fade - fills the eyes as it is: no panel)
+            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank ? vk_hud_backend() : NULL;
             {   // (test) LARECOMP_MENU_AT=<frame>: the settings menu opens at that frame (as on the desktop below)
                 static long menu_at = -1;
                 if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
@@ -935,7 +939,7 @@ void backend_present(NvnTexture *t) {
                 extern TexBackend *vk_hud_backend(void);
                 extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh,
                                                const float pv[8], bool opaque);
-                TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() ? vk_hud_backend() : NULL;
+                TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank ? vk_hud_backend() : NULL;
                 extern bool vr_mirror_hud_mvp(float out[16]);
                 extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
                 float mvp[16];
