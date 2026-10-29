@@ -3981,6 +3981,7 @@ static void draw(CmdRec *r, bool indexed) {
 static bool hud_route(Prog *pr) {
     const uint64_t fr1 = renderer_present_count() + 1;
     bool reads_scene = false;
+    bool reads_screen_rt = false;
     for (int i = 0; i < pr->fi->ntex && i < 64 && !reads_scene; i++) {
         NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
         const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
@@ -3989,8 +3990,12 @@ static bool hud_route(Prog *pr) {
         // floating rectangular card (notably the flare in the void dream sequence).
         reads_scene = b && b->scene_frame && b->scene_frame <= fr1 + 1 && b->scene_frame + 1 >= fr1 &&
                       !recently_presented(t);
+        // Some cutscene bloom/flare chains use an offscreen render target whose scene_frame marker is lost while
+        // copying or downsampling it.  It is still screen-derived imagery, not a static UI texture.  Without this
+        // fallback the effect's rectangular intermediate becomes a floating HUD card in the void sequence.
+        if (b && b->gpu_owned && t->width >= 160 && t->height >= 90 && !recently_presented(t)) reads_screen_rt = true;
     }
-    if (reads_scene) {
+    if (reads_scene || reads_screen_rt) {
         // A live-scene composite is part of the stereo view even when its quad is not the canonical 0..1 shape.
         // The old unit-quad requirement routed cutscene bloom/flares to the HUD, exposing their rectangular bounds.
         // Only an intentionally active world-menu panel may use a scene sample as its frosted HUD backdrop.
