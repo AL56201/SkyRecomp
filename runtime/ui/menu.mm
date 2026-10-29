@@ -895,7 +895,7 @@ extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, in
         uint64_t t0 = SDL_GetTicks();
         backend_represent();
         uint64_t dt = SDL_GetTicks() - t0;
-        if (dt < 16) SDL_Delay((uint32_t)(16 - dt));
+        if (dt < 16 && !vr_running()) SDL_Delay((uint32_t)(16 - dt));  // (VR: the headset's frame wait paces it)
     }
     bool ok = g_kbd.load() == 2 && g_kbd_text[0];
     if (ok) snprintf(out, cap, "%s", g_kbd_text);

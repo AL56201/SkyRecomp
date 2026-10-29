@@ -692,6 +692,15 @@ void present_game_hooks(uint64_t frame) {
     }
     extern void input_frame(uint64_t frame);
     input_frame(frame);
+    {   // (test) SKYRECOMP_KBD_AT=<frame>: the name entry dialog opens at that frame (as the game's swkbd would)
+        static long at = -1;
+        if (at < 0) at = getenv("SKYRECOMP_KBD_AT") ? atol(getenv("SKYRECOMP_KBD_AT")) : 0;
+        if (at && (long)frame == at) {
+            extern int menu_keyboard_run(const char *initial, int max_len, char *out, int cap);
+            char out[64];
+            LOG("[test] name entry -> %d (%s)\n", menu_keyboard_run("Link", 8, out, sizeof out), out);
+        }
+    }
     static long slow_ms = -1;
     if (slow_ms < 0) slow_ms = getenv("LARECOMP_SLOW_FRAME_MS") ? atol(getenv("LARECOMP_SLOW_FRAME_MS")) : 0;
     static long slow_until = -1;  // LARECOMP_SLOW_FRAME_UNTIL=<frame>: the stall ends there (frame pacing recovery tests)

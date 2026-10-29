@@ -552,7 +552,11 @@ void vr_poll(void) {
         event = (XrEventDataBuffer){.type = XR_TYPE_EVENT_DATA_BUFFER};
     }
     // Controllers are located in the same OpenXR local space as the HMD (the game's Joy-Cons, the wrist HUD).
-    vr_input_sync(running ? local_space : XR_NULL_HANDLE, frame.display_time, reference_valid ? reference_pose : NULL);
+    // Between frames (the game waiting, e.g. on the name entry dialog: only re-presents, no frame begun yet) the
+    // last frame's display time: with 0 the controllers aren't synced at all (no menu pointer).
+    static XrTime last_time;
+    if (frame.display_time) last_time = frame.display_time;
+    vr_input_sync(running ? local_space : XR_NULL_HANDLE, last_time, reference_valid ? reference_pose : NULL);
 }
 
 // ================================================================== frame loop
