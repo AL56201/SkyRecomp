@@ -820,6 +820,10 @@ static XrView frozen_views[2];
 static bool frozen_valid, frozen_failed, freeze_next, frame_3d_next;
 
 void vr_freeze_world(bool freeze, bool frame_is_3d) { freeze_next = freeze; frame_3d_next = frame_is_3d; }
+// A prerendered cutscene (device.c): the eyes dark, the HUD panel (the video) larger and held still - a cinema.
+static bool g_cinema;
+void vr_cinema(bool on) { g_cinema = on; }
+static float hud_size_factor(void) { return g_cinema ? 1.6f : 1.0f; }
 
 static void frozen_destroy(void) {
     if (vk_device && frozen) vkDestroyImage(vk_device, frozen, NULL);
@@ -890,6 +894,18 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
     VkImage dst = images[frame.image].image;
     const bool freeze = freeze_next, frame_3d = frame_3d_next;
     freeze_next = frame_3d_next = false;
+    if (g_cinema) {  // (vr_cinema: dark around the video's screen)
+        barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        const VkClearColorValue black = {{0, 0, 0, 1}};
+        const VkImageSubresourceRange both = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 2};
+        vkCmdClearColorImage(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &both);
+        barrier(cb, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        frame.copied = true;
+        return true;
+    }
     if (freeze && frozen_valid) {  // (vr_freeze_world: the last 3D frame again, with its poses)
         barrier(cb, frozen, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
@@ -1513,7 +1529,7 @@ static bool g_hud_world_ok;
 // panel's (x, y) in -1..1 over its half extents (0.8 x 0.45 m at HUD scale 1). False: no stereo frame or no panel.
 bool vr_mirror_hud_mvp(float out[16]) {
     if (!g_hud_world_ok) return false;
-    return mirror_quad_mvp(g_hud_world, 0.8f, 0.45f, out);
+    return mirror_quad_mvp(g_hud_world, 0.8f * hud_size_factor(), 0.45f * hud_size_factor(), out);
 }
 
 // m: world-from-quad (columns right, up, back, centre); hx, hy: the half extents along its first two columns.
@@ -1561,12 +1577,12 @@ static XrPosef hud_pose(void) {
     const float dt = frame.display_period > 0 ? (float)frame.display_period * 1e-9f : 1.0f / 90.0f;
     extern bool vr_menu_pointer_active(void);  // (vr_controls.c: the panel holds still while it is in use)
     extern bool menu_is_open(void), menu_on_vr_panel(void);
-    g_vr_hud_hold = vr_menu_pointer_active();  // (the settings menu has its own panel)
+    g_vr_hud_hold = vr_menu_pointer_active() || g_cinema;  // (a cutscene's screen holds still too)
     ComputeHUDQuadMatrixDelta(m, head, NULL, dt);
     memcpy(g_hud_world, m, sizeof g_hud_world);
     g_hud_world_ok = true;
     {   // (the menu pointer, vr_controls.c) the panel with its half extents as axes
-        const float hw = 0.8f * g_vr_hud_config.hud_scale, hh = hw * HUD_H / HUD_W;
+        const float hw = 0.8f * g_vr_hud_config.hud_scale * hud_size_factor(), hh = hw * HUD_H / HUD_W;
         float h[16];
         memcpy(h, m, sizeof h);
         for (int r = 0; r < 3; r++) h[r * 4 + 0] *= hw, h[r * 4 + 1] *= hh;
@@ -1695,7 +1711,7 @@ void vr_frame_end(void) {
     const bool hud_ok = frame.hud_acquired &&
         xr_frame_ok(p_xrReleaseSwapchainImage(hud_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
                     "xrReleaseSwapchainImage (HUD)", &hud_release_logged) && frame.hud_copied;
-    const float hud_w = 1.6f * g_vr_hud_config.hud_scale;
+    const float hud_w = 1.6f * g_vr_hud_config.hud_scale * hud_size_factor();
     XrCompositionLayerQuad quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
                                    .layerFlags = frame.hud_opaque ? 0 : XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
                                    .eyeVisibility = XR_EYE_VISIBILITY_BOTH,

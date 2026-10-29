@@ -673,7 +673,8 @@ void backend_set_window_crop(const int crop[4]) {
 }
 
 void backend_present(NvnTexture *t);
-static bool g_representing;  // (backend_represent: the game is waiting - e.g. the name entry dialog)
+static bool g_representing;
+static bool g_cinema;  // (this frame: a prerendered cutscene - vr.c cinema - the mirror shows it the same way)  // (backend_represent: the game is waiting - e.g. the name entry dialog)
 void backend_represent(void) {
     extern bool nvn_async_on(void), nvn_async_is_replay_thread(void);
     extern void nvn_async_represent(void);
@@ -820,6 +821,12 @@ void backend_present(NvnTexture *t) {
         {   // full-screen 2D (the map): the eyes keep the last 3D frame
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void), vk_hud_frame_had_scene(void);
             const bool had_scene = vk_hud_frame_had_scene();
+            {   // a prerendered cutscene (hle/movie.c) on its own screen: the panel, larger and still, in the dark
+                extern bool movie_playing(void);
+                extern void vr_cinema(bool on);
+                g_cinema = vk_hud_layer_on() && movie_playing() && !had_scene;
+                vr_cinema(g_cinema);
+            }
             if (g_representing) vr_freeze_world(true, false);  // (the game waiting: its last frame, held in the world)
             else vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene, had_scene);  // (world mode: live)
         }
@@ -922,7 +929,7 @@ void backend_present(NvnTexture *t) {
         if (mirror) {
             VkExtent2D extent = vk_frame_extent();
             float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, 0, 0, 1, 1};
-            vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
+            if (!g_cinema) vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
             {   // the HUD panel's 2D layer (the HUD, menus, map) over it, as the headset shows it: 16:9 in the middle
                 extern bool vk_hud_layer_on(void), vk_hud_opaque(void), motion_vr_calibration_hidden(void);
                 extern TexBackend *vk_hud_backend(void);

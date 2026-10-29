@@ -762,6 +762,14 @@ static void dec_acquire_output(Cpu *c) {
     c->x[0] = 0;
 }
 
+// (VR, device.c) A video frame went to the game within the last 0.3 s: a prerendered cutscene is playing.
+static _Atomic int64_t g_movie_frame_us;
+bool movie_playing(void);
+bool movie_playing(void) {
+    const int64_t t = g_movie_frame_us;
+    return t && av_gettime_relative() - t < 300000;
+}
+
 static void dec_get_output_buffer(Cpu *c) {
     Decoder *d = self_state(c);
     n_get_out++;
@@ -769,6 +777,7 @@ static void dec_get_output_buffer(Cpu *c) {
     int i = (int)c->x[1];
     MBuffer *b = BUF(c->x[2]);
     if (i < 0 || i >= NOUT) { c->x[0] = 1; return; }
+    if (d->video) g_movie_frame_us = av_gettime_relative();
     if (d->video && b->base) {
         // texture output mode: the buffer points at the game's NVNtexture; write RGBA into it
         NvnTexture *t = *(NvnTexture **)(uintptr_t)b->base;
