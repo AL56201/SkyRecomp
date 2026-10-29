@@ -3781,6 +3781,23 @@ static bool hud_fullscreen_quad(void) {
 // The HUD texture's backend (NULL before the first HUD draw).
 TexBackend *vk_hud_backend(void) { return g_hud_tex.backend; }
 
+// The panel image is a per-present scratch surface, not retained UI state.  Clear it only after device.c has
+// recorded every headset and mirror read from it.  This makes stale full-screen screens impossible even when the
+// async replay thread's draw/present counters cross a frame boundary.
+void vk_hud_discard_after_present(void) {
+    if (!g_hud_tex.backend) return;
+    vk_end_pass();
+    TexBackend *b = vk_tex(&g_hud_tex, true);
+    VkClearColorValue zero = {{0, 0, 0, 0}};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, b->layer0, 1};
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+    vk_full_barrier(cb);
+    g_hud_cleared = ~0ull;
+    st.rt_dirty = true;
+}
+
 // Made like the presented image but 1920x1080 and not resolution-scaled (the game lays its 2D layer out in those
 // pixels), host-only (no guest memory: never uploaded).
 static NvnTexture *hud_texture(const NvnTexture *like) {
@@ -3858,7 +3875,15 @@ bool vk_hud_opaque(void) { return hud_full2d() || vr_world_menu_active(); }
 
 static CmdRec *g_hud_rec;  // (the draw being routed)
 static bool g_hud_candidate;  // this draw is drawn like the 2D layer (decided in draw_ once its program is known)
-static bool g_hud_fullscreen_draw;  // geometry fills the screen; draw_ decides whether it is actually a solid fade
+static bool g_hud_fullscreen_draw;
+static bool g_fullscreen_quad_frame;  // a full-screen 2D quad (a fade, a flash) since the last present
+// (device.c, at present) Whether this frame drew a full-screen 2D quad - then the eyes carry it over the whole view
+// and the panel is never opaque nor a copy of the frame (it showed as a black rectangle during fades); resets.
+bool vk_hud_frame_had_fullscreen_quad(void) {
+    const bool had = g_fullscreen_quad_frame;
+    g_fullscreen_quad_frame = false;
+    return had;
+}  // geometry fills the screen; draw_ decides whether it is actually a solid fade
 static bool g_hud_active;     // this draw renders into the HUD texture: draw() restores the targets afterwards
 static bool g_hud_content_since_present;  // at least one real 2D-layer draw was routed since the last present
 static RtState g_hud_saved_rt;
@@ -3895,7 +3920,7 @@ void vk_hud_present(NvnTexture *screen) {
     // Do not resurrect the previous panel during a scene-less fade.  The HUD image is persistent, so merely having
     // a backend does not mean this frame supplied panel content.  Real full-screen 2D screens (map, file select,
     // menus) contain layout draws; an all-screen fade does not.
-    if (!vk_hud_layer_on() || !hud_full2d() || g_scene_since_present || g_fullscreen_2d_since_present ||
+    if (!vk_hud_layer_on() || !hud_full2d() || g_scene_since_present || g_fullscreen_2d_since_present || g_fullscreen_quad_frame ||
         g_2d_content == 0 || !screen || !screen->backend) return;
     NvnTexture *hud = hud_texture(screen);
     TexBackend *d = vk_tex(hud, true), *s = (TexBackend *)screen->backend;
@@ -3929,6 +3954,7 @@ static void draw(CmdRec *r, bool indexed) {
     const bool hud_draw = vk_hud_layer_on() && st.program && !vk_vr_eye() && is_hud_draw();
     const bool fullscreen_2d = hud_draw && hud_fullscreen_quad();
     g_hud_fullscreen_draw = fullscreen_2d;
+    if (fullscreen_2d) g_fullscreen_quad_frame = true;
     if (g_hud_candidate && fullscreen_2d) g_hud_candidate = false;  // (a fade: over the whole view, in the eyes)
     if (!fullscreen_2d && hud_draw) g_2d_content++;  // (vk_hud_frame_blank)
     // World behind a menu (hle/vr_world.c): the menu's own passes that read the screen back (the map's islands,

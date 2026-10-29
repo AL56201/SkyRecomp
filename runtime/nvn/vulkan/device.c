@@ -676,7 +676,8 @@ void backend_present(NvnTexture *t);
 static bool g_representing;
 static bool g_cinema;
 static bool g_blank;      // this frame is a full-screen colour fade: show it in the eyes, not on the panel
-static bool g_had_scene;  // this frame drew 3D: never put a full-screen copy on the panel
+static bool g_had_scene;
+static bool g_fade;  // (this frame drew a full-screen 2D quad - a fade: in the eyes; the panel never opaque)  // this frame drew 3D: never put a full-screen copy on the panel
 static bool g_had_hud;    // this frame routed actual 2D-layer draws into the HUD texture
 static float g_vr_crop[4] = {0, 0, 1, 1};  // the eyes' part of the game image; the mirror shows the same crop
 void backend_represent(void) {
@@ -826,6 +827,8 @@ void backend_present(NvnTexture *t) {
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void), vk_hud_frame_had_scene(void), vk_hud_frame_had_content(void);
             const bool had_scene = vk_hud_frame_had_scene();
             g_had_scene = had_scene;
+            extern bool vk_hud_frame_had_fullscreen_quad(void);
+            g_fade = vk_hud_frame_had_fullscreen_quad();
             g_had_hud = vk_hud_frame_had_content();
             extern bool vk_hud_frame_blank(void);  // (exec.c: no scene, and no 2D but full-screen colour - a fade)
             // A fade may cover a live 3D scene (the Skyview void transition does exactly that).  It still owns the
@@ -838,7 +841,7 @@ void backend_present(NvnTexture *t) {
                 vr_cinema(g_cinema);
             }
             if (g_representing) vr_freeze_world(true, false);  // (the game waiting: its last frame, held in the world)
-            else vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene && !g_blank, had_scene);  // (world mode: live)
+            else vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene && !g_blank && !g_fade, had_scene);  // (world mode: live)
         }
         pt_mark(PT_FREEZE);
         TexBackend *mirror_src = b;  // (the desktop mirror shows eye 0 as the headset gets it: no second post chain)
@@ -900,7 +903,7 @@ void backend_present(NvnTexture *t) {
             if (hb) {
                 vk_label_begin(vk_cmd(), "[VR] HUD Quad");
                 vr_record_hud_copy((void *)vk_cmd(), (void *)hb->image, hb->width, hb->height, renderer_origin_lower_left(),
-                               vk_hud_opaque() && !g_had_scene);
+                               vk_hud_opaque() && !g_had_scene && !g_fade);
                 vk_label_end(vk_cmd());
             }
             pt_mark(PT_HUD);
@@ -964,7 +967,7 @@ void backend_present(NvnTexture *t) {
                 extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
                 float mvp[16];
                 if (hb && vr_mirror_hud_mvp(mvp)) {  // (where the left eye sees the panel)
-                    vk_present_hud_quad(vk_cmd(), hb, mvp, renderer_origin_lower_left(), vk_hud_opaque() && !g_had_scene);
+                    vk_present_hud_quad(vk_cmd(), hb, mvp, renderer_origin_lower_left(), vk_hud_opaque() && !g_had_scene && !g_fade);
                 } else if (hb) {
                     const float ww = (float)extent.width, wh = (float)extent.height;
                     const float w = fminf(ww, wh * 16.0f / 9.0f), h = w * 9.0f / 16.0f;
@@ -977,9 +980,13 @@ void backend_present(NvnTexture *t) {
             pt_mark(PT_MIRROR_DRAW);
             if (!g_vr_menu_on_panel) menu_render((void *)vk_cmd(), extent.width, extent.height);  // (else: on the panel)
             pt_mark(PT_MENU);
+            extern void vk_hud_discard_after_present(void);
+            vk_hud_discard_after_present();
             vk_frame_end(NULL);
             pt_mark(PT_MIRROR_END);
         } else {
+            extern void vk_hud_discard_after_present(void);
+            vk_hud_discard_after_present();
             renderer_submit();
             pt_mark(PT_SUBMIT);
         }
