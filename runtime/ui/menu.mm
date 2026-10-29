@@ -158,6 +158,8 @@ static int g_kbd_max = 8;
 static bool capturing() { return g_open.load() || g_kbd.load() == 1; }
 // The game gets no input while this is true (runtime/hle/input.c): menu or name entry up.
 extern "C" bool menu_input_captured(void) { return capturing(); }
+// (VR: the settings menu or the name entry dialog - drawn on the HUD panel, used with the right controller)
+extern "C" bool menu_on_vr_panel(void) { return capturing(); }
 
 bool menu_handle_event(const SDL_Event *e) {
     static bool back_down, start_down;
@@ -1057,7 +1059,7 @@ void menu_render(void *cmd, uint32_t target_w, uint32_t target_h) {
     io.DeltaTime = last > 0 && now > last ? (float)(now - last) : 1.0f / 60;
     last = now;
     drain_events(io);
-    if (vr_running() && g_open.load()) {  // VR: the right controller's ray on the HUD panel is the mouse, its trigger the click
+    if (vr_running() && capturing()) {  // VR: the right controller's ray on the HUD panel is the mouse, its trigger the click
         float u, v;
         bool click = false;
         static bool was_click, was_on;

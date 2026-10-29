@@ -738,6 +738,7 @@ static void pt_report(void) {
     pt_frames = 0;
 }
 
+extern bool menu_on_vr_panel(void);  // (ui/menu.mm)
 static bool g_vr_menu_on_panel;  // (this frame: the settings menu was drawn onto the VR HUD panel)
 static TexBackend *g_vr_panel_img;  // (this frame: the panel's image - the HUD texture, or it with the menu)
 
@@ -840,7 +841,7 @@ void backend_present(NvnTexture *t) {
                 if (menu_at < 0) menu_at = getenv("LARECOMP_MENU_AT") ? atol(getenv("LARECOMP_MENU_AT")) : 0;
                 if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
             }
-            if (vk_hud_layer_on() && menu_is_open()) {  // (the settings menu, on the panel: exec.c)
+            if (vk_hud_layer_on() && menu_on_vr_panel()) {  // (the settings menu, on the panel: exec.c)
                 extern TexBackend *vk_vr_menu_over_hud(TexBackend *hud, bool flip);
                 hb = vk_vr_menu_over_hud(hb, renderer_origin_lower_left());
                 g_vr_menu_on_panel = true;
@@ -875,8 +876,8 @@ void backend_present(NvnTexture *t) {
         }
         const double mirror_hz = g_settings.vr_mirror_hz;
         const uint64_t now_ns = SDL_GetTicksNS();
-        const bool mirror_due = menu_is_open() || mirror_hz <= 0 || now_ns >= mirror_next;
-        const bool mirror = (g_vr_config.desktop_mirror || menu_is_open()) && mirror_due && vk_frame_begin(mirror_black);
+        const bool mirror_due = menu_on_vr_panel() || mirror_hz <= 0 || now_ns >= mirror_next;
+        const bool mirror = (g_vr_config.desktop_mirror || menu_on_vr_panel()) && mirror_due && vk_frame_begin(mirror_black);
         if (mirror && mirror_hz > 0) {
             const uint64_t period = (uint64_t)(1e9 / mirror_hz);
             mirror_next = now_ns + period - period / 8 > mirror_next + period ? now_ns + period - period / 8 : mirror_next + period;
