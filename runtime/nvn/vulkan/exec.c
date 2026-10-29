@@ -3980,6 +3980,18 @@ static void draw(CmdRec *r, bool indexed) {
 // in the eyes. The rest renders once, in eye 0, into the HUD texture; eye 1 skips it. False: skip the draw.
 static bool hud_route(Prog *pr) {
     const uint64_t fr1 = renderer_present_count() + 1;
+    const uint64_t fs = st.program ? st.program->stages[1].code_addr : 0;
+    const uint64_t fs_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
+    // Skyward Sword's void-dream flare is five layered four-vertex effect quads using static I8 textures.  Because
+    // they neither sample a scene render target nor carry scene_frame metadata, the generic HUD classifier treated
+    // them as UI and exposed their rectangular bounds on the floating panel.  Captured at the reported frame with
+    // SKYRECOMP_VR_HUD_TRACE; these layers belong in both eyes as part of the cutscene composition.
+    static const uint64_t void_eye_fx[] = {
+        0xc52964779a815b1eull, 0xd98c778c14781ffaull, 0xceabdb297885901aull,
+        0x68482eb700779dacull, 0x434ce7269a7234d6ull,
+    };
+    for (int i = 0; i < (int)(sizeof void_eye_fx / sizeof void_eye_fx[0]); i++)
+        if (fs_hash == void_eye_fx[i]) return true;
     bool reads_scene = false;
     bool reads_screen_rt = false;
     for (int i = 0; i < pr->fi->ntex && i < 64 && !reads_scene; i++) {
@@ -4006,6 +4018,32 @@ static bool hud_route(Prog *pr) {
         if (unit) return true;  // full-screen menu composite: drawn normally in both eyes
     }
     if (vk_vr_eye()) return false;
+    {   // Diagnostic capture for a user-reproduced floating cutscene card.  Log the actual draw routed to the HUD,
+        // including every sampled texture's provenance; do not infer the offending effect from screenshots alone.
+        static int trace = -1;
+        if (trace < 0) trace = getenv("SKYRECOMP_VR_HUD_TRACE") && atoi(getenv("SKYRECOMP_VR_HUD_TRACE")) != 0;
+        if (trace) {
+            static uint64_t seen[512];
+            static int nseen;
+            int k = 0;
+            while (k < nseen && seen[k] != fs_hash) k++;
+            if (k == nseen && nseen < (int)(sizeof seen / sizeof seen[0])) {
+                seen[nseen++] = fs_hash;
+                LOG("[hud-route] first frame %llu fs %016llx draws %llu fullscreen %d scene %d screenrt %d ntex %d rt %ux%u\n",
+                    (unsigned long long)renderer_present_count(), (unsigned long long)fs_hash,
+                    (unsigned long long)(g_hud_rec ? g_hud_rec->x[2] : 0), hud_fullscreen_quad(), reads_scene,
+                    reads_screen_rt, pr->fi->ntex, st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->width : 0,
+                    st.rt.ncolor && st.rt.color[0] ? st.rt.color[0]->height : 0);
+                for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+                    NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+                    const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+                    LOG("[hud-route]   tex%d %ux%u gpu %d scene_frame %llu recent %d label %s\n", i,
+                        t ? t->width : 0, t ? t->height : 0, b ? b->gpu_owned : 0,
+                        (unsigned long long)(b ? b->scene_frame : 0), recently_presented(t), t ? t->label : "-");
+                }
+            }
+        }
+    }
     // Async replay can process the first draws of a new presented frame while renderer_present_count still names the
     // previous one. The frame-number guard may therefore think the HUD was already cleared. The first draw actually
     // routed after each present is an unambiguous boundary: force its transparent clear before preserving this draw.
