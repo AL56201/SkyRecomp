@@ -4068,7 +4068,10 @@ static void draw_(CmdRec *r, bool indexed) {
     const bool mv = mv_for_draw();
     Prog *pr = get_program(st.program, &vkey, &fkey, mv);
     if (!pr || atomic_load(&pr->state) != 1) {
-        if (mv && pr && atomic_load(&pr->state) == 2) mv_blacklist(mv_sig(), "shader");
+        // (only a failure of the multiview rewrite itself: a shader that doesn't translate at all is skipped one eye
+        // at a time too - blacklisting its targets cascaded into every pass reading them, the whole scene included)
+        if (mv && pr && atomic_load(&pr->state) == 2 && pr->vi && pr->vi->msl && pr->fi && pr->fi->msl)
+            mv_blacklist(mv_sig(), "shader");
         stat_skipped++;
         return;
     }
