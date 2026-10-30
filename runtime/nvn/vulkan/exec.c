@@ -22,6 +22,7 @@
 #include "../../vr/vr.h"
 #include "../../vr/vr_rig.h"
 #include "multiview.h"
+#include "../paint_filter.h"
 
 static uint64_t stat_draws, stat_skipped, stat_passes, stat_dispatches, stat_wait_ns, stat_flushes, stat_feedback_copies;
 static uint64_t stat_descriptor_hits, stat_descriptor_misses;
@@ -2790,6 +2791,14 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     if ((si->cbuf_dynamic & (1u << k)) && r.size) size = r.size > 0x10000 ? 0x10000 : r.size;
     if (size > r.size && r.size) size = r.size;
     if (size < 16) size = 16;
+    if (g_settings.watercolor_filter != WATERCOLOR_ORIGINAL && stage == 1 && idx == 2) {
+        NvnTexture *t = si->ntex ? shader_texture_object(1, &si->tex[0]) : NULL;
+        const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+        float local[SKY_PAINT_PARAMS_MAX / sizeof(float)];
+        if (t && b && sky_paint_filter_parameters(local, (const void *)(uintptr_t)r.addr, size, g_cur_fs_hash,
+                g_settings.watercolor_filter, t->width, t->height, b->width, b->height))
+            return ubo_span(vk_transient_copy(local, size, 256), size);
+    }
     // VR stereo: the scene camera block becomes the recording eye's camera in this draw's own copy. Vertex shaders
     // conventionally bind it at uniform slot 0, but fragment shaders do not: the water surface, for example, binds
     // its camera at slot 2 while using it to project the reflection/refraction scene textures. Probe every fragment

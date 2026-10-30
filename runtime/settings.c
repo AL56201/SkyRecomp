@@ -36,6 +36,7 @@ Settings g_settings = {
     .show_fps = false,
     .hd_textures = true,
     .draw_distance = 1.0f,
+    .watercolor_filter = WATERCOLOR_ORIGINAL,
     .vr_mirror_hz = 60,
     .vr_foveation = false,  // (coarser lens edges: a choice, not the default)
     .vr_foveation_inner = 0.60f,
@@ -230,6 +231,9 @@ void settings_load(void) {
         else if (!strcmp(key, "vr_fast_post")) g_settings.vr_fast_post = atoi(val) != 0;
         else if (!strcmp(key, "vr_world_in_menus")) g_settings.vr_world_in_menus = atoi(val) != 0;
         else if (!strcmp(key, "vr_dof")) g_settings.vr_dof = atoi(val) != 0;
+        else if (!strcmp(key, "watercolor_filter"))
+            g_settings.watercolor_filter = !strcmp(val, "off") || !strcmp(val, "0") ? WATERCOLOR_OFF :
+                                           !strcmp(val, "resolution_aware") ? WATERCOLOR_RESOLUTION : WATERCOLOR_ORIGINAL;
         else if (!strcmp(key, "async_replay")) g_settings.async_replay = atoi(val) != 0;
         else if (!strcmp(key, "vr_near_clip")) {
             const float v = (float)atof(val);
@@ -312,6 +316,8 @@ void settings_save(void) {
     fprintf(f, "fullscreen = %d\n", g_settings.fullscreen);
     fprintf(f, "hd_textures = %d\nreshade = %d\nvr = %d\n", g_settings.hd_textures, g_settings.reshade, g_settings.vr);
     fprintf(f, "draw_distance = %.2f\n", g_settings.draw_distance);
+    fprintf(f, "watercolor_filter = %s\n", g_settings.watercolor_filter == WATERCOLOR_OFF ? "off" :
+            g_settings.watercolor_filter == WATERCOLOR_RESOLUTION ? "resolution_aware" : "original");
     fprintf(f, "async_replay = %d\n", g_settings.async_replay);
     fprintf(f, "vr_near_clip = %.1f\n", g_settings.vr_near_clip);
     fprintf(f, "vr_mirror_hz = %d\nvr_foveation = %d\nvr_world_in_menus = %d\nvr_dof = %d\n", g_settings.vr_mirror_hz,
