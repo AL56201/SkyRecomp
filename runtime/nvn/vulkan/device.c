@@ -149,6 +149,8 @@ static void pick_device(void) {
     free(qp);
     if (g_vk.qfam == UINT32_MAX) FATAL("no graphics+present queue\n");
     LOG("[vk] using %s\n", g_vk.props.deviceName);
+    extern void perfmon_set_gpu_hint(const char *n);
+    perfmon_set_gpu_hint(g_vk.props.deviceName);  // (runtime/perfmon.c: the overlay's GPU, NVML's pick)
 }
 
 static bool g_fault_ext;
@@ -175,6 +177,24 @@ void vk_device_fault_report(void) {
     for (uint32_t i = 0; i < c.vendorInfoCount; i++)
         LOG("[vk]   vendor: %s (code %#llx data %#llx)\n", vend[i].description, (unsigned long long)vend[i].vendorFaultCode,
             (unsigned long long)vend[i].vendorFaultData);
+}
+
+void vk_pipeline_cache_save(void);
+static void vk_pipeline_cache_save_(void);
+
+// Saves the pipeline cache every minute while it grows, not only at exit, so a crash or a killed process keeps the
+// session's pipelines (arg: the size loaded at startup)
+static int pcache_saver(void *arg) {
+    size_t last = *(size_t *)arg;
+    for (;;) {
+        SDL_Delay(60000);
+        size_t sz = 0;
+        if (vkGetPipelineCacheData(g_vk.dev, g_vk.pcache, &sz, NULL) == VK_SUCCESS && sz > last) {
+            vk_pipeline_cache_save();
+            last = sz;
+        }
+    }
+    return 0;
 }
 
 static void create_device(void) {
@@ -375,6 +395,9 @@ static void create_device(void) {
     }
     LOG("[vk] pipeline cache: %s (%zu bytes)\n", sz ? "loaded" : "new", sz);
     free(data);
+    static size_t loaded;
+    loaded = sz;
+    SDL_DetachThread(SDL_CreateThread(pcache_saver, "pcache", &loaded));
 }
 
 void vk_pipeline_cache_save(void) {
@@ -1147,6 +1170,19 @@ present_complete:
     }
     extern void vk_pace_frame(void);
     vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
+    extern void perfmon_frame(void);
+    extern void perfmon_set_gpu_mem(float game_mb, float total_mb);
+    perfmon_frame();  // (runtime/perfmon.c: the performance overlay's frame times)
+    if (total_frames % 30 == 0 && g_vk.vma) {  // the game's device-local allocations (VMA's count), and those heaps' size
+        VmaBudget b[VK_MAX_MEMORY_HEAPS];
+        const VkPhysicalDeviceMemoryProperties *mp;
+        vmaGetHeapBudgets(g_vk.vma, b);
+        vmaGetMemoryProperties(g_vk.vma, &mp);
+        uint64_t used = 0, size = 0;
+        for (uint32_t i = 0; i < mp->memoryHeapCount; i++)
+            if (mp->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) used += b[i].usage, size += mp->memoryHeaps[i].size;
+        perfmon_set_gpu_mem(used / 1048576.0f, size / 1048576.0f);
+    }
     extern bool nvn_async_on(void);
     if (!nvn_async_on()) present_game_hooks(total_frames);  // (async replay: run by the game thread, nvn/async.c)
     extern void vk_level_change_check(void);

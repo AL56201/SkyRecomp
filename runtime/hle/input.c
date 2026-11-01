@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +19,7 @@
 #include "../vr/vr_rig.h"
 #include "../input_bind.h"
 #include "stick.h"
+#include "motion.h"
 #include "../frame_rate.h"
 
 extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up
@@ -40,6 +42,10 @@ static bool mouse_skip_motion;
 static _Atomic int32_t mouse_dx, mouse_dy, mouse_rx, mouse_ry;
 static _Atomic int32_t mouse_slash_x, mouse_slash_y;
 static _Atomic uint64_t mouse_slash_until, mouse_shield_until;
+// Hold and swing: while left is held, the mouse's travel since the press is the sword stick (mouse_sx / mouse_sy, kept in
+// its circle), so a flick swings that way and the game's own stick gestures work; mouse_swung: it went past half tilt
+static _Atomic bool mouse_swinging, mouse_swung;
+static _Atomic int32_t mouse_sx, mouse_sy;
 static uint64_t mouse_frame_ns;
 
 static bool mouse_unbound(int button) {
@@ -62,6 +68,13 @@ static void mouse_frame(uint64_t now) {
     int32_t dx = atomic_exchange(&mouse_dx, 0), dy = atomic_exchange(&mouse_dy, 0);
     mouse_rx = (int32_t)fmax(-32767, fmin(32767, dx * gain));
     mouse_ry = (int32_t)fmax(-32767, fmin(32767, -dy * gain));
+    if (mouse_swinging) {  // (full tilt: 60 pixels of travel at 1x)
+        double k = 32767.0 / (60 * 256) * g_settings.mouse_sens;
+        double x = mouse_sx + dx * k, y = mouse_sy - dy * k, r = hypot(x, y);
+        if (r > 32767) x *= 32767 / r, y *= 32767 / r;
+        mouse_sx = (int32_t)x, mouse_sy = (int32_t)y;
+        if (r > 16384) mouse_swung = true;
+    }
 }
 
 // Host keys / buttons held by a test script (LARECOMP_HOST_INPUT, input_frame): they go through the bindings
@@ -133,6 +146,8 @@ void input_reset(void) {
     atomic_store(&mouse_btn_x2, false);
     mouse_dx = mouse_dy = mouse_rx = mouse_ry = 0;
     mouse_slash_until = mouse_shield_until = 0;
+    mouse_swinging = mouse_swung = false;
+    mouse_sx = mouse_sy = 0;
     recompute_keyboard();
 }
 
@@ -181,7 +196,8 @@ bool input_user_blocked(const SDL_Event *e) {
     case SDL_EVENT_MOUSE_MOTION: case SDL_EVENT_MOUSE_BUTTON_DOWN: case SDL_EVENT_MOUSE_BUTTON_UP:
     case SDL_EVENT_MOUSE_WHEEL:
     case SDL_EVENT_GAMEPAD_ADDED: case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
-    case SDL_EVENT_GAMEPAD_BUTTON_UP: case SDL_EVENT_JOYSTICK_ADDED: case SDL_EVENT_JOYSTICK_AXIS_MOTION:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP: case SDL_EVENT_GAMEPAD_SENSOR_UPDATE: case SDL_EVENT_JOYSTICK_ADDED:
+    case SDL_EVENT_JOYSTICK_AXIS_MOTION:
     case SDL_EVENT_JOYSTICK_BUTTON_DOWN: case SDL_EVENT_JOYSTICK_BUTTON_UP:
         return true;
     default:
@@ -220,6 +236,66 @@ int input_pad_family(void) {
     }
     return env >= 0 ? env : pad_family;
 }
+// A controller is open (or LARECOMP_PAD_TYPE pretends one): Auto prompts follow it, else the keyboard's
+bool input_pad_connected(void) { return pad || getenv("LARECOMP_PAD_TYPE"); }
+
+// The controller's motion, for the game's six-axis sensor (gyro aiming and the motion camera, which the game offers
+// with a Pro Controller): written by sensor events on the main thread, read by GetSixAxisSensorState on the game's.
+// Switch units and axes (runtime/hle/motion.h): acceleration in g, angular velocity in rotations / s, angle in
+// rotations, q the controller's orientation since it was connected.
+static pthread_mutex_t motion_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct { bool on; float acc[3], vel[3], angle[3], q[4]; uint64_t t; } motion = {.q = {0, 0, 0, 1}};
+
+static void motion_reset(bool on) {
+    pthread_mutex_lock(&motion_lock);
+    memset(&motion, 0, sizeof motion);
+    motion.q[3] = 1;
+    motion.on = on;
+    pthread_mutex_unlock(&motion_lock);
+}
+
+static const MotionMap *motion_axes(void) {  // (main thread only)
+    static MotionMap m;
+    static bool done;
+    if (!done) {
+        done = true;
+        const char *e = getenv("LARECOMP_GYRO_MAP");
+        if (!e || !motion_parse_map(e, &m)) {
+            if (e) LOG("[input] LARECOMP_GYRO_MAP=%s: not like \"x,-z,y\", ignored\n", e);
+            motion_parse_map("x,-z,y", &m);
+        }
+    }
+    return &m;
+}
+
+static void motion_sample(const SDL_GamepadSensorEvent *s) {
+    float v[3];
+    motion_map(motion_axes(), s->data, v);
+    bool menu = menu_input_captured();  // (the overlay has the controls: the aim stays where it was, no jump after)
+    uint64_t t = s->sensor_timestamp ? s->sensor_timestamp : s->timestamp;
+    pthread_mutex_lock(&motion_lock);
+    if (s->sensor == SDL_SENSOR_ACCEL) {
+        for (int i = 0; i < 3; i++) motion.acc[i] = -v[i] / SDL_STANDARD_GRAVITY;  // (SDL: the push against gravity)
+    } else if (s->sensor == SDL_SENSOR_GYRO) {
+        float dt = motion.t && t > motion.t ? (float)((double)(t - motion.t) * 1e-9) : 0;
+        if (dt > 0.1f) dt = 0;  // (a gap: the controller slept, or events were held up)
+        motion.t = t;
+        // (gyro_sens scales the turn, so the angle and orientation below follow it too; a third-party pad in
+        // Switch mode can report a much faster gyro than a Pro Controller)
+        for (int i = 0; i < 3; i++) motion.vel[i] = menu ? 0 : v[i] / (2 * (float)M_PI) * g_settings.gyro_sens;
+        for (int i = 0; i < 3; i++) motion.angle[i] += motion.vel[i] * dt;
+        motion_integrate(motion.q, motion.vel, dt);
+    }
+    pthread_mutex_unlock(&motion_lock);
+}
+
+static void pad_opened(void) {  // its name, its button prompts, its gyro (DualSense, DualShock 4, Switch controllers)
+    bool gyro = SDL_GamepadHasSensor(pad, SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_GYRO, true);
+    if (gyro && SDL_GamepadHasSensor(pad, SDL_SENSOR_ACCEL)) SDL_SetGamepadSensorEnabled(pad, SDL_SENSOR_ACCEL, true);
+    LOG("[input] gamepad: %s (%s)\n", SDL_GetGamepadName(pad), gyro ? "gyro" : "no gyro");
+    note_family();
+    motion_reset(gyro);
+}
 
 void input_handle_event(const SDL_Event *e) {
     static bool scanned;  // pads present at startup: their ADDED event may have gone to the start screen's loop
@@ -227,7 +303,7 @@ void input_handle_event(const SDL_Event *e) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        if (n > 0 && !pad && (pad = SDL_OpenGamepad(ids[0]))) pad_opened();
         SDL_free(ids);
     }
     switch (e->type) {
@@ -263,21 +339,24 @@ void input_handle_event(const SDL_Event *e) {
             if (down && mouse_captured && mouse_unbound(btn)) {
                 uint64_t now = SDL_GetTicks();
                 if (btn == SDL_BUTTON_LEFT && !((key_buttons | pad_buttons) & (1ull << BTN_ZR)) && !mouse_item_mode()) {
-                    int32_t x = mouse_rx, y = mouse_ry;
-                    if (abs(x) + abs(y) < 4000) x = 32767, y = 0;
-                    mouse_slash_x = x < -4000 ? -32767 : x > 4000 ? 32767 : 0;
-                    mouse_slash_y = y < -4000 ? -32767 : y > 4000 ? 32767 : 0;
-                    mouse_slash_until = now + 100;
+                    mouse_sx = mouse_sy = 0;
+                    mouse_swung = false;
+                    mouse_swinging = true;
                 }
                 if (btn == SDL_BUTTON_RIGHT && !mouse_item_mode()) mouse_shield_until = now + 80;
+            }
+            if (!down && btn == SDL_BUTTON_LEFT && mouse_swinging) {  // released without swinging: a horizontal slash
+                mouse_swinging = false;
+                mouse_sx = mouse_sy = 0;
+                if (!mouse_swung && !mouse_item_mode()) mouse_slash_x = 32767, mouse_slash_y = 0, mouse_slash_until = SDL_GetTicks() + 100;
             }
         }
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        if (!pad && (pad = SDL_OpenGamepad(e->gdevice.which))) pad_opened();
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
+        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); motion_reset(false); }
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION:
@@ -290,6 +369,9 @@ void input_handle_event(const SDL_Event *e) {
         break;
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
         recompute_pad();
+        break;
+    case SDL_EVENT_GAMEPAD_SENSOR_UPDATE:
+        if (pad && !host_test && SDL_GetGamepadID(pad) == e->gsensor.which) motion_sample(&e->gsensor);
         break;
     }
 }
@@ -601,17 +683,21 @@ static bool mouse_input(uint64_t *buttons, int32_t *rx, int32_t *ry, uint64_t no
     bool item = item_mode || (b & (1ull << BTN_ZR)) != 0;
     if (item_mode && mouse_btn_left && mouse_unbound(SDL_BUTTON_LEFT)) b |= 1ull << BTN_ZR;
     bool slash = !item && now < mouse_slash_until && mouse_unbound(SDL_BUTTON_LEFT);
+    bool swing = !item && mouse_swinging;
     // A click starts at neutral, then flicks the stick; time-based pulses work at both 60 and 120 FPS.
-    if (slash) {
+    if (swing) {
+        *rx = mouse_sx;
+        *ry = mouse_sy;
+    } else if (slash) {
         bool neutral = mouse_slash_until - now > 80;
         *rx = neutral ? 0 : mouse_slash_x;
         *ry = neutral ? 0 : mouse_slash_y;
     } else if (item || (b & (1ull << BTN_R)) || (free_cam_on && !(b & (1ull << BTN_ZL)))) {
         *rx = clamp_axis(*rx + mouse_rx); *ry = clamp_axis(*ry + mouse_ry);
     }
-    if (slash || thrust || item_mode) b &= ~(1ull << BTN_L);
+    if (slash || swing || thrust || item_mode) b &= ~(1ull << BTN_L);
     *buttons = b;
-    return slash || thrust || item_mode;
+    return slash || swing || thrust || item_mode;
 }
 
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
@@ -746,6 +832,7 @@ HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullk
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", hid_state_dual) {
     note_state("JoyDual");
     fill_state(c, 1u | 1u << 2 | 1u << 4);
+}
 }
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left) {
     note_state("JoyLeft");

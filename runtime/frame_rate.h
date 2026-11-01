@@ -9,3 +9,9 @@ bool rt_headset_paced(void);  // VR at a high frame rate: OpenXR's frame wait pa
 extern int g_rt_headset_hz;   // (vr.c) the headset's nominal refresh rate while a session runs, else 0
 float rt_sky_frame_step(float original);
 float rt_sky_frame_ms(float original);
+// The game's own swap interval, as its frame timer reads it (runtime/hle/framepace.c): 1 = 60 Hz, 2 = the game's
+// own 30 fps mode (its frame timer advances two world steps per frame then). On a console the compositor holds
+// each present that many vsyncs; here the present pacer (hle/framepace.c rt_present_pace) does, so the world keeps real-time
+// speed - without it a 30 fps mode presents at 60 and every animation runs twice as fast.
+void rt_game_interval_seen(uint32_t interval);
+uint32_t rt_game_interval(void);

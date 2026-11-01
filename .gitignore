@@ -74,3 +74,4 @@ zig/
 /ReShade*.ini
 /ReShade*.log*
 /HenrikoMagnifico_*.ini
+/patched/

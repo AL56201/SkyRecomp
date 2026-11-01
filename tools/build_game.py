@@ -44,7 +44,9 @@ except FileNotFoundError:
     CACHE_VALID = False
 
 BASE_CFLAGS = [
-    "-O0",
+    "-O1",
+    "-g0",
+    "-DNDEBUG",
     "-fno-strict-aliasing",
     "-Wno-return-type",
     "-Wno-unused-label",
