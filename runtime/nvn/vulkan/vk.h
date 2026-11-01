@@ -36,7 +36,7 @@ typedef struct {
     VkPipelineCache pcache;
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
-    bool custom_border, divisor, host_import, logic_op;
+    bool custom_border, divisor, host_import, logic_op, mirror_clamp;
     // VR fixed foveated shading (VK_KHR_fragment_shading_rate, attachment rates): texel size of the rate image and
     // the coarsest rates the device supports (exec.c vrs_*)
     bool vrs;

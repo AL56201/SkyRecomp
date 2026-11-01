@@ -32,6 +32,7 @@ extracted/*.id
 ssh_generated/
 
 # Build artifacts, caches, and local saves
+.codex/
 /skyrecomp.exe
 /skyrecomp.dll.a
 /*.dll

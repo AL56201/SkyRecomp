@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <shellapi.h>
@@ -10,6 +11,28 @@
 #include <wchar.h>
 
 #include "../platform.h"
+
+// stderr stays unbuffered for crash diagnostics. Formatting directly into it makes the Windows CRT issue
+// many tiny writes on the calling (often render) thread. Preserve immediate logs with one write per message.
+void rt_log(const char *format, ...) {
+    char local[2048];
+    va_list args, copy;
+    va_start(args, format);
+    va_copy(copy, args);
+    int count = vsnprintf(local, sizeof local, format, args);
+    va_end(args);
+    if (count >= 0 && (size_t)count < sizeof local) {
+        fwrite(local, 1, (size_t)count, stderr);
+    } else if (count >= 0) {
+        char *large = malloc((size_t)count + 1);
+        if (large) {
+            vsnprintf(large, (size_t)count + 1, format, copy);
+            fwrite(large, 1, (size_t)count, stderr);
+            free(large);
+        }
+    }
+    va_end(copy);
+}
 
 // ---- guest address space
 // The window is reserved up front and committed per region (plat_commit from the loader / kernel). Anything

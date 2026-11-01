@@ -1,7 +1,51 @@
 # Experimental SteamVR / OpenXR support
 
-VR is opt-in and off by default. Start SteamVR, then use **Enable VR Mode** in VR Options to enter or leave VR live.
+VR is opt-in and off by default. Use **Enable VR Mode** in VR Options to enter or leave VR live.
 `SKYRECOMP_VR=0` / `=1` before launch overrides the saved setting.
+
+The launcher always opens on desktop without starting OpenXR or asking for a play mode. After **Play**, if VR is
+enabled, Windows requests SteamVR startup once if necessary. Desktop play continues while its server and compositor
+start. Once both have been present for three seconds, the game connects to OpenXR and switches into VR when the
+session is ready. Failed connections retry every ten seconds; SteamVR starting later is detected automatically.
+Disabling VR stops automatic connection attempts. Returning to the launcher disconnects VR.
+
+On Windows, name entry keeps the normal game update and stereo render loop running behind the keyboard panel.
+Only the game's naming callback waits for the answer, on its own native and guest stacks; it resumes and writes
+the name after confirmation. Fresh left/right views follow head movement while background animations continue.
+This also applies when VR is enabled but SteamVR is still starting. Other platforms retain the synchronous
+name-entry fallback for now.
+
+Automatic VR pointer calibration runs without opening the game's `SYS_GYRO_00` message or triggering its UI sounds.
+The direct gyro-reset routine uses its native silent branch, bypassing the separate `0x13bd` reset sound and
+its sound-driven feedback. A temporary native gate rejects duplicate reset calls without holding that feedback
+state across rendered frames. Desktop reset behavior remains unchanged.
+The calibration and cleanup steps still execute, while background music keeps playing at the normal volume.
+The centered sensor baseline settles during startup and while the name keyboard is open, before the native
+calibration wait. If it is not ready, calibration still waits for the required samples rather than using an
+unstable baseline.
+Calibration callbacks preserve the native HUD layout visibility, and the renderer keeps drawing the HUD throughout
+the reset. No captured menu image is substituted for the live layouts.
+
+On Windows, runtime logs are formatted before writing to unbuffered stderr, so routine VR diagnostics issue
+one write per message instead of many small writes on the render thread.
+
+Standard solid-colour game fades use a final head-locked OpenXR quad overlay covering the headset view, including
+the floating HUD, wrist panels, keyboard and pointer. The renderer reads the game's actual uniform RGBA and
+projects its four vertices to identify a full-view fade; overlapping fades retain their alpha blending order.
+Textured backgrounds, partial rectangles, and depth/stencil-clipped draws retain their native routing.
+The desktop VR mirror shows the same full-view coverage. `SKYRECOMP_VR_FADE_TRACE=1` traces extraction and
+composition; `SKYRECOMP_VR_FULL_VIEW_FADE=0` restores native fade routing for diagnosis.
+Black-fade transmission is converted from the game's display blend space to OpenXR linear light, preventing
+bright logos/effects from remaining conspicuous through near-black fades. The native mirror opacity is retained.
+The veil uses a single-image overlay swapchain and is submitted after the HUD/menu overlays. SteamVR composited-eye
+captures verify that the opaque startup fade covers the title logo, then reveals it as the fade opens.
+The shared draw handler also covers non-blended opaque fills between fade-out and fade-in, including the black
+hold after confirming a new save name. An opaque background followed by ordinary content remains local to its
+panel; consecutive fade fills retain their native ordering. The opaque hold is not mistaken for the end of a fade.
+
+For shortcuts, `skyrecomp.exe --desktop` forces desktop mode; `skyrecomp.exe --vr` enables automatic VR connection
+after Play. These flags override `SKYRECOMP_VR` for that process. Other OpenXR runtimes use their normal API readiness
+checks; automatic SteamVR process detection and launching currently apply to Windows.
 
 This build covers VR rendering (stereo output, the head-tracked camera in 1st / 3rd person, culling, per-eye visual
 fixes, performance), the HUD panel / world behind menus / wrist HUD, and the VR controllers as the game's Joy-Con
@@ -21,8 +65,9 @@ restores the mirror so its settings remain visible.
 pressure, down to Adaptive Minimum. It raises quality again gradually after sustained headroom and requires no eye
 tracking, so it works with Valve Index.
 
-Failure to find an OpenXR loader, an active runtime, a headset, a compatible Vulkan version or the headset's GPU is
-not fatal: the reason is logged (`[vr]`) and the game runs on the desktop as usual.
+Failures reported by the OpenXR API are logged (`[vr]`); desktop play continues while connection retries wait.
+Waiting for SteamVR's compositor avoids entering the driver with only its server running. This is a readiness
+check, not isolation from arbitrary driver crashes. `--desktop` bypasses OpenXR entirely.
 
 ## Build dependency
 
@@ -167,7 +212,9 @@ against near = 1: only the head pieces differ (no fog, depth-of-field or depth-f
   plain blit). Rendered above the headset's size (VR Resolution > 1): a filtered downscale (shaders.c `down.frag`, a
   tent over one output pixel, 16 bilinear taps - a bilinear blit skipped most of a 1.5-2x image, so supersampling
   kept its aliasing), SMAA at the headset's size, a light RCAS sharpen. Below it: SMAA, then the Video tab's upscaler
-  (FSR 1 / NIS). SMAA follows the Video tab's "Anti-aliasing". Cost at 1.5x: 0.66 ms per eye.
+  (FSR 1 / NIS). At native resolution: optional SMAA without sharpening, to avoid amplifying subpixel shimmer on
+  thin geometry such as Skyloft's ladders and fences. Fast VR Post-Processing bypasses these optional passes.
+  SMAA follows the Video tab's "Anti-aliasing". Cost at 1.5x: 0.66 ms per eye.
   The desktop window does the same when the internal resolution is above the window's size (exec.c
   `post_process`; 2x into 1280x720: jagged edges before, ~0.15 ms; `LARECOMP_POST_DOWN=0`: the old bilinear present).
 - Depth targets a draw samples while they are attached, without writing them (title screen, file select), are read

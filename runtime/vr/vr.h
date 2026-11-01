@@ -1,5 +1,5 @@
 // Optional OpenXR / SteamVR output (runtime/vr.c). The desktop renderer never depends on an XR runtime: every entry
-// point is a no-op unless VR was enabled before launch and OpenXR started.
+// point is a no-op until VR is enabled and OpenXR connects after Play.
 //
 // Frame model (all calls on the renderer thread):
 //   vr_frame_begin()          first command list of a frame: xrWaitFrame + xrBeginFrame + xrLocateViews. Both eyes
@@ -29,7 +29,11 @@ typedef struct {         // nn::hid::SixAxisSensorState's payload
 } VrJoyConSensor;
 
 // ---- lifecycle
-bool vr_requested(void);  // settings "vr" (or SKYRECOMP_VR=0/1); decides the Vulkan extensions asked for
+bool vr_requested(void);  // settings "vr" (or SKYRECOMP_VR=0/1); automatic connection preference
+void vr_set_game_active(bool active);  // Play / return to launcher; never connects from the launcher
+bool vr_game_active(void);
+bool vr_runtime_ready(void);  // does not load OpenXR
+void vr_runtime_start(void);  // asynchronous request to start the configured runtime
 // After the Vulkan instance and device exist. Vulkan handles are opaque to keep Vulkan out of this header.
 bool vr_vulkan_init(void *instance, void *physical_device, void *device, uint32_t queue_family, uint32_t queue_index);
 void vr_shutdown(void);
@@ -70,6 +74,9 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
 // frame_is_3d: this frame drew a 3D scene; its eyes become that "last 3D frame".
 void vr_freeze_world(bool freeze, bool frame_is_3d);
 bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint32_t h, bool flip_y, bool opaque);
+// Premultiplied game fade, composited over all submitted game/headset layers in both full eye FOVs.
+bool vr_record_view_fade(void *command_buffer, const float rgba[4]);
+bool vr_view_fade_available(void);
 // Latest OpenXR grip poses (vr_input.c) for the wrist HUD: {qx, qy, qz, qw, px, py, pz} in the local space.
 void vr_set_grip_poses(bool left_tracked, const float left_pose[7], bool right_tracked, const float right_pose[7]);
 void vr_frame_end(void);

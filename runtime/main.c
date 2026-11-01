@@ -152,6 +152,7 @@ static void reboot_idle(void) {  // (main thread, while guest threads stop) keep
 }
 
 static void teardown(void) {
+    vr_set_game_active(false);
     uint64_t t0 = plat_now_ns();
     if (atomic_exchange(&diagnostic_running, false)) pthread_join(diagnostic_thread, NULL);
     kernel_stop_threads(reboot_idle);
@@ -171,6 +172,7 @@ static void teardown(void) {
 }
 
 static void boot(const char *root) {
+    vr_set_game_active(true);
     char exefs[1024], romfs[1024], npdm_path[1024];
     snprintf(exefs, sizeof exefs, "%s/exefs", root);
     snprintf(romfs, sizeof romfs, "%s/romfs", root);
@@ -185,6 +187,7 @@ static void boot(const char *root) {
     settings_game_started();
     kernel_init();
     dispatch_init();
+    { extern void swkbd_live_init(void); swkbd_live_init(); }
     { extern void custom_tex_init(void); custom_tex_init(); }
     { extern void motion_vr_init(void); motion_vr_init(); }  // VR: skip the obsolete Joy-Con calibration modal
     { extern void vr_world_init(void); vr_world_init(); }  // (VR: the world keeps drawing behind the map)
@@ -222,13 +225,20 @@ int main(int argc, char **argv) {
 #endif
     const char *root = "extracted";  // (in the data root)
     bool skip_launcher = getenv("LARECOMP_NO_LAUNCHER") || getenv("LARECOMP_INPUT");  // tests boot straight in
+    int launch_vr = -1;
     static char arg_root[1024];
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--play")) skip_launcher = true;
+        else if (!strcmp(argv[i], "--desktop")) launch_vr = 0;
+        else if (!strcmp(argv[i], "--vr")) launch_vr = 1;
         else if (argv[i][0] != '-' && !realpath(argv[i], arg_root)) root = argv[i];  // (relative to where we started)
         else if (argv[i][0] != '-') root = arg_root;
     }
     rt_paths_init();  // the data root becomes the working directory (runtime/paths.h)
+    settings_load();
+    // Explicit shortcuts override the saved preference; normal launches always open the desktop launcher.
+    if (launch_vr >= 0) setenv("SKYRECOMP_VR", launch_vr ? "1" : "0", 1);
+    if (getenv("SKYRECOMP_VR")) g_settings.vr = atoi(getenv("SKYRECOMP_VR")) != 0;
     for (bool title = !skip_launcher;;) {
         if (title) {  // start screen (runtime/ui/launcher.mm): game files setup, seed choice, settings
             extern void launcher_run(const char *root);

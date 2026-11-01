@@ -373,6 +373,11 @@ class Module:
             out.append('}')
             return out
         out.append(f'    FN_ENTER({hx(entry)});')
+        motion_reset = self.is_skyward and entry == self.base + 0xdd1a68
+        if motion_reset:
+            out.append('    extern uint64_t rt_sky_motion_reset_begin(Cpu *);')
+            out.append('    extern void rt_sky_motion_reset_end(uint64_t);')
+            out.append('    uint64_t motion_reset_start = rt_sky_motion_reset_begin(c);')
         batch = []
         refs = set()
 
@@ -408,6 +413,10 @@ class Module:
             if a in labels:
                 flush()
                 out.append(f'L_{a:x}:;')
+            if motion_reset and a == self.base + 0xdd23e4:
+                flush()
+                out.append('    { extern int rt_sky_motion_quiet_reset(void); '
+                           f'if (rt_sky_motion_quiet_reset()) {{ {jump(self.base + 0xdd2450)} }} }}')
             if self.is_las and (a - self.base) in RANDO_CODE:  # randomizer patch site: the active seed picks the instruction
                 flush()
                 out.append(f'    {{ extern uint32_t rando_word(uint64_t); uint32_t rw = rando_word({hx(a)});')
@@ -478,6 +487,8 @@ class Module:
                     continue
                 out.append(f'    c->pc = {ins.target}; __attribute__((musttail)) return rt_dispatch(c);')
             elif k == 'ret':
+                if motion_reset:
+                    out.append('    rt_sky_motion_reset_end(motion_reset_start);')
                 out.append('    return;')
             last = k
         flush()

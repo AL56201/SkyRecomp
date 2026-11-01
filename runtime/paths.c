@@ -46,6 +46,26 @@ static bool is_dir(const char *p) {
     return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+bool rt_same_path(const char *a, const char *b) {
+#ifdef _WIN32
+    // Compare file identities so junctions, symlinks and hard links cannot bypass the copy guard.
+    HANDLE ha = CreateFileA(a, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    HANDLE hb = CreateFileA(b, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                            OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    BY_HANDLE_FILE_INFORMATION ia, ib;
+    bool same = ha != INVALID_HANDLE_VALUE && hb != INVALID_HANDLE_VALUE &&
+                GetFileInformationByHandle(ha, &ia) && GetFileInformationByHandle(hb, &ib) &&
+                ia.dwVolumeSerialNumber == ib.dwVolumeSerialNumber &&
+                ia.nFileIndexHigh == ib.nFileIndexHigh && ia.nFileIndexLow == ib.nFileIndexLow;
+    if (ha != INVALID_HANDLE_VALUE) CloseHandle(ha);
+    if (hb != INVALID_HANDLE_VALUE) CloseHandle(hb);
+    if (same) return true;
+#endif
+    char ra[1100], rb[1100];
+    return resolve(a, ra, sizeof ra) && resolve(b, rb, sizeof rb) && path_eq(ra, rb);
+}
+
 static bool exists(const char *p) {
     struct stat st;
     return stat(p, &st) == 0;

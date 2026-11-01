@@ -44,7 +44,8 @@ GENFLAGS := $(OPTFLAGS) $(LTOFLAGS) -fno-strict-aliasing -Wno-return-type -Wno-u
 
 # The game code (made by `make gen` from your own game files) is its own library next to the app (runtime/gamelib.h);
 # the app itself holds none of it
-GEN_SRC  := $(wildcard $(GEN)/main/*.c) $(wildcard $(GEN)/sdk/*.c)
+GEN_MODULES := main sdk subsdk0 subsdk1
+GEN_SRC  := $(foreach module,$(GEN_MODULES),$(wildcard $(GEN)/$(module)/*.c))
 GEN_OBJ  := $(patsubst %.c,$(B)/obj/%.o,$(patsubst $(GEN)/%,%,$(GEN_SRC))) $(B)/obj/tools/gamelib_entry.o
 RT_SRC   := $(wildcard runtime/*.c) $(wildcard runtime/vr/*.c) $(wildcard runtime/hle/*.c) $(wildcard runtime/services/*.c) \
             $(wildcard runtime/nvn/*.c) $(wildcard runtime/nvn/maxwell/*.c) runtime/platform/$(PLATFORM).c
@@ -111,6 +112,12 @@ GAMELIB  := $(B)/skygame.dll
 LDFLAGS  += -Wl,--export-all-symbols -Wl,--out-implib,$(B)/skyrecomp.dll.a
 GAMELIB_LDFLAGS := -shared -fuse-ld=lld $(B)/skyrecomp.dll.a
 GAMELIB_SHARED := -shared  # (+ the import library: runtime/gamebuild.c)
+# OpenXR is loaded dynamically, so ldd on the executable does not discover it. Keep the installed loader next
+# to local executables too; launching from Explorer must not depend on the compiler's bin directory in PATH.
+OPENXR_LOADER ?= $(firstword $(wildcard $(DEPS)/bin/openxr_loader.dll $(DEPS)/bin/libopenxr_loader.dll \
+                    $(dir $(shell command -v $(firstword $(CC))))openxr_loader.dll \
+                    $(dir $(shell command -v $(firstword $(CC))))libopenxr_loader.dll))
+VR_RUNTIME_DLL := $(if $(OPENXR_LOADER),$(B)/$(notdir $(OPENXR_LOADER)))
 endif
 
 # GAMELIB_ID: what the game code library is built from (the generator, the headers it is compiled against, the
@@ -118,7 +125,7 @@ endif
 GAMELIB_SRCS := tools/gen.py tools/lifter.py tools/analyze.py tools/nso.py tools/passes.py tools/patches.py \
                 tools/simd_c.py tools/rando/patch_variants.json tools/gamelib_entry.c runtime/hle/hle_symbols.txt \
                 runtime/cpu.h runtime/simd.h runtime/simd_fp.h runtime/gamelib.h
-GAMELIB_ID ?= 5e5bafbb450f894b
+GAMELIB_ID ?= dd813db2801b3003
 
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC)) $(patsubst runtime/%.cpp,$(B)/rt/%.o,$(RT_CPP_SRC))
 RTFLAGS  := $(OPTFLAGS) $(LTOFLAGS) $(GENARCH) -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn -DGAMELIB_ID='"$(GAMELIB_ID)"' $(DEPINC) $(OSFLAGS)
@@ -131,6 +138,13 @@ GAMELIB_LDFLAGS += $(LTOFLAGS)
 GAMELIB_SHARED  += $(LTOFLAGS)
 
 all: $(EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))
+
+ifneq ($(strip $(VR_RUNTIME_DLL)),)
+$(EXE): | $(VR_RUNTIME_DLL)
+$(VR_RUNTIME_DLL): $(OPENXR_LOADER)
+	@mkdir -p $(dir $@)
+	cp $< $@
+endif
 
 $(B)/obj/%.o: $(GEN)/%.c runtime/cpu.h
 	@mkdir -p $(dir $@)
@@ -156,7 +170,9 @@ $(B)/rt/%.o: runtime/%.c $(RT_HDRS)
 # the string literals ends them early on macOS clang)
 $(B)/inc/smaa_hlsl.inc: third_party/smaa/SMAA.hlsl
 	@mkdir -p $(dir $@)
-	LC_ALL=C tr -d '\r' < $< | LC_ALL=C tr '\200-\377' '?' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' > $@
+	LC_ALL=C tr -d '\r' < $< | LC_ALL=C tr '\200-\377' '?' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/^/"/' -e 's/$$/\\n"/' > $@.tmp
+	@test -s $@.tmp
+	@mv -f $@.tmp $@
 $(B)/rt/nvn/smaa_data.o: $(B)/inc/smaa_hlsl.inc
 $(B)/rt/nvn/smaa_data.o: RTFLAGS += -I$(B)/inc -Ithird_party/smaa/Textures
 
@@ -180,7 +196,8 @@ $(EXE): $(RT_OBJ) $(BACKEND_OBJ) $(UI_OBJ) $(IMGUI_OBJ)
 
 # its id file (<library>.id) says what it was built from without loading it (runtime/gamelib.c)
 $(GAMELIB): $(GEN_OBJ) | $(EXE)
-	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp $^
+	$(file >$@.rsp,$^)
+	$(CC) $(GAMELIB_LDFLAGS) -o $@.tmp @$@.rsp
 	mv -f $@.tmp $@
 	echo $(GAMELIB_ID) > $@.id
 
@@ -206,6 +223,8 @@ PY := $(firstword $(wildcard tools/venv/bin/python) $(wildcard tools/venv/Script
 gen:
 	cd tools && ../$(PY) gen.py sdk ../extracted/exefs/sdk 0x7030000000 ../$(GEN)/sdk --hle ../runtime/hle/hle_symbols.txt $(GENSIMD)
 	cd tools && ../$(PY) gen.py main ../extracted/exefs/main 0x7000000000 ../$(GEN)/main $(GENSIMD)
+	cd tools && ../$(PY) gen.py subsdk0 ../extracted/exefs/subsdk0 0x7032000000 ../$(GEN)/subsdk0 $(GENSIMD)
+	cd tools && ../$(PY) gen.py subsdk1 ../extracted/exefs/subsdk1 0x7034000000 ../$(GEN)/subsdk1 $(GENSIMD)
 
 gen-objs: $(GEN_OBJ)
 
@@ -273,6 +292,7 @@ dist:
 	cp -R build/helper/rando-gen "$(DIST)/"
 	PATH="$(CURDIR)/build/deps-win/bin:$$PATH" ldd $(WIN_B)/skyrecomp.exe | awk '(/ucrt64/ || /deps-win/) && !/vulkan-1/ {print $$3}' | sort -u | \
 	    xargs -I{} cp -u {} "$(DIST)/"
+	$(if $(OPENXR_LOADER),cp "$(OPENXR_LOADER)" "$(DIST)/",:)
 	! ls "$(DIST)" | grep -iE 'x264|x265|xvid|postproc'  # (no GPL codec libraries in the release)
 	$(PACK_PY) tools/fetch_reshade.py --output "$(DIST)/reshade"
 	$(PACK_PY) tools/package_visuals.py --source "$(VISUAL_PACK)" --output "$(DIST)"

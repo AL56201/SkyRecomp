@@ -1,7 +1,8 @@
 // Software keyboard (naming Link on a new file, ...). On the Switch nn::swkbd::ShowKeyboard launches the keyboard
 // library applet; our am service has no applets, so the game crashed. ShowKeyboard is replaced here: the overlay
 // (runtime/ui/menu.mm menu_keyboard_run) asks for the text - typed directly with a keyboard, an on-screen keyboard
-// with a controller - while this (game) thread keeps re-presenting the last frame.
+// with a controller. On Windows, the VR name process yields through swkbd_live.c while the game's normal loop
+// keeps updating and rendering stereo. Other callers keep the synchronous re-presenting fallback.
 #include <stdio.h>
 #include <string.h>
 #include <SDL3/SDL_stdinc.h>
@@ -9,6 +10,7 @@
 #include "../hle.h"
 
 int menu_keyboard_run(const char *initial, int max_len, char *out, int cap);  // runtime/ui/menu.mm
+void motion_prepare_auto_calibration(bool prepare);
 
 // nn::swkbd::ShowKeyboard(nn::swkbd::String *out, const nn::swkbd::ShowKeyboardArg &arg) -> nn::Result
 // String = {void *ptr; size_t bufSize}
@@ -32,7 +34,9 @@ HLE_FUNC("_ZN2nn5swkbd12ShowKeyboardEPNS0_6StringERKNS0_15ShowKeyboardArgE", swk
         if (s) { SDL_utf8strlcpy(initial, s, sizeof initial); SDL_free(s); }
     }
     char text[96] = {0};
+    motion_prepare_auto_calibration(true);
     int ok = menu_keyboard_run(initial, max_len, text, sizeof text);
+    motion_prepare_auto_calibration(false);
     if (!ok) snprintf(text, sizeof text, "%s", initial);  // cancelled: keep what was there
     LOG("[swkbd] name entry (max %d, initial \"%s\"): %s \"%s\"\n", max_len, initial, ok ? "entered" : "cancelled", text);
     if (ptr && size) {

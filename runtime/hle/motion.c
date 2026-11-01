@@ -17,6 +17,7 @@
 #include "../frame_rate.h"
 #include "../vr/vr.h"
 #include "../vr/vr_settings.h"
+#include "motion_calibration.h"
 
 enum { STYLE_FULLKEY = 1u << 0, STYLE_JOY_DUAL = 1u << 2 };  // NpadStyleTag bits
 enum { STYLE_INDEX_FULLKEY = 3, STYLE_INDEX_JOY_DUAL = 5 };   // NpadStyleIndex
@@ -43,20 +44,62 @@ static _Atomic int auto_joycon;
 // set when an animation is done), 2 Y pressed?, 3 closing requested, 4 waiting for the closing animation, 5
 // teardown, then 0 (idle). State 3 waits for the prompt's status +0x15e0 to be 2 (open). In VR it runs, answered by
 // the port, and is never seen or heard:
-//  - states 1, 3 and 4: the prompt is reported open / its animation done at once (+0x15e0 = 2, +0x160b);
-//  - state 2: after a short centred-pose settling window, Y is pressed for the player (input.c motion_auto_buttons);
+//  - states 0/1 go straight to 2, and 3/4 straight to 5: SYS_GYRO_00 is never opened or closed, so neither its
+//    drawing nor its UI sound events are requested. State 2's calibration and state 5's cleanup still run;
+//  - the centred-pose settling window starts during startup/name entry; state 2 confirms once it is ready;
 //  - states 1-4: the right Joy-Con points at the screen's centre (the HUD panel's centre, where the menu pointer's
 //    mapping starts: vr_controls.c);
-//  - the whole run and CAL_FADE_FRAMES after it (the fade-out): the game's 2D layer isn't shown in the headset (exec.c,
-//    device.c) and the game's sound is muted (services/audio.c): motion_vr_calibration_hidden.
+//  - the HUD and background audio keep running normally; neither blanket HUD hiding nor master muting is needed.
 // A run ends when the state returns to 0 after the prompt, or when the coordinator stops being called; it is never
 // answered for more than CAL_MAX_FRAMES. SKYRECOMP_VR_MOTION_CALIBRATION=1: show the game's own prompt in VR too.
 #define LEGACY_CALIBRATION_COORDINATOR 0x7000dd2a68ull
-enum { CAL_MAX_FRAMES = 1200, CAL_SETTLE_FRAMES = 45, CAL_FADE_FRAMES = 4 };
+enum { CAL_MAX_FRAMES = 1200, CAL_SETTLE_FRAMES = 45 };
 static GuestFn legacy_calibration_coordinator;
-static _Atomic uint64_t cal_last_call, cal_run_start, cal_run_end;  // (present count + 1; 0 none)
+static GuestFn legacy_calibration_begin, legacy_calibration_update;
+
+// The native calibration callbacks disable the meter/layout owner's draw flag (+0x1539), saving it at
+// main+0x1939784. Keep that draw flag at its entry value while running automatic VR calibration; the real
+// layouts then continue updating/drawing, rather than disappearing or being replaced with a captured image.
+typedef struct { uint64_t hud; uint8_t visible; } CalibrationHud;
+static CalibrationHud calibration_hud_before(void) {
+    CalibrationHud result = {0};
+    if (!vr_requested() || ENV("SKYRECOMP_VR_MOTION_CALIBRATION")) return result;
+    result.hud = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x1827388);
+    if (result.hud) result.visible = *(const uint8_t *)(uintptr_t)(result.hud + 0x1539);
+    return result;
+}
+static void calibration_hud_after(CalibrationHud before) {
+    if (!before.hud || before.hud != *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x1827388)) return;
+    volatile uint8_t *visible = (volatile uint8_t *)(uintptr_t)(before.hud + 0x1539);
+    if (*visible != before.visible) {
+        if (ENV("SKYRECOMP_MOTION_CAL_TRACE"))
+            LOG("[motion] calibration preserves native HUD visibility %u (native callback requested %u)\n", before.visible, *visible);
+        *visible = before.visible;
+    }
+}
+static void vr_calibration_begin(Cpu *c) {
+    CalibrationHud before = calibration_hud_before();
+    legacy_calibration_begin(c);
+    calibration_hud_after(before);
+}
+static void vr_calibration_update(Cpu *c) {
+    CalibrationHud before = calibration_hud_before();
+    legacy_calibration_update(c);
+    calibration_hud_after(before);
+}
+static _Atomic uint64_t cal_last_call, cal_run_start;  // (present count + 1; 0 none)
 static _Atomic uint32_t cal_state;
 static _Atomic bool cal_in_run;
+static _Atomic bool cal_initial_done;
+static _Atomic uint64_t cal_warm_start;
+
+// Prepare while the normal startup/name-entry loop is still running, before native calibration pauses it.
+// Name entry releases preparation when its dialog closes; live sensor samples invalidate the prepared window.
+void motion_prepare_auto_calibration(bool prepare) {
+    if (!vr_requested() || ENV("SKYRECOMP_VR_MOTION_CALIBRATION")) return;
+    atomic_store(&cal_initial_done, !prepare);
+    if (prepare) atomic_store(&cal_warm_start, 0);
+}
 static uint64_t cal_now(void) {
     extern uint64_t renderer_present_count(void);
     return renderer_present_count() + 1;
@@ -76,45 +119,59 @@ static void vr_auto_calibration(Cpu *c) {
     if (!cal_running()) {  // (a new run)
         atomic_store(&cal_run_start, now);
         atomic_store(&cal_in_run, true);
-        LOG("[motion] VR: the pointer calibration prompt is answered automatically, hidden and muted\n");
+        LOG("[motion] VR: calibrating in the background; native prompt and UI sounds are skipped\n");
     }
     atomic_store(&cal_last_call, now);
-    {   // (states 1 and 4: no waiting for the prompt's animations)
-        const uint32_t st0 = self ? *(const uint32_t *)(uintptr_t)(self + 24) : 0;
-        const uint64_t prompt = self ? *(const uint64_t *)(uintptr_t)(self + 8) : 0;
-        if ((st0 == 1 || st0 == 4) && prompt) *(volatile uint8_t *)(uintptr_t)(prompt + 0x160b) = 1;
-        if (st0 == 3 && prompt) *(volatile uint32_t *)(uintptr_t)(prompt + 0x15e0) = 2;  // (state 3: "fully open")
+    if (self) {
+        volatile uint32_t *state = (volatile uint32_t *)(uintptr_t)(self + 24);
+        const uint32_t next = motion_calibration_background_state(*state);
+        if (next != *state) {
+            *state = next;
+            *(volatile uint32_t *)(uintptr_t)(self + 0x20) = 0;
+        }
+        atomic_store(&cal_state, next);  // centered sensor samples apply before the first native calibration call
     }
+    CalibrationHud hud_before = calibration_hud_before();
     legacy_calibration_coordinator(c);
+    calibration_hud_after(hud_before);
     const uint32_t st = self ? *(const uint32_t *)(uintptr_t)(self + 24) : 0;
     const uint32_t before = atomic_exchange(&cal_state, st);
-    if (st != before && getenv("SKYRECOMP_MOTION_CAL_TRACE")) LOG("[motion] calibration state %u at frame %llu\n", st, (unsigned long long)now);
+    if (st != before && getenv("SKYRECOMP_MOTION_CAL_TRACE")) {
+        const uint64_t prompt = self ? *(const uint64_t *)(uintptr_t)(self + 8) : 0;
+        LOG("[motion] calibration state %u at frame %llu (native prompt state %u, open request %u)\n", st,
+            (unsigned long long)now, prompt ? *(const uint32_t *)(uintptr_t)(prompt + 0x15e0) : 0,
+            prompt ? *(const uint32_t *)(uintptr_t)(prompt + 0x15f8) : 0);
+    }
     if (st == 0 && before == 5) {  // (closed: the run is over)
         atomic_store(&cal_in_run, false);
-        atomic_store(&cal_run_end, now);
+        atomic_store(&cal_initial_done, true);
+        atomic_store(&cal_warm_start, 0);
     }
 }
+
+RT_ON_RESET(motion_calibration_reset) {
+    atomic_store(&cal_in_run, false);
+    atomic_store(&cal_state, 0);
+    atomic_store(&cal_last_call, 0);
+    atomic_store(&cal_run_start, 0);
+    atomic_store(&cal_initial_done, false);
+    atomic_store(&cal_warm_start, 0);
+}
 static bool auto_calibrating(void) {  // (the right Joy-Con points at the centre)
+    if (!vr_requested() || ENV("SKYRECOMP_VR_MOTION_CALIBRATION")) return false;
     const uint32_t st = atomic_load(&cal_state);
-    return cal_running() && st >= 1 && st <= 4;
+    const bool centered = !atomic_load(&cal_initial_done) || (cal_running() && st >= 1 && st <= 4);
+    if (centered && !atomic_load(&cal_warm_start)) atomic_store(&cal_warm_start, cal_now());
+    return centered;
 }
 
-// (exec.c, device.c, audio.c) The calibration prompt is up in VR, or just closed: hide it.
-bool motion_vr_calibration_hidden(void) {
-    const uint64_t now = cal_now();
-    if (cal_running()) return true;
-    const uint64_t end = atomic_load(&cal_run_end), last = atomic_load(&cal_last_call);
-    const uint64_t over = end > last ? end : last;  // (closed, or stopped being called)
-    return over && now <= over + CAL_FADE_FRAMES;
-}
-
-// (input.c, each pad poll) Confirm only after the game's motion filter has received a stable centred pose.  Completing
+// (input.c, each pad poll) Confirm only after the game's motion filter has received a stable centred pose. Completing
 // the hidden prompt in 2-3 frames left its baseline dependent on the controller pose from before the prompt, which
 // could restrict the cursor to part of the screen even though the absolute VR ray covered the whole HUD panel.
 uint64_t motion_auto_buttons(void) {
     const uint32_t st = atomic_load(&cal_state);
-    const uint64_t start = atomic_load(&cal_run_start);
-    return cal_running() && st == 2 && cal_now() >= start + CAL_SETTLE_FRAMES ? 1u << 3 : 0;  // (Npad Y)
+    const uint64_t start = atomic_load(&cal_warm_start);
+    return cal_running() && st == 2 && start && cal_now() >= start + CAL_SETTLE_FRAMES ? 1u << 3 : 0;  // (Npad Y)
 }
 
 // TEMP (RE) SKYRECOMP_TEMP_MOTION_GATE=1: f_7000a17aa8 / f_7000a17be0 (player: "motion input active?") logged on change
@@ -145,12 +202,18 @@ void motion_vr_init(void) {
         hle_override(LEGACY_CALIBRATION_COORDINATOR, vr_auto_calibration, "vr_auto_motion_calibration");
     else
         LOG("[motion] warning: legacy calibration hook unavailable\n");
+    legacy_calibration_begin = dispatch_lookup(MAIN_BASE + 0xdd25c0);
+    legacy_calibration_update = dispatch_lookup(MAIN_BASE + 0xdd273c);
+    if (legacy_calibration_begin)
+        hle_override(MAIN_BASE + 0xdd25c0, vr_calibration_begin, "vr_calibration_begin");
+    if (legacy_calibration_update)
+        hle_override(MAIN_BASE + 0xdd273c, vr_calibration_update, "vr_calibration_update");
 }
 
 // VR always plays with motion controls (user: button controls must not be an option in VR - they lose the
 // motion): the Joy-Con pair whenever VR is on, whatever was used last. g_vr_config.control_source (the old "VR
 // Control Source" choice) is no longer read.
-static int forced_mode(void) { return vr_requested() ? 1 : -1; }
+static int forced_mode(void) { return vr_running() ? 1 : -1; }
 
 bool motion_joycon_mode(void) {
     static int override = -2, last = -1;
@@ -270,7 +333,6 @@ static bool test_sample(uint8_t device, SensorState *s) {
 static void motion_sample(uint8_t device, SensorState *s) {
     s->accel[2] = -1.0f;
     s->direction[0] = s->direction[4] = s->direction[8] = 1.0f;
-    if (test_sample(device, s)) return;
     if (device == DEVICE_RIGHT && auto_calibrating()) {
         // Bias the hidden baseline slightly toward the top of the panel.  The game's accepted pointer cone is
         // asymmetric after calibration; using its geometric centre left a narrow unreachable strip at the bottom.
@@ -280,6 +342,8 @@ static void motion_sample(uint8_t device, SensorState *s) {
         for (int i = 0; i < 3; i++) s->accel[i] = -s->direction[i * 3 + 2];
         return;
     }
+    if (device == DEVICE_RIGHT) atomic_store(&cal_warm_start, 0);
+    if (test_sample(device, s)) return;
     VrJoyConSensor v;
     if (device > DEVICE_RIGHT) return;
     // The settings menu has the controllers (its pointer, menu.mm): the game keeps their last pose, held still

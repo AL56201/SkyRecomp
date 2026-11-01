@@ -15,6 +15,7 @@
 #include "../../paths.h"
 #include "../../settings.h"
 #include "../../vr/vr.h"
+#include "../../vr/vr_connect.h"
 #include "../../vr/vr_settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
@@ -61,9 +62,9 @@ static void create_instance(void) {
     const char *ext[16];
     uint32_t n_ext = 0;
     for (Uint32 i = 0; i < n_sdl && n_ext < 14; i++) ext[n_ext++] = sdl_ext[i];
-    if (vr_requested()) {
+    {
         // SteamVR's OpenXR Vulkan bridge obtains the HMD GPU through these KHR entry points even though the
-        // underlying queries are core in modern Vulkan. They are requested only for the opt-in VR path.
+        // underlying queries are core in modern Vulkan. Keep them available for enabling VR after Play.
         ext[n_ext++] = VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME;
         ext[n_ext++] = VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME;
         ext[n_ext++] = VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME;
@@ -251,9 +252,25 @@ static void create_device(void) {
     g_fault_ext = fault;
     free(ep);
 
-    // features the backend relies on (all present on current desktop drivers)
-    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    // What the device has of the features below. Asking for one it lacks fails vkCreateDevice with
+    // VK_ERROR_FEATURE_NOT_PRESENT (-8: Intel Iris Xe / UHD, Adreno X1-85; #46, #59, #60), so the optional ones are
+    // asked for only where present; dynamicRendering, synchronization2 and timelineSemaphore are needed.
+    VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT hdiv = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT hcbc = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT, .pNext = g_vk.divisor ? &hdiv : NULL};
+    VkPhysicalDeviceVulkan13Features h13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+                                            .pNext = g_vk.custom_border ? (void *)&hcbc : g_vk.divisor ? (void *)&hdiv : NULL};
+    VkPhysicalDeviceVulkan12Features h12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &h13};
+    VkPhysicalDeviceVulkan11Features h11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, .pNext = &h12};
+    VkPhysicalDeviceFaultFeaturesEXT hff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .pNext = &h11};
+    VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&hff : (void *)&h11};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
+    g_vk.divisor = g_vk.divisor && hdiv.vertexAttributeInstanceRateDivisor;
+    g_vk.custom_border = g_vk.custom_border && hcbc.customBorderColors && hcbc.customBorderColorWithoutFormat;
+    g_vk.mirror_clamp = h12.samplerMirrorClampToEdge;  // (else mirrored repeat: textures.c)
+    if (!h13.dynamicRendering || !h13.synchronization2 || !h12.timelineSemaphore)
+        LOG("[vk] warning: no dynamicRendering / synchronization2 / timelineSemaphore (Vulkan 1.3): this GPU can't run it\n");
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -262,23 +279,21 @@ static void create_device(void) {
         .customBorderColorWithoutFormat = VK_TRUE, .pNext = g_vk.divisor ? &div : NULL};
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
                                             .dynamicRendering = VK_TRUE, .synchronization2 = VK_TRUE,
-                                            .shaderDemoteToHelperInvocation = VK_TRUE, .shaderTerminateInvocation = VK_TRUE,
-                                            .maintenance4 = VK_TRUE,
+                                            .shaderDemoteToHelperInvocation = h13.shaderDemoteToHelperInvocation,
+                                            .shaderTerminateInvocation = h13.shaderTerminateInvocation,
+                                            .maintenance4 = h13.maintenance4,
                                             .pNext = g_vk.custom_border ? (void *)&cbc : g_vk.divisor ? (void *)&div : NULL};
     VkPhysicalDeviceVulkan12Features f12 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
-                                            .timelineSemaphore = VK_TRUE, .shaderInt8 = VK_TRUE, .samplerMirrorClampToEdge = VK_TRUE,
-                                            .uniformAndStorageBuffer8BitAccess = VK_TRUE, .storageBuffer8BitAccess = VK_TRUE,
-                                            .scalarBlockLayout = VK_TRUE, .pNext = &f13};
-    VkPhysicalDeviceVulkan11Features have11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
-    VkPhysicalDeviceFeatures2 have2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have11};
-    vkGetPhysicalDeviceFeatures2(g_vk.phys, &have2);
-    g_vk.multiview = vr_requested() && have11.multiview;  // (VR: both eyes in one pass, exec.c)
+                                            .timelineSemaphore = VK_TRUE, .shaderInt8 = h12.shaderInt8, .samplerMirrorClampToEdge = h12.samplerMirrorClampToEdge,
+                                            .uniformAndStorageBuffer8BitAccess = h12.uniformAndStorageBuffer8BitAccess, .storageBuffer8BitAccess = h12.storageBuffer8BitAccess,
+                                            .scalarBlockLayout = h12.scalarBlockLayout, .pNext = &f13};
+    g_vk.multiview = h11.multiview;  // (VR: both eyes in one pass, exec.c)
     VkPhysicalDeviceVulkan11Features f11 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
-                                            .storageBuffer16BitAccess = VK_TRUE, .multiview = g_vk.multiview, .pNext = &f12};
+                                            .storageBuffer16BitAccess = h11.storageBuffer16BitAccess, .multiview = g_vk.multiview, .pNext = &f12};
     VkPhysicalDeviceFragmentShadingRateFeaturesKHR vrs_on = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR,
                                                               .attachmentFragmentShadingRate = VK_TRUE, .pNext = &f11};
     void *chain = g_vk.vrs ? (void *)&vrs_on : (void *)&f11;
-    VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = VK_TRUE,
+    VkPhysicalDeviceFaultFeaturesEXT ff = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT, .deviceFault = hff.deviceFault,
                                            .pNext = chain};
     VkPhysicalDeviceFeatures2 f = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = fault ? (void *)&ff : chain};
     VkPhysicalDeviceFeatures *b = &f.features, *h = &have.features;
@@ -299,7 +314,7 @@ static void create_device(void) {
     b->vertexPipelineStoresAndAtomics = h->vertexPipelineStoresAndAtomics;
     b->robustBufferAccess = h->robustBufferAccess;  // guest shaders index cbufs freely: keep OOB reads harmless
     b->shaderClipDistance = h->shaderClipDistance;
-    g_vk.depth_bounds = b->depthBounds = vr_requested() && h->depthBounds;  // (VR hidden area: exec.c)
+    g_vk.depth_bounds = b->depthBounds = h->depthBounds;  // (VR hidden area: exec.c)
     if (!h->shaderInt64) LOG("[vk] warning: no shaderInt64 (64-bit address math in shaders)\n");
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -653,15 +668,27 @@ static atomic_int g_vr_enabled_request = -1;
 void vk_vr_request_enabled(bool enabled) { atomic_store(&g_vr_enabled_request, enabled ? 1 : 0); }
 
 static void vr_apply_enabled_request(void) {
-    const int enabled = atomic_exchange(&g_vr_enabled_request, -1);
-    if (enabled < 0 || !g_vk.dev) return;
-    vkDeviceWaitIdle(g_vk.dev);
-    if (!enabled) {
+    static VrConnectState connect;
+    static uint64_t next_poll;
+    const int requested = atomic_exchange(&g_vr_enabled_request, -1);
+    const uint64_t now = SDL_GetTicks();
+    if (!g_vk.dev) return;
+    if (requested >= 0) { connect = (VrConnectState){0}; next_poll = 0; }
+    const bool enabled = vr_game_active() && vr_requested();
+    if (enabled && now < next_poll) return;
+    next_poll = now + 1000;
+    const bool ready = enabled && vr_runtime_ready();
+    unsigned action = vr_connect_tick(&connect, now, enabled, vr_available(), ready);
+    if (action & VR_CONNECT_START) vr_runtime_start();
+    if (action & VR_CONNECT_STOP) {
+        vkDeviceWaitIdle(g_vk.dev);
         vr_shutdown();
-        LOG("[vr] disabled from the VR settings\n");
-    } else if (!vr_available()) {
+        LOG("[vr] continuing in desktop mode\n");
+    }
+    if (action & VR_CONNECT_TRY) {
+        vkDeviceWaitIdle(g_vk.dev);
         if (!vr_vulkan_init((void *)g_vk.inst, (void *)g_vk.phys, (void *)g_vk.dev, g_vk.qfam, 0))
-            LOG("[vr] could not enable from the VR settings; continuing in desktop mode\n");
+            LOG("[vr] not ready yet; desktop play continues, retrying later\n");
     }
 }
 
@@ -675,6 +702,7 @@ void backend_set_window_crop(const int crop[4]) {
 void backend_present(NvnTexture *t);
 static bool g_representing;
 static bool g_cinema;
+static bool g_black_backdrop;
 static bool g_blank;      // this frame is a full-screen colour fade: show it in the eyes, not on the panel
 static bool g_had_scene;
 static bool g_fade;  // (this frame drew a full-screen 2D quad - a fade: in the eyes; the panel never opaque)  // this frame drew 3D: never put a full-screen copy on the panel
@@ -846,6 +874,14 @@ void backend_present(NvnTexture *t) {
                 extern void vr_cinema(bool on);
                 g_cinema = vk_hud_layer_on() && movie_playing() && !had_scene;
                 vr_cinema(g_cinema);
+                extern bool vk_hud_black_backdrop(NvnTexture *screen), vr_world_menu_active(void);
+                extern void vr_black_background(bool on);
+                g_black_backdrop = vk_hud_layer_on() && !had_scene && !vr_world_menu_active() && vk_hud_black_backdrop(t);
+                vr_black_background(g_black_backdrop);
+                if (getenv("SKYRECOMP_VR_FADE_TRACE") && present_gen % 60 == 0)
+                    LOG("[vr-backdrop] frame %llu scene %d target %d replay %d menu %d opaque %d black %d selected %d\n",
+                        (unsigned long long)present_gen, had_scene, target_had_scene, replay_had_scene,
+                        vr_world_menu_active(), vk_hud_opaque(), vk_hud_black_backdrop(t), g_black_backdrop);
             }
             if (g_representing) vr_freeze_world(true, false);  // (the game waiting: its last frame, held in the world)
             else vr_freeze_world(vk_hud_layer_on() && vk_hud_opaque() && !had_scene && !g_blank && !g_fade, had_scene);  // (world mode: live)
@@ -884,7 +920,6 @@ void backend_present(NvnTexture *t) {
         {   // the 2D layer (exec.c HUD texture) onto the HUD panel
             extern bool vk_hud_layer_on(void), vk_hud_opaque(void);
             extern TexBackend *vk_hud_backend(void);
-            extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the calibration prompt, hidden)
             extern bool vr_world_menu_active(void);
             // (a blank frame - a fade - fills the eyes as it is: no panel)
             // The HUD image persists between frames.  Submit it only when this present actually routed or copied
@@ -892,7 +927,7 @@ void backend_present(NvnTexture *t) {
             // A retained full-screen screen (file select/title) must also disappear as soon as live 3D resumes.
             // Merely making it non-opaque is insufficient: those textures contain alpha 1 over every pixel.
             const bool panel_allowed = !g_had_scene || !vk_hud_opaque() || vr_world_menu_active();
-            TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && g_had_hud && panel_allowed
+            TexBackend *hb = vk_hud_layer_on() && !g_blank && g_had_hud && panel_allowed
                                  ? vk_hud_backend() : NULL;
             {   // (test) LARECOMP_MENU_AT=<frame>: the settings menu opens at that frame (as on the desktop below)
                 static long menu_at = -1;
@@ -901,12 +936,19 @@ void backend_present(NvnTexture *t) {
             }
             g_vr_menu_on_panel = false;
             extern bool menu_vr_passive(void);
+            extern void vr_menu_panel_frame(void);
+            // Closing a menu must clear its placement even on frames with no UI to draw. Otherwise the next
+            // dialog (notably name entry) can stay at an old world position, outside the current view.
+            vr_menu_panel_frame();
             if (menu_on_vr_panel() || menu_vr_passive()) {  // (the settings menu / name entry / overlays: exec.c, vr.c)
                 extern TexBackend *vk_vr_menu_panel(void);
                 extern bool vr_record_menu_copy(void *cb, void *image, uint32_t w, uint32_t h);
-                extern void vr_menu_panel_frame(void);
-                vr_menu_panel_frame();
                 TexBackend *m = vk_vr_menu_panel();
+                // Diagnostic: capture the actual VR UI image, including the software keyboard.
+                static unsigned menu_shot_frames;
+                const char *menu_shot = getenv("SKYRECOMP_VR_MENU_SHOT");
+                if (menu_shot && menu_on_vr_panel() && ++menu_shot_frames == 3)
+                    renderer_save_texture_tex(m, menu_shot);
                 g_vr_menu_img = m;
                 g_vr_menu_on_panel = vr_record_menu_copy((void *)vk_cmd(), (void *)m->image, m->width, m->height);
             }
@@ -918,6 +960,22 @@ void backend_present(NvnTexture *t) {
                 vk_label_end(vk_cmd());
             }
             pt_mark(PT_HUD);
+        }
+        TexBackend *view_fade_mirror = NULL;
+        {   // Always record the final fade, including frames where the throttled desktop mirror is skipped.
+            extern bool vk_take_view_fade(float rgba[4]);
+            extern TexBackend *vk_view_fade_mirror(const float rgba[4]);
+            static float last_fade[4];
+            float rgba[4]={0};
+            if (g_representing) memcpy(rgba,last_fade,sizeof rgba);
+            else {
+                vk_take_view_fade(rgba);
+                memcpy(last_fade,rgba,sizeof rgba);
+            }
+            if (rgba[3]>0) {
+                vr_record_view_fade((void *)vk_cmd(), rgba);
+                view_fade_mirror = vk_view_fade_mirror(rgba);
+            }
         }
         // Desktop mirror: the left eye, with the menu.
         static const float mirror_black[4] = {0, 0, 0, 1};
@@ -966,15 +1024,15 @@ void backend_present(NvnTexture *t) {
         if (mirror) {
             VkExtent2D extent = vk_frame_extent();
             float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, g_vr_crop[0], g_vr_crop[1], g_vr_crop[2], g_vr_crop[3]};
-            if (!g_cinema) vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
+            if (!g_cinema && !g_black_backdrop) vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
             {   // the HUD panel's 2D layer (the HUD, menus, map) over it, as the headset shows it: 16:9 in the middle
-                extern bool vk_hud_layer_on(void), vk_hud_opaque(void), motion_vr_calibration_hidden(void);
+                extern bool vk_hud_layer_on(void), vk_hud_opaque(void);
                 extern TexBackend *vk_hud_backend(void);
                 extern bool vr_world_menu_active(void);
                 extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh,
                                                const float pv[8], bool opaque);
                 const bool panel_allowed = !g_had_scene || !vk_hud_opaque() || vr_world_menu_active();
-                TexBackend *hb = vk_hud_layer_on() && !motion_vr_calibration_hidden() && !g_blank && g_had_hud && panel_allowed
+                TexBackend *hb = vk_hud_layer_on() && !g_blank && g_had_hud && panel_allowed
                                      ? vk_hud_backend() : NULL;
                 extern bool vr_mirror_hud_mvp(float out[16]);
                 extern void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16], bool flip, bool opaque);
@@ -992,10 +1050,16 @@ void backend_present(NvnTexture *t) {
             }
             pt_mark(PT_MIRROR_DRAW);
             if (!g_vr_menu_on_panel) menu_render((void *)vk_cmd(), extent.width, extent.height);  // (else: on the panel)
+            if (view_fade_mirror) {
+                extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float x, float y, float w, float h, const float pv[8], bool opaque);
+                const float full[8]={0,0,0,0,0,0,1,1};
+                vk_present_overlay(vk_cmd(),view_fade_mirror,0,0,(float)extent.width,(float)extent.height,full,false);
+            }
             pt_mark(PT_MENU);
             extern void vk_hud_discard_after_present(void);
             vk_hud_discard_after_present();
-            vk_frame_end(NULL);
+            const char *mirror_shot = getenv("LARECOMP_WINDOW_SHOT");
+            vk_frame_end(mirror_shot && (long)total_frames + 1 == atol(mirror_shot) ? "build/window.png" : NULL);
             pt_mark(PT_MIRROR_END);
         } else {
             extern void vk_hud_discard_after_present(void);
@@ -1068,6 +1132,19 @@ present_complete:
     frames++;
     total_frames++;
     g_frame_counter++;
+    {   // Optional low-overhead timing capture; no screenshots/readbacks in frame-stall measurements.
+        static FILE *trace;
+        static bool opened;
+        if (!opened) {
+            opened = true;
+            const char *path = getenv("SKYRECOMP_FRAME_TRACE");
+            if (path) trace = fopen(path, "w");
+        }
+        if (trace) {
+            fprintf(trace, "%llu,%llu\n", (unsigned long long)total_frames, (unsigned long long)SDL_GetTicksNS());
+            if (total_frames % 120 == 0) fflush(trace);
+        }
+    }
     extern void vk_pace_frame(void);
     vk_pace_frame();  // (exec.c: the game's 30 fps mode when frames don't fit 60)
     extern bool nvn_async_on(void);
@@ -1291,11 +1368,7 @@ void ui_window_init(void) {
     LOG("[vk] execution ready\n");
     vk_shaders_init();
     LOG("[vk] shaders ready\n");
-    // OpenXR is optional and deliberately initialized last. The desktop engine
-    // is already operational if the loader, runtime, or headset is unavailable.
-    if (vr_requested() && !vr_vulkan_init((void *)g_vk.inst, (void *)g_vk.phys,
-                                           (void *)g_vk.dev, g_vk.qfam, 0))
-        LOG("[vr] OpenXR unavailable; continuing in desktop mode\n");
+    // OpenXR starts after Play, once the runtime is ready (vr_apply_enabled_request).
     if (g_settings.fullscreen && !getenv("LARECOMP_WINDOW") && !getenv("LARECOMP_HIDDEN")) {
         if (!SDL_SetWindowFullscreen(window, true) || !SDL_SyncWindow(window))
             LOG("[vk] fullscreen transition: %s\n", SDL_GetError());
@@ -1317,7 +1390,9 @@ void backend_reset(void) {
     vkDeviceWaitIdle(g_vk.dev);
     extern void vk_textures_reset(void);
     extern void vk_exec_reset(void);
+    vr_shutdown();
     vk_textures_reset();
+    vk_vr_request_enabled(vr_requested());  // a subsequent Play gets one fresh automatic launch attempt
     vk_exec_reset();
     g_last_presented = NULL;
 }

@@ -205,7 +205,11 @@ volatile int g_rt_unwind;
 static KThread *g_threads;  // every thread of this boot (g_klock)
 
 void rt_unwind_point(void) {
-    if (__builtin_expect(g_rt_unwind, 0) && t_cur) longjmp(t_cur->unwind, 1);
+    if (__builtin_expect(g_rt_unwind, 0) && t_cur) {
+        extern void swkbd_live_unwind(void);
+        swkbd_live_unwind();
+        longjmp(t_cur->unwind, 1);
+    }
 }
 
 static void *thread_main(void *arg) {

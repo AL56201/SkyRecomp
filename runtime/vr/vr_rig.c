@@ -368,6 +368,22 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
         if (pass_camera[i].pass == g_vr_pass_id) pc = i;
     if (memory && memory_recent() && det3(mono + 16) > 0) game = camera, source = 0;
     else if (sky_vr_is_scene_camera(mono, 28 * sizeof(float))) {
+        if (!direct && pc >= 0 && fabsf(mono[5] - 5.0f) < .01f &&
+            getenv("SKYRECOMP_VR_MODEL_CAMERA_TRACE") && !same_view(pass_camera[pc].view, mono + 16)) {
+            extern uint64_t renderer_present_count(void);
+            static uint64_t logged_frame = ~0ull;
+            static int logged;
+            const uint64_t frame_no = renderer_present_count();
+            if (logged_frame != frame_no) { logged_frame = frame_no; logged = 0; }
+            if (logged++ < 60) {
+                fprintf(stderr, "[vr-model-camera] frame %llu pass %llu prior", (unsigned long long)frame_no,
+                        (unsigned long long)g_vr_pass_id);
+                for (int j = 0; j < 12; j++) fprintf(stderr, " %.8g", pass_camera[pc].view[j]);
+                fprintf(stderr, " next");
+                for (int j = 0; j < 12; j++) fprintf(stderr, " %.8g", mono[16 + j]);
+                fprintf(stderr, "\n");
+            }
+        }
         game = mono + 16, source = 1;
         if (det3(mono + 16) > 0 && g_vr_pass_id) {
             if (pc < 0) pc = pass_camera_next, pass_camera_next = (pass_camera_next + 1) % PASS_CAMERAS;

@@ -32,6 +32,7 @@ extern "C" {
 #include "menu.h"
 extern "C" bool input_free_cam_active(void);  // runtime/hle/input.c: free camera session toggle
 void input_reset(void);
+bool swkbd_live_yield(void);
 void input_mouse_update(void *window, bool playing);
 void save_editor_draw(float scale);  // save_editor.mm
 extern "C" int game_in_play(void);  // hle/warp.c
@@ -47,6 +48,8 @@ void controls_bindings_draw(float scale);  // controls_ui.mm
 
 // ------------------------------------------------------------------ state shared with the main thread
 static std::atomic<bool> g_open{false};
+static std::atomic<uint64_t> g_vr_panel_generation{0};
+extern "C" uint64_t menu_vr_panel_generation(void) { return g_vr_panel_generation.load(); }
 float g_vr_scroll_lines;  // (VR: the right stick's scrolling this frame, lines, + up: option_rows.mm opt_vr_scroll)
 static std::atomic<bool> g_text_busy{false};  // a text field / the on-screen keyboard has the keys (render thread: ui_text_busy)
 static std::atomic<bool> g_want_fullscreen_apply{false};
@@ -86,6 +89,7 @@ void menu_tabs_focus(bool first_tab);
 static void set_open(bool open) {
     if (open == g_open.load()) return;
     g_open.store(open);
+    ++g_vr_panel_generation;  // a close/reopen between render frames must still place a fresh panel
     input_reset();  // nothing held while the menu had focus leaks into the game
     bind_capture_cancel();
     if (open) {
@@ -634,8 +638,8 @@ static void tab_vr_options(void) {
     opt_section("VR Mode");
     bool changed = false;
     if (opt_toggle("Enable VR Mode", &g_settings.vr, false,
-                   "Connects to OpenXR/SteamVR when enabled and returns to desktop rendering when disabled. Start "
-                   "your OpenXR runtime and connect a headset before enabling it.")) {
+                   "After Play, starts SteamVR if needed and switches to VR when ready. You can keep playing "
+                   "on desktop while it waits. Disable this to stay on desktop.")) {
 #if !defined(__APPLE__)
         vk_vr_request_enabled(g_settings.vr);
 #endif
@@ -685,6 +689,8 @@ static void tab_vr_options(void) {
     changed |= opt_toggle("Depth of Field", &g_settings.vr_dof, false,
                           "The game's background blur in cutscenes. In the headset it looks blocky around characters, "
                           "and your eyes already focus by themselves, so it is off by default. Changes apply live.");
+    changed |= opt_toggle("Bloom", &g_settings.vr_bloom, false,
+                          "Adds the game's soft glow over bright surfaces. Disable for clearer characters in VR. Changes apply live.");
     changed |= opt_toggle("World Behind Menus", &g_settings.vr_world_in_menus, true,
                           "Keeps the 3D world around you while the map and other full-screen menus are open; the menu "
                           "floats in front of it. Off: the classic black background. Applies from the next menu opened.");
@@ -1032,9 +1038,19 @@ extern "C" int menu_keyboard_run(const char *initial, int max_len, char *out, in
     g_kbd_max = max_len > 0 && max_len < (int)sizeof g_kbd_text / 4 ? max_len : 8;
     input_reset();
     g_kbd = 1;
-    // (test) LARECOMP_KBD_AUTO=<text>: answer at once
-    if (getenv("LARECOMP_KBD_AUTO")) { snprintf(g_kbd_text, sizeof g_kbd_text, "%s", getenv("LARECOMP_KBD_AUTO")); g_kbd = 2; }
+    ++g_vr_panel_generation;  // name entry owns a new panel even if another modal was already open
+    LOG("[swkbd] dialog opened (%s, max %d)\n", vr_running() ? "VR" : "desktop", g_kbd_max);
+    // (test) Optional delay exercises live rendering and sensor preparation while the keyboard is open.
+    const char *auto_text = getenv("LARECOMP_KBD_AUTO");
+    const char *auto_delay = getenv("LARECOMP_KBD_AUTO_DELAY_MS");
+    const uint64_t auto_at = SDL_GetTicks() + (auto_delay ? strtoull(auto_delay, nullptr, 10) : 0);
     while (g_kbd.load() == 1 && !g_rt_unwind) {  // ~60 Hz (a reboot cancels)
+        if (auto_text && SDL_GetTicks() >= auto_at) {
+            snprintf(g_kbd_text, sizeof g_kbd_text, "%s", auto_text);
+            g_kbd = 2;
+            break;
+        }
+        if (swkbd_live_yield()) continue;  // name callback suspended; the normal game loop renders fresh stereo
         uint64_t t0 = SDL_GetTicks();
         backend_represent();
         uint64_t dt = SDL_GetTicks() - t0;

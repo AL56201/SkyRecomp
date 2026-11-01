@@ -646,8 +646,6 @@ static void apply_gain(SDL_AudioStream *st) {
     static double env = -1;
     if (env < 0) env = getenv("LARECOMP_AUDIO_GAIN") ? atof(getenv("LARECOMP_AUDIO_GAIN")) : 1.0;
     float g = (float)(env * g_settings.volume);
-    extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the VR motion calibration prompt's sounds)
-    if (motion_vr_calibration_hidden()) g = 0;
     if (st && SDL_GetAudioStreamGain(st) != g) SDL_SetAudioStreamGain(st, g);
 }
 

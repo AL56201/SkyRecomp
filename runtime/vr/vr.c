@@ -5,6 +5,7 @@
 // so the frame state below needs no locks. Only vr_debug_stage is read from another thread (the freeze watchdog).
 #include "vr.h"
 #include "vr_internal.h"
+#include "vr_fade.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -33,6 +34,9 @@
 #endif
 
 static bool available, running;
+static atomic_bool game_active;
+void vr_set_game_active(bool active) { atomic_store(&game_active, active); }
+bool vr_game_active(void) { return atomic_load(&game_active); }
 float g_vr_gpu_ms;  // the last measured GPU frame time (exec.c), for dynamic resolution
 static atomic_bool focus_requested;  // set on the renderer thread, taken on the UI thread
 static char status_text[192] = "VR is disabled";
@@ -98,6 +102,10 @@ static XrSwapchain swapchain = XR_NULL_HANDLE;  // one image per frame, array la
 static VkFormat swapchain_format;
 static uint32_t eye_width, eye_height, image_count;
 static XrSwapchainImageVulkanKHR *images;
+static XrSwapchain view_fade_swapchain = XR_NULL_HANDLE;
+static XrSwapchainImageVulkanKHR *view_fade_images;
+static uint32_t view_fade_count, view_fade_index;
+static bool view_fade_acquired, view_fade_ready, view_fade_failed;
 static float adaptive_resolution;
 static double adaptive_work_sum, adaptive_budget_sum;
 static int adaptive_samples, adaptive_headroom;
@@ -187,6 +195,7 @@ bool vr_eye_fov(int eye, float fov[4]) {  // this frame's eye field of view: tan
 
 
 static void hud_destroy(void);
+static void view_fade_destroy(void);
 static void menu_destroy(void);
 static bool mirror_quad_mvp(const float m[16], float hx, float hy, float out[16]);
 static void frozen_destroy(void);
@@ -501,6 +510,7 @@ void vr_shutdown(void) {
     if (swapchain && p_xrDestroySwapchain) p_xrDestroySwapchain(swapchain);
     swapchain = XR_NULL_HANDLE;
     hud_destroy();
+    view_fade_destroy();
     menu_destroy();
     frozen_destroy();
     XrSpace *spaces[] = {&view_space, &local_space};
@@ -546,7 +556,7 @@ void vr_poll(void) {
                 input_controller_style_changed();
                 set_status("SteamVR session stopped");
             } else if (state == XR_SESSION_STATE_EXITING || state == XR_SESSION_STATE_LOSS_PENDING) {
-                running = false;
+                running = available = false;
                 set_status("SteamVR session ended");
             }
         } else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
@@ -823,6 +833,8 @@ void vr_freeze_world(bool freeze, bool frame_is_3d) { freeze_next = freeze; fram
 // A prerendered cutscene (device.c): the eyes dark, the HUD panel (the video) larger and held still - a cinema.
 static bool g_cinema;
 void vr_cinema(bool on) { g_cinema = on; }
+static bool g_black_background;
+void vr_black_background(bool on) { g_black_background = on; }
 static float hud_size_factor(void) { return g_cinema ? 1.6f : 1.0f; }
 
 static void frozen_destroy(void) {
@@ -904,7 +916,7 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
     VkImage dst = images[frame.image].image;
     const bool freeze = freeze_next, frame_3d = frame_3d_next;
     freeze_next = frame_3d_next = false;
-    if (g_cinema) {  // (vr_cinema: dark around the video's screen)
+    if (g_cinema || g_black_background) {  // Video and black title cards replace the world behind their lettering.
         barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_CLEAR_BIT,
                 VK_ACCESS_2_TRANSFER_WRITE_BIT);
         const VkClearColorValue black = {{0, 0, 0, 1}};
@@ -1155,6 +1167,68 @@ static void barrier_layers(VkCommandBuffer cb, VkImage image, VkImageLayout from
     VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb,
                            .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &ib};
     vkCmdPipelineBarrier2(cb, &di);
+}
+
+// A final head-locked overlay covers both eyes, including all earlier HUD/menu overlays.
+static void view_fade_destroy(void) {
+    if (view_fade_swapchain && p_xrDestroySwapchain) p_xrDestroySwapchain(view_fade_swapchain);
+    view_fade_swapchain = XR_NULL_HANDLE;
+    SDL_free(view_fade_images);
+    view_fade_images = NULL;
+    view_fade_count = 0;
+    view_fade_acquired = view_fade_ready = view_fade_failed = false;
+}
+
+bool vr_view_fade_available(void) {
+    const char *enabled = ENV("SKYRECOMP_VR_FULL_VIEW_FADE");
+    if (enabled && !atoi(enabled)) return false;
+    if (!vr_stereo_active() || view_fade_failed) return false;
+    if (!view_fade_swapchain) {
+        view_fade_failed = true;
+        XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
+            .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
+            .format = swapchain_format, .sampleCount = 1, .width = 8, .height = 8,
+            .faceCount = 1, .arraySize = 1, .mipCount = 1};
+        if (!xr_ok(p_xrCreateSwapchain(xr_session, &ci, &view_fade_swapchain), "xrCreateSwapchain (fade)") ||
+            !xr_ok(p_xrEnumerateSwapchainImages(view_fade_swapchain, 0, &view_fade_count, NULL), "xrEnumerateSwapchainImages (fade)") || !view_fade_count)
+            return false;
+        view_fade_images = SDL_calloc(view_fade_count, sizeof *view_fade_images);
+        if (!view_fade_images) return false;
+        for (uint32_t i = 0; i < view_fade_count; i++) view_fade_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+        if (!xr_ok(p_xrEnumerateSwapchainImages(view_fade_swapchain, view_fade_count, &view_fade_count,
+                    (XrSwapchainImageBaseHeader *)view_fade_images), "xrEnumerateSwapchainImages (fade)")) return false;
+        view_fade_failed = false;
+    }
+    return true;
+}
+
+bool vr_record_view_fade(void *command_buffer, const float rgba[4]) {
+    if (!vr_view_fade_available() || !command_buffer || rgba[3] <= 0 || view_fade_acquired) return false;
+    if (!xr_ok(p_xrAcquireSwapchainImage(view_fade_swapchain,
+                &(XrSwapchainImageAcquireInfo){.type=XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO}, &view_fade_index), "xrAcquireSwapchainImage (fade)")) return false;
+    view_fade_acquired = true;
+    XrSwapchainImageWaitInfo wi = {.type=XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, .timeout=100000000ll};
+    XrResult result = XR_TIMEOUT_EXPIRED;
+    for (int i = 0; result == XR_TIMEOUT_EXPIRED && i < 20; i++) result = p_xrWaitSwapchainImage(view_fade_swapchain, &wi);
+    if (result != XR_SUCCESS || view_fade_index >= view_fade_count) return false;
+    VkCommandBuffer cb = command_buffer;
+    VkImage image = view_fade_images[view_fade_index].image;
+    barrier_layers(cb, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                   VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, 1);
+    float linear[4];
+    vr_fade_compositor_color(rgba,linear);
+    const VkClearColorValue color = {{linear[0], linear[1], linear[2], linear[3]}};
+    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+    barrier_layers(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                   VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT, 1);
+    view_fade_ready = true;
+    if (getenv("SKYRECOMP_VR_FADE_TRACE")) {
+        static unsigned traced;
+        if (traced++ % 30 == 0)
+            LOG("[vr-fade] native opacity %.6f -> compositor linear opacity %.6f\n",rgba[3],linear[3]);
+    }
+    return true;
 }
 
 bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint32_t h, bool flip_y, bool opaque) {
@@ -1462,6 +1536,13 @@ static bool g_hud_world_ok;
 static bool g_menu_passive;  // the panel shows only the overlays (menu closed): it follows the HUD panel, no pointer
 static void menu_panel_update(void) {
     extern bool menu_on_vr_panel(void), menu_vr_passive(void);
+    extern uint64_t menu_vr_panel_generation(void);
+    static uint64_t generation;
+    const uint64_t next_generation = menu_vr_panel_generation();
+    if (generation != next_generation) {
+        generation = next_generation;
+        g_menu_placed = false;
+    }
     g_menu_passive = !menu_on_vr_panel() && menu_vr_passive();
     if (g_menu_passive) {  // (where the HUD panel is, as wide; columns made unit)
         if (!g_hud_world_ok) { g_menu_placed = false; return; }
@@ -1490,6 +1571,8 @@ static void menu_panel_update(void) {
         // columns: right = (-fz, 0, fx), up = (0, 1, 0), back (toward the player) = (-fx, 0, -fz)
         const float m[16] = {-fz, 0, -fx, c[0], 0, 1, 0, c[1], fx, 0, -fz, c[2], 0, 0, 0, 1};
         memcpy(g_menu_world, m, sizeof m);
+        LOG("[vr] menu panel placed for dialog %llu at (%.2f %.2f %.2f)\n",
+            (unsigned long long)generation, c[0], c[1], c[2]);
         g_menu_placed = true;
     }
     const float hw = g_vr_hud_config.menu_width * 0.5f, hh = hw * MENU_H / MENU_W;
@@ -1794,6 +1877,28 @@ void vr_frame_end(void) {
         for (uint32_t i = 0; i < wrist_count; i++) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&wrist[i];
     if (submit && menu_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&menu_quad;
     if (submit && beam_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&beam_quad;
+    // Use the overlay path for the final veil, just like the HUD/keyboard it must cover. A second scene
+    // projection layer is not sufficient to keep the veil in front of SteamVR's separately composed overlays.
+    // Head-locked and close to the eyes, with far more angular coverage than the headset FOV: no visible edges.
+    const XrCompositionLayerQuad fade_layer = {.type=XR_TYPE_COMPOSITION_LAYER_QUAD,
+        .layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, .space=view_space,
+        .eyeVisibility=XR_EYE_VISIBILITY_BOTH,
+        .subImage={.swapchain=view_fade_swapchain, .imageRect={{0,0},{8,8}}, .imageArrayIndex=0},
+        .pose={{0,0,0,1},{0,0,-VR_FADE_OVERLAY_DISTANCE}}, .size={VR_FADE_OVERLAY_SIZE,VR_FADE_OVERLAY_SIZE}};
+    const bool has_view_fade = submit && view_fade_acquired && view_fade_ready;
+    static bool had_view_fade;
+    if (had_view_fade && !has_view_fade && getenv("SKYRECOMP_VR_FADE_TRACE")) LOG("[vr-fade] compositor fade cleared\n");
+    had_view_fade = has_view_fade;
+    if (view_fade_acquired) {
+        const bool released = xr_ok(p_xrReleaseSwapchainImage(view_fade_swapchain,
+            &(XrSwapchainImageReleaseInfo){.type=XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}), "xrReleaseSwapchainImage (fade)");
+        if (submit && released && view_fade_ready) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fade_layer;
+        if (getenv("SKYRECOMP_VR_FADE_TRACE") && view_fade_ready) {
+            static unsigned traced;
+            if (traced++ % 30 == 0) LOG("[vr-fade] compositor FINAL head-locked QUAD layer %u, both eyes, release %d, submitted %d\n", nlayers, released, submit);
+        }
+        view_fade_acquired = view_fade_ready = false;
+    }
     if (g_vr_config.dynamic_resolution && frame.work_start_ns && frame.display_period > 0) {
         adaptive_work_sum += (double)(SDL_GetTicksNS() - frame.work_start_ns);
         adaptive_budget_sum += (double)frame.display_period;
@@ -1869,6 +1974,10 @@ bool vr_frame_begin(void) { return false; }
 bool vr_stereo_active(void) { return false; }
 void vr_recenter(void) {}
 void vr_freeze_world(bool freeze, bool frame_is_3d) { (void)freeze; (void)frame_is_3d; }
+bool vr_view_fade_available(void) { return false; }
+bool vr_record_view_fade(void *command_buffer, const float rgba[4]) {
+    (void)command_buffer; (void)rgba; return false;
+}
 bool vr_record_hud_copy(void *command_buffer, void *hud_image, uint32_t w, uint32_t h, bool flip_y, bool opaque) {
     (void)command_buffer; (void)hud_image; (void)w; (void)h; (void)flip_y; (void)opaque;
     return false;

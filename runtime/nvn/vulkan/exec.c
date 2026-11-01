@@ -16,6 +16,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "../../vr/vr_fade.h"
 #include "../renderer.h"
 #include "../../settings.h"
 #include "../../frame_rate.h"
@@ -31,6 +32,8 @@ static uint64_t stat_mv_passes, stat_mv_draws, stat_mv_skipped;  // (VR multivie
 static bool g_stereo_camera_patched;
 static uint64_t g_last_scene_frame;  // (the HUD layer, below: the last frame that drew a 3D scene)
 static bool g_scene_since_present;
+static NvnTexture *g_black_clear_target;
+static uint64_t g_black_clear_frame;
 // Scene depth and projection/decal passes are eye-dependent. A native,
 // depth-only offscreen shadow map is light-space data and can be shared.
 static bool g_stereo_shadow_or_depth;
@@ -1045,8 +1048,10 @@ static bool pass_vrs_attached;
 // list has run and the targets themselves; eye 1's replay then skips the draws and clears of those passes (and
 // their CPU cost) and still runs everything else (its other passes, copies). A target set whose draws need what one
 // pass can't give per eye (a feedback snapshot of the target, a shader the rewrite doesn't understand) is never
-// multiview again. SKYRECOMP_VR_MULTIVIEW=0 turns it off.
+// multiview again. Keep separate-eye rendering as the default while the single-pass cutscene flicker is unresolved;
+// SKYRECOMP_VR_MULTIVIEW=1 opts into the optimization for diagnosis.
 static bool pass_mv;        // the open pass renders both eyes
+static RtState pass_rt;     // the open pass's targets
 static bool pass_mv_skip;   // eye 1: the current targets were rendered by eye 0's multiview pass
 static bool g_mv_list;      // a stereo list is being replayed (either eye)
 static uint32_t mv_epoch;   // render-target commands run so far in this eye of the list
@@ -1064,7 +1069,7 @@ static int mv_nlater;
 // A depth target not scaled like the eyes is a light-space shadow map: the same for both eyes (eye 0's is read).
 static bool mv_shared(const NvnTexture *t) {
     const TexBackend *b = t ? t->backend : NULL;
-    return !b || (!b->eye_layer && !b->scalable && renderer_format_is_depth(t->format));
+    return !t || (b && !b->eye_layer && !b->scalable && renderer_format_is_depth(t->format));
 }
 static void mv_note_later(NvnTexture *t) {
     if (!g_mv_list || vk_vr_eye() || !t || mv_shared(t)) return;
@@ -1080,7 +1085,7 @@ static void vk_end_pass_at(int line);
 
 static bool mv_enabled(void) {
     static int on = -1;
-    if (on < 0) { const char *e = getenv("SKYRECOMP_VR_MULTIVIEW"); on = !e || atoi(e) != 0; }
+    if (on < 0) { const char *e = getenv("SKYRECOMP_VR_MULTIVIEW"); on = e && atoi(e) != 0; }
     return on && g_vk.multiview;
 }
 static uint64_t mv_sig(void) { return hash_words(0x6D76u, &st.rt, sizeof st.rt) | 1; }
@@ -1139,13 +1144,36 @@ static bool mv_eligible(uint64_t sig) {
     }
     return true;
 }
+// Choose once, before selecting a shader. Resolving a draw's textures can promote an attachment to a
+// two-layer image; re-evaluating eligibility in begin_pass would then pair a single-eye pipeline with
+// a multiview render pass. Eye 1 must replay the same decision, including a conservative first use.
+static bool mv_decide(void) {
+    // Materialize first-use attachments before deciding whether the pass has both eye layers. Otherwise a new
+    // effect target is rendered only in eye 0, while its consumer can already sample both layers in multiview.
+    for (int i = 0; i <= st.rt.ncolor; i++) {
+        NvnTexture *t = i == st.rt.ncolor ? st.rt.depth : st.rt.color[i];
+        const TexBackend *b = t ? t->backend : NULL;
+        if (t && (!b || !b->vr_eye)) {
+            vk_end_pass_at(-1);
+            st.rt_dirty = true;
+            (void)vk_tex(t, true);
+        }
+    }
+    const uint64_t sig = mv_sig();
+    const int known = mv_lookup(sig);
+    if (known >= 0) return known == 1;
+    if (mv_npass == (int)(sizeof mv_pass / sizeof mv_pass[0])) return false;
+    const bool mv = in_pass && !memcmp(&pass_rt, &st.rt, sizeof st.rt) ? pass_mv : mv_eligible(sig);
+    mv_pass[mv_npass].epoch = mv_epoch;
+    mv_pass[mv_npass].sig = sig;
+    mv_pass[mv_npass++].mv = mv;
+    return mv;
+}
 // (eye 0, before a draw's program is chosen) Whether the pass this draw goes into renders both eyes.
 static bool mv_for_draw(void) {
     if (!g_mv_list || vk_vr_eye()) return false;
     if (in_pass && !st.rt_dirty) return pass_mv;
-    const uint64_t sig = mv_sig();
-    const int known = mv_lookup(sig);
-    return known >= 0 ? known == 1 : mv_eligible(sig);
+    return mv_decide();
 }
 // (eye 1) The current targets were rendered by eye 0's multiview pass: skip this draw / clear.
 static bool mv_skip(void) {
@@ -1431,21 +1459,20 @@ static bool written_since_barrier(const NvnTexture *t) {  // (the same object, o
     return false;
 }
 
-static RtState pass_rt;  // (the open pass's targets)
 static void begin_pass(void) {
-    if (in_pass && !st.rt_dirty) return;
     // The same targets as the open pass: it goes on (setting the same targets again would otherwise end the pass
     // and start it again, with its attachment barriers)
-    if (in_pass && !memcmp(&pass_rt, &st.rt, sizeof st.rt)) { st.rt_dirty = false; return; }
+    if (in_pass && !memcmp(&pass_rt, &st.rt, sizeof st.rt) &&
+        (!pass_mv || (g_mv_list && !vk_vr_eye()))) {
+        if (g_mv_list && !vk_vr_eye()) (void)mv_decide();
+        st.rt_dirty = false;
+        return;
+    }
     vk_end_pass_at(-1);
     pass_mv_skip = false;
     bool mv = false;  // (VR multiview: eye 0 renders both eyes here)
     if (g_mv_list && !vk_vr_eye()) {
-        const uint64_t sig = mv_sig();
-        const int known = mv_lookup(sig);
-        mv = known >= 0 ? known == 1 : mv_eligible(sig);
-        if (known < 0 && mv_npass < (int)(sizeof mv_pass / sizeof mv_pass[0]))
-            mv_pass[mv_npass].epoch = mv_epoch, mv_pass[mv_npass].sig = sig, mv_pass[mv_npass++].mv = mv;
+        mv = mv_decide();
     }
     static const VkComponentMapping mv_id = {0};
     if (!mv && g_mv_list && !vk_vr_eye()) {  // (eye 1 renders these targets in its own replay, later)
@@ -1888,6 +1915,13 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
     VkRect2D rect = scissor_rect();
     if (!rect.extent.width || !rect.extent.height) return;
     if (index >= 0 && (index >= (int)pass_ncolor || pass_color[index] == VK_FORMAT_UNDEFINED)) return;
+    if (!vk_vr_eye() && index == 0 && (mask & 7) == 7 && st.rt.color[0] &&
+        renderer_texture_presented(st.rt.color[0]) && rect.offset.x == 0 && rect.offset.y == 0 &&
+        rect.extent.width == pass_w && rect.extent.height == pass_h) {
+        const float *rgb = color;
+        g_black_clear_target = rgb[0] == 0 && rgb[1] == 0 && rgb[2] == 0 ? st.rt.color[0] : NULL;
+        g_black_clear_frame = renderer_present_count();
+    }
     bool simple = (index < 0 || (mask & 0xF) == 0xF) && (!stencil || (smask & 0xFF) == 0xFF);
     if (simple) {
         VkClearAttachment a[2];
@@ -2333,6 +2367,7 @@ static VkImageView feedback_view1[4];  // (VR multiview draws: eye 1's, else NUL
 static int nfeedback;
 static uint64_t g_cur_fs_hash;
 static bool g_draw_samples_screen;  // this draw's fragment shader samples a screen-sized GPU-written texture
+static bool g_draw_screen_composite;  // an image-copy quad, despite its perspective camera block
 #define WATER_SURFACE_FS 0xbfc2287ba468fc7full  // (the outdoor water surface's fragment shader)
 
 // Row-major 4x4 inverse (Gauss-Jordan, partial pivoting); false when singular.
@@ -2804,7 +2839,8 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // its camera at slot 2 while using it to project the reflection/refraction scene textures. Probe every fragment
     // uniform through the strict camera classifier so those screen-space effects use the same eye as their geometry.
     // Guest memory keeps the game's mono camera.
-    if ((stage == 0 || stage == 1) && (stage == 1 || idx == 0) && size >= 28 * sizeof(float) && vr_stereo_active()) {
+    if (!g_draw_screen_composite && (stage == 0 || stage == 1) && (stage == 1 || idx == 0) &&
+        size >= 28 * sizeof(float) && vr_stereo_active()) {
         float camera[28];
         const float *source = (const float *)(uintptr_t)r.addr;
         const bool camera_patched = stage == 1 ? vr_patch_scene_fragment_ubo(vk_vr_eye(), camera, source, size)
@@ -3885,6 +3921,26 @@ bool vk_hud_opaque(void) { return hud_full2d() || vr_world_menu_active(); }
 static CmdRec *g_hud_rec;  // (the draw being routed)
 static bool g_hud_candidate;  // this draw is drawn like the 2D layer (decided in draw_ once its program is known)
 static bool g_hud_fullscreen_draw;
+static VrFadeFrame g_view_fade;
+static NvnTexture *g_view_fade_target;
+// Lettering cancels a final fade, but does not make a title card's black backdrop a window onto the last scene.
+bool vk_hud_black_backdrop(NvnTexture *screen) {
+    return screen && ((g_black_clear_target == screen && g_black_clear_frame == renderer_present_count()) ||
+           (g_view_fade_target == screen && g_view_fade.opaque[3] == 1 &&
+            g_view_fade.opaque[0] == 0 && g_view_fade.opaque[1] == 0 && g_view_fade.opaque[2] == 0));
+}
+bool vk_take_view_fade(float rgba[4]) {
+    g_view_fade_target = NULL;
+    return vr_fade_frame_take(&g_view_fade,rgba);
+}
+TexBackend *vk_view_fade_mirror(const float rgba[4]) {
+    extern void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride);
+    static NvnTexture texture = {.width=1, .height=1, .depth=1, .levels=1, .samples=1, .target=1, .format=0x25};
+    uint8_t pixel[4];
+    for (int i=0;i<4;i++) pixel[i]=(uint8_t)lroundf(fminf(1, fmaxf(0,rgba[i]))*255);
+    renderer_upload_rgba(&texture,pixel,1,1,4);
+    return vk_tex(&texture,false);
+}
 static bool g_fullscreen_quad_frame;  // a full-screen 2D quad (a fade, a flash) since the last present
 // (device.c, at present) Whether this frame drew a full-screen 2D quad - then the eyes carry it over the whole view
 // and the panel is never opaque nor a copy of the frame (it showed as a black rectangle during fades); resets.
@@ -3953,8 +4009,7 @@ static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
     g_hud_rec = r;
     g_hud_candidate = vk_hud_layer_on() && st.program && (hud_clear_for_frame(), !hud_full2d()) && is_hud_draw();
-    extern bool motion_vr_calibration_hidden(void);  // (hle/motion.c: the motion calibration prompt, answered for the
-    if (g_hud_candidate && (motion_vr_calibration_hidden() || hud_letterbox_bar())) {  // player, is never shown)
+    if (g_hud_candidate && hud_letterbox_bar()) {
         g_hud_candidate = false;
         stat_skipped++;
         PROF_ADD(prof_draw);
@@ -3985,22 +4040,15 @@ static void draw(CmdRec *r, bool indexed) {
 }
 
 // (draw_, its program known) Where a 2D-layer draw goes. Some of the 2D layer's draws composite the 3D scene
-// (bloom, the title's haze, the file select's backdrop): they read a texture made from this frame's scene and stay
+// (bloom, the title's haze): they read a texture made from this frame's scene and stay
 // in the eyes. The rest renders once, in eye 0, into the HUD texture; eye 1 skips it. False: skip the draw.
 static bool hud_route(Prog *pr) {
     const uint64_t fr1 = renderer_present_count() + 1;
     const uint64_t fs = st.program ? st.program->stages[1].code_addr : 0;
     const uint64_t fs_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
-    // Skyward Sword's void-dream flare is five layered four-vertex effect quads using static I8 textures.  Because
-    // they neither sample a scene render target nor carry scene_frame metadata, the generic HUD classifier treated
-    // them as UI and exposed their rectangular bounds on the floating panel.  Captured at the reported frame with
-    // SKYRECOMP_VR_HUD_TRACE; these layers belong in both eyes as part of the cutscene composition.
-    static const uint64_t void_eye_fx[] = {
-        0xc52964779a815b1eull, 0xd98c778c14781ffaull, 0xceabdb297885901aull,
-        0x68482eb700779dacull, 0x434ce7269a7234d6ull,
-    };
-    for (int i = 0; i < (int)(sizeof void_eye_fx / sizeof void_eye_fx[0]); i++)
-        if (fs_hash == void_eye_fx[i]) return true;
+    // Static layout layers include the void dialogue's patterned purple background. They must follow its text
+    // onto the HUD; a shader-wide "void effect" exemption separated the box from its lettering. Screen-sized
+    // backgrounds and scene-derived composites are classified by geometry/provenance instead.
     bool reads_scene = false;
     bool reads_screen_rt = false;
     for (int i = 0; i < pr->fi->ntex && i < 64 && !reads_scene; i++) {
@@ -4016,7 +4064,13 @@ static bool hud_route(Prog *pr) {
         // fallback the effect's rectangular intermediate becomes a floating HUD card in the void sequence.
         if (b && b->gpu_owned && t->width >= 160 && t->height >= 90 && !recently_presented(t)) reads_screen_rt = true;
     }
-    if (reads_scene || reads_screen_rt) {
+    // The selected save's parchment backing uses a layout shader with a static 256x512 mask and a small rendered
+    // texture. That second input inherits scene provenance, but the quad is UI: leaving it in the eyes separates
+    // it from the save details/buttons on the HUD panel. Measured on the selected-save screen, not the title.
+    // Restrict this exception to that layout shader and its two-texture, non-fullscreen draw; scene composites,
+    // including the measured void cutscene effects above, keep their existing stereo routing.
+    const bool layout_backdrop = fs_hash == 0x47b40805275c9a4aull && pr->fi->ntex == 2 && !hud_fullscreen_quad();
+    if ((reads_scene || reads_screen_rt) && !layout_backdrop) {
         // A live-scene composite is part of the stereo view even when its quad is not the canonical 0..1 shape.
         // The old unit-quad requirement routed cutscene bloom/flares to the HUD, exposing their rectangular bounds.
         // Only an intentionally active world-menu panel may use a scene sample as its frosted HUD backdrop.
@@ -4132,6 +4186,47 @@ static void draw_(CmdRec *r, bool indexed) {
         stat_skipped++;
         return;
     }
+    bool view_fade_draw = false;
+    // The native solid layout shader carries uniform colour in VS cb3[7], not at FS cbuf[0].
+    // Handle alpha ramps and the opaque hold in the same full-view fade path. Keep native opaque fills until
+    // present: a later content draw cancels promotion, preserving normal backgrounds behind menu text.
+    if (vr_stereo_active() && !indexed && r->x[0] == 7 && r->x[2] == 4 &&
+        pr->vi->attr_mask == 1 && pr->fi->ntex == 0 && is_hud_draw() && !st.ds[0] && !st.ds[3] && st.rt.ncolor == 1 &&
+        st.rt.color[0] && renderer_texture_presented(st.rt.color[0]) &&
+        (!(st.color_state[0] & 1) || (st.blend[0][1] == 5 && st.blend[0][2] == 6 && st.blend[0][5] == 1)) &&
+        (st.channel_mask & 7) == 7 && st.ubuf[0][0].addr && st.ubuf[0][0].size == 192 &&
+        st.attrib[0] == 0x22 && st.stream[0][0] == 12 && st.vbuf[0].addr &&
+        r->x[1] <= st.vbuf[0].size / 12 && st.vbuf[0].size / 12 - r->x[1] >= 4 &&
+        st.viewport[0][0] == 0 && st.viewport[0][1] == 0 &&
+        st.viewport[0][2] >= st.rt.color[0]->width && st.viewport[0][3] >= st.rt.color[0]->height &&
+        st.scissor[0][0] == 0 && st.scissor[0][1] == 0 &&
+        st.scissor[0][2] >= st.rt.color[0]->width && st.scissor[0][3] >= st.rt.color[0]->height) {
+        const uint64_t fs_hash = hmix(1469598103934665603ull, (const void *)(uintptr_t)(pr->code[1] + 0x30), 0x200);
+        float rgba[4];
+        const float (*vertices)[3] = (const float (*)[3])(uintptr_t)(st.vbuf[0].addr + r->x[1] * 12);
+        if (fs_hash == 0x8574d5dbe7039811ull && vr_fade_quad_color((const float *)(uintptr_t)st.ubuf[0][0].addr, vertices, rgba) && vr_view_fade_available()) {
+            view_fade_draw = true;
+            const bool keep_native = g_view_fade.opaque_last || !(st.color_state[0] & 1);
+            if (!vk_vr_eye()) {
+                g_view_fade_target = st.rt.color[0];
+                vr_fade_frame_fill(&g_view_fade, rgba, (st.color_state[0] & 1) != 0);
+                if (getenv("SKYRECOMP_VR_FADE_TRACE") && renderer_present_count() % 30 == 0)
+                    LOG("[vr-fade] frame %llu native rgba %.4f %.4f %.4f %.4f %s -> full headset\n",
+                        (unsigned long long)renderer_present_count(),rgba[0],rgba[1],rgba[2],rgba[3],
+                        (st.color_state[0] & 1) ? "blend" : "opaque hold");
+            }
+            if (!keep_native) {
+                stat_skipped++;
+                return; // Alpha ramps are composited once. Opaque fills remain native unless final at present.
+            }
+        }
+    }
+    // Work on another image cannot reveal content behind this fill. Only later content on its own target
+    // distinguishes an opaque menu background from a final full-view veil.
+    if (!vk_vr_eye() && !view_fade_draw && g_view_fade_target) {
+        for (int i = 0; i < st.rt.ncolor; i++)
+            if (st.rt.color[i] == g_view_fade_target) vr_fade_frame_draw(&g_view_fade);
+    }
     // A textured full-screen quad can be the title or file-select background.  Only a textureless black/white fill
     // owns the whole view as a fade; suppressing every full-screen quad makes those screens disappear in VR.
     if (g_hud_fullscreen_draw && pr->fi->ntex == 0 && st.ubuf[1][0].addr && st.ubuf[1][0].size >= 12) {
@@ -4140,7 +4235,10 @@ static void draw_(CmdRec *r, bool indexed) {
         const bool white = c[0] > 0.99f && c[1] > 0.99f && c[2] > 0.99f;
         if (black || white) g_fullscreen_2d_since_present = true;
     }
-    if (g_hud_candidate && !hud_route(pr)) { stat_skipped++; return; }  // (VR HUD layer, see draw())
+    // A recognized full-view fill stays in the eyes while we decide whether it is a final veil or an opaque
+    // background followed by scene content. Routing that native hold to the HUD leaves a black card over the
+    // world even after later scene draws correctly cancel promotion to the final compositor fade.
+    if (g_hud_candidate && !view_fade_draw && !hud_route(pr)) { stat_skipped++; return; }
     if (vk_hud_layer_on()) hud_mark_scene_targets(pr);
     {   // SKYRECOMP_VR_DRAW_LOG=<frame>: that frame's draws (eye 0)
         static long at = -2;
@@ -4239,6 +4337,27 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         if (g_debug_frame && getenv("LARECOMP_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
+        // The void cutscene's depth composite uses a perspective camera to place a screen image on a quad.
+        // Its source already contains this eye's scene. Replacing that camera with the headset camera projects
+        // the image a second time, adding a smaller Link/flare over the correctly rendered world.
+        g_draw_screen_composite = false;
+        if (vr_stereo_active() && g_cur_fs_hash == 0x5baac408d0a0e46eull && !indexed &&
+            r->x[0] == 7 && r->x[2] == 4 && pr->fi->ntex == 1) {
+            NvnTexture *source = shader_texture_object(1, &pr->fi->tex[0]);
+            const TexBackend *image = source ? (const TexBackend *)source->backend : NULL;
+            g_draw_screen_composite = image && image->gpu_owned && source->width >= 160 && source->height >= 90;
+        }
+        // This cutscene uses another depth-of-field composite. Skipping only the older blur shader
+        // leaves its low-resolution image blended over Link even with Depth of Field disabled.
+        if (g_draw_screen_composite && !g_settings.vr_dof) { stat_skipped++; return; }
+        // Keep the glow's offscreen producers intact; only its final screen overlay softens the eye image.
+        if (vr_stereo_active() && last_hash == 0x8e6c006313fee204ull && pr->fi->ntex == 1 &&
+            st.rt.ncolor && recently_presented(st.rt.color[0]) && hud_fullscreen_quad() &&
+            !g_settings.vr_bloom) {
+            NvnTexture *source = shader_texture_object(1, &pr->fi->tex[0]);
+            const TexBackend *image = source ? (const TexBackend *)source->backend : NULL;
+            if (image && image->gpu_owned) { stat_skipped++; return; }
+        }
         {   // Reverse-engineering capture for Skyward Sword's native bomb trajectory guide. Unlike the normal F9
             // summary, this preserves every ribbon segment and the complete landing mesh/instance stream so a
             // standalone VR renderer can reproduce the original geometry and material exactly.
@@ -4439,7 +4558,10 @@ static void draw_(CmdRec *r, bool indexed) {
     // ---- rasterizer
     uint8_t cull = st.poly[0];
     if (vkey.flip_x) cull = 0;  // (mirror mode's composite: one full-screen quad, either winding)
-    VkCullModeFlags cm = cull == 1 ? VK_CULL_MODE_FRONT_BIT : cull == 2 ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    // (NVN Face: 1 front, 2 back, 3 front and back. 3 is how the game hides a material's polygons - the Remlit's night
+    // face and claws by day (zeldaret/ss d_a_e_remly.cpp applyScaryMat) - and was drawn as none)
+    VkCullModeFlags cm = cull == 1 ? VK_CULL_MODE_FRONT_BIT : cull == 2 ? VK_CULL_MODE_BACK_BIT
+                       : cull == 3 ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE;
     if (ss_need(SS_CULL, ss.cull == cm)) { ss.cull = cm; vkCmdSetCullMode(cb, cm); }
     bool ccw = st.poly[1] == 1;
     static int flipw = -1;  // LARECOMP_VK_FLIP_WINDING: invert the front-face mapping (A/B against Metal)
@@ -5389,7 +5511,8 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
 
 // VR: eye `eye`'s game image -> the headset's eye size ow x oh (vr.c then copies the result 1:1). The Video tab's
 // choices apply: rendered above the headset's size (supersampling), a filtered downscale (down.frag), SMAA
-// ("Anti-aliasing") and a light RCAS sharpen; below it, SMAA then the "Upscaler" (FSR 1 / NIS) as on the desktop. Returns the image to copy (b itself when nothing applies). SKYRECOMP_VR_EYE_POST=0: none.
+// ("Anti-aliasing") and a light RCAS sharpen; at native size, SMAA without resampling or sharpening; below it, SMAA then
+// the "Upscaler" (FSR 1 / NIS) as on the desktop. Returns the image to copy. SKYRECOMP_VR_EYE_POST=0: none.
 TexBackend *vk_vr_eye_post(int eye, TexBackend *b, uint32_t ow, uint32_t oh) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("SKYRECOMP_VR_EYE_POST"); on = !e || atoi(e) != 0; }

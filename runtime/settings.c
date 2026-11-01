@@ -44,6 +44,7 @@ Settings g_settings = {
     .async_replay = true,
     .vr_world_in_menus = true,
     .vr_dof = false,
+    .vr_bloom = false,
     .vr_near_clip = 15.0f,
     .reshade = true,
     .frame_rate = 60,
@@ -231,6 +232,7 @@ void settings_load(void) {
         else if (!strcmp(key, "vr_fast_post")) g_settings.vr_fast_post = atoi(val) != 0;
         else if (!strcmp(key, "vr_world_in_menus")) g_settings.vr_world_in_menus = atoi(val) != 0;
         else if (!strcmp(key, "vr_dof")) g_settings.vr_dof = atoi(val) != 0;
+        else if (!strcmp(key, "vr_bloom")) g_settings.vr_bloom = atoi(val) != 0;
         else if (!strcmp(key, "watercolor_filter"))
             g_settings.watercolor_filter = !strcmp(val, "off") || !strcmp(val, "0") ? WATERCOLOR_OFF :
                                            !strcmp(val, "resolution_aware") ? WATERCOLOR_RESOLUTION : WATERCOLOR_ORIGINAL;
@@ -324,6 +326,7 @@ void settings_save(void) {
             g_settings.vr_foveation, g_settings.vr_world_in_menus, g_settings.vr_dof);
     fprintf(f, "vr_foveation_inner = %.2f\nvr_foveation_outer = %.2f\nvr_fast_post = %d\n",
             g_settings.vr_foveation_inner, g_settings.vr_foveation_outer, g_settings.vr_fast_post);
+    fprintf(f, "vr_bloom = %d\n", g_settings.vr_bloom);
     fprintf(f, "volume = %.2f\n", g_settings.volume);
     fprintf(f, "reverb = %d\n", g_settings.reverb);
     fprintf(f, "movie_audio = %d\n", g_settings.movie_audio);
