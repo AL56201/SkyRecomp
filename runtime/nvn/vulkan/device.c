@@ -1047,8 +1047,34 @@ void backend_present(NvnTexture *t) {
         if (mirror) {
             VkExtent2D extent = vk_frame_extent();
             float pv[8] = {renderer_origin_lower_left() ? 1.0f : 0.0f, 0, 0, 0, g_vr_crop[0], g_vr_crop[1], g_vr_crop[2], g_vr_crop[3]};
-            if (!g_cinema && !g_black_backdrop) vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
-            {   // the HUD panel's 2D layer (the HUD, menus, map) over it, as the headset shows it: 16:9 in the middle
+            // Exactly what the headset is given: this frame's composition layers (vr.c), the same images in the same
+            // order, as the left eye sees them - no mirror-only drawing to drift from the headset.
+            VrMirrorLayer ml[9];
+            const int nml = vr_mirror_layers(ml, 9);
+            if (nml > 0) {
+                // The eye image's full width across the window, top and bottom cropped (no stretch): every layer's
+                // clip y scaled by the same factor, so the panels stay where the eye image has them.
+                const float k = ml[0].height && extent.height
+                                    ? ((float)extent.width / extent.height) / ((float)ml[0].width / ml[0].height) : 1.0f;
+                for (int i = 0; i < nml; i++) {
+                    if (ml[i].full) {
+                        memset(ml[i].mvp, 0, sizeof ml[i].mvp);
+                        ml[i].mvp[0] = 1, ml[i].mvp[5] = -1, ml[i].mvp[10] = 1, ml[i].mvp[15] = 1;
+                        ml[i].full = false;
+                    }
+                    for (int c = 0; c < 4; c++) ml[i].mvp[c * 4 + 1] *= k;
+                }
+                extern void vk_present_layer(VkCommandBuffer cb, const VrMirrorLayer *l);
+                vk_frame_suspend();
+                vr_mirror_barriers((void *)vk_cmd(), ml, nml, true);
+                vk_frame_resume();
+                for (int i = 0; i < nml; i++) vk_present_layer(vk_cmd(), &ml[i]);
+                vk_frame_suspend();
+                vr_mirror_barriers((void *)vk_cmd(), ml, nml, false);
+                vk_frame_resume();
+            }
+            if (nml <= 0 && !g_cinema && !g_black_backdrop) vk_present_draw(vk_cmd(), mirror_src, 0, 0, (float)extent.width, (float)extent.height, pv);
+            if (nml <= 0) {   // (no headset frame to copy: the HUD panel's 2D layer over it, 16:9 in the middle)
                 extern bool vk_hud_layer_on(void), vk_hud_opaque(void);
                 extern TexBackend *vk_hud_backend(void);
                 extern bool vr_world_menu_active(void);
@@ -1073,7 +1099,7 @@ void backend_present(NvnTexture *t) {
             }
             pt_mark(PT_MIRROR_DRAW);
             if (!g_vr_menu_on_panel) menu_render((void *)vk_cmd(), extent.width, extent.height);  // (else: on the panel)
-            if (view_fade_mirror) {
+            if (nml <= 0 && view_fade_mirror) {
                 extern void vk_present_overlay(VkCommandBuffer cb, TexBackend *b, float x, float y, float w, float h, const float pv[8], bool opaque);
                 const float full[8]={0,0,0,0,0,0,1,1};
                 vk_present_overlay(vk_cmd(),view_fade_mirror,0,0,(float)extent.width,(float)extent.height,full,false);

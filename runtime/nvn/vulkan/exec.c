@@ -5310,14 +5310,17 @@ static void copy_texture(const TexRefRec *src, const TexRefRec *dst, uint64_t fl
 static VkPipelineLayout present_layout;
 static VkDescriptorSetLayout present_set_layout;
 
-static VkPipeline present_pipeline_ex(VkFormat fmt, bool over, bool quad);
+static VkPipeline present_pipeline_srgb(VkFormat fmt, bool over, bool quad, bool srgb);
+static VkPipeline present_pipeline_ex(VkFormat fmt, bool over, bool quad) { return present_pipeline_srgb(fmt, over, quad, false); }
 static VkPipeline present_pipeline(VkFormat fmt) { return present_pipeline_ex(fmt, false, false); }
-static VkPipelineLayout quad_layout;  // (present's set layout; push: mat4 mvp + vec4, vertex stage)
-// over: the premultiplied texture blended over what is there (the VR HUD on the desktop mirror)
-static VkPipeline present_pipeline_ex(VkFormat fmt, bool over, bool quad) {
-    static struct { VkFormat f; bool over, quad; VkPipeline p; } cache[8];
-    for (int i = 0; i < 8; i++)
-        if (cache[i].p && cache[i].f == fmt && cache[i].over == over && cache[i].quad == quad) return cache[i].p;
+static VkPipelineLayout quad_layout;  // (present's set layout; push: mat4 mvp + vec4 + vec4 uv rect, vertex stage)
+// over: the premultiplied texture blended over what is there (the VR HUD on the desktop mirror); srgb: the texture is
+// read through an sRGB view and encoded again (the VR mirror's layers: their own format, no reinterpreting view)
+static VkPipeline present_pipeline_srgb(VkFormat fmt, bool over, bool quad, bool srgb) {
+    static struct { VkFormat f; bool over, quad, srgb; VkPipeline p; } cache[16];
+    for (int i = 0; i < 16; i++)
+        if (cache[i].p && cache[i].f == fmt && cache[i].over == over && cache[i].quad == quad && cache[i].srgb == srgb)
+            return cache[i].p;
     if (!present_layout) {
         VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
@@ -5326,7 +5329,7 @@ static VkPipeline present_pipeline_ex(VkFormat fmt, bool over, bool quad) {
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &present_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &present_layout));
-        VkPushConstantRange q = {VK_SHADER_STAGE_VERTEX_BIT, 0, 80};
+        VkPushConstantRange q = {VK_SHADER_STAGE_VERTEX_BIT, 0, 96};
         ci.pPushConstantRanges = &q;
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &quad_layout));
     }
@@ -5334,7 +5337,7 @@ static VkPipeline present_pipeline_ex(VkFormat fmt, bool over, bool quad) {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT,
          .module = vk_builtin_shader(quad ? "hud_quad.vert" : "present.vert"), .pName = "main"},
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
-         .module = vk_builtin_shader(over ? "present_over.frag" : "present.frag"), .pName = "main"}};
+         .module = vk_builtin_shader(srgb ? "present_srgb.frag" : over ? "present_over.frag" : "present.frag"), .pName = "main"}};
     VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
                                                  .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
@@ -5364,8 +5367,8 @@ static VkPipeline present_pipeline_ex(VkFormat fmt, bool over, bool quad) {
                                        .layout = quad ? quad_layout : present_layout};
     VkPipeline p;
     VK_CHECK(vk_create_graphics_pipelines(1, &pi, &p));
-    for (int i = 0; i < 8; i++)
-        if (!cache[i].p) { cache[i].f = fmt; cache[i].over = over; cache[i].quad = quad; cache[i].p = p; break; }
+    for (int i = 0; i < 16; i++)
+        if (!cache[i].p) { cache[i].f = fmt; cache[i].over = over; cache[i].quad = quad; cache[i].srgb = srgb; cache[i].p = p; break; }
     return p;
 }
 
@@ -5777,9 +5780,50 @@ void vk_present_hud_quad(VkCommandBuffer cb, TexBackend *b, const float mvp[16],
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, quad_layout, 0, 1, &ds, 0, NULL);
     VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &full);
-    float pc[20];
+    float pc[24];
     memcpy(pc, mvp, 16 * sizeof(float));
     pc[16] = flip ? 1.0f : 0.0f, pc[17] = pc[18] = pc[19] = 0;
+    pc[20] = pc[21] = 0, pc[22] = pc[23] = 1;
+    vkCmdPushConstants(cb, quad_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
+    vkCmdDraw(cb, 6, 1, 0, 0);
+}
+
+// (device.c, the VR desktop mirror) One composition layer as the left eye sees it (vr_mirror_layers): the very
+// swapchain image the compositor gets, read in its own (sRGB) format and encoded again for the window.
+void vk_present_layer(VkCommandBuffer cb, const VrMirrorLayer *l) {
+    enum { WRAPS = 64 };
+    static TexBackend wrap[WRAPS];
+    static int next;
+    TexBackend *b = NULL;
+    for (int i = 0; i < WRAPS && !b; i++)
+        if (wrap[i].image == (VkImage)l->image && wrap[i].width == l->width && wrap[i].height == l->height &&
+            wrap[i].layers == l->layers && wrap[i].format == (VkFormat)l->format) b = &wrap[i];
+    if (!b) {  // (a new swapchain image: its views are made on first use; one recycled after 64 others)
+        b = &wrap[next];
+        next = (next + 1) % WRAPS;
+        if (b->image) vk_views_forget(b);
+        *b = (TexBackend){.image = (VkImage)l->image, .format = (VkFormat)l->format, .width = l->width,
+                          .height = l->height, .depth = 1, .layers = l->layers, .levels = 1, .samples = 1,
+                          .aspect = VK_IMAGE_ASPECT_COLOR_BIT,
+                          .base_type = l->layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D};
+    }
+    const bool srgb = b->format == VK_FORMAT_R8G8B8A8_SRGB || b->format == VK_FORMAT_B8G8R8A8_SRGB;
+    VkPipeline p = present_pipeline_srgb(g_vk.sc_format, l->blend, true, srgb);
+    VkDescriptorSet ds = vk_alloc_set(present_set_layout);
+    static const VkComponentMapping id = {0};
+    VkImageView view = vk_image_view(b, VK_IMAGE_VIEW_TYPE_2D, b->format, 0, 1, 0, 1, id, VK_IMAGE_ASPECT_COLOR_BIT);
+    VkDescriptorImageInfo ii = {vk_default_sampler(true), view, VK_IMAGE_LAYOUT_GENERAL};
+    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
+                              .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
+    vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, quad_layout, 0, 1, &ds, 0, NULL);
+    VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
+    vkCmdSetViewport(cb, 0, 1, &full);
+    float pc[24] = {0};
+    if (l->full) pc[0] = 1, pc[5] = -1, pc[10] = 1, pc[15] = 1;  // (the quad's -1..1 over the window, top row first)
+    else memcpy(pc, l->mvp, 16 * sizeof(float));
+    memcpy(pc + 20, l->rect, 4 * sizeof(float));
     vkCmdPushConstants(cb, quad_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof pc, pc);
     vkCmdDraw(cb, 6, 1, 0, 0);
 }

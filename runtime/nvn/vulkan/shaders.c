@@ -255,7 +255,7 @@ static const char *builtin_src(const char *name, int *stage) {
         // pc.mvp: panel (x, y in -1..1 over its half extents) -> clip; pc.a.x: flip (lower-left origin texture)
         *stage = STAGE_VERTEX;
         return "#version 450\n"
-               "layout(push_constant) uniform P { mat4 mvp; vec4 a; } pc;\n"
+               "layout(push_constant) uniform P { mat4 mvp; vec4 a; vec4 rect; } pc;\n"  // rect: uv origin, size
                "layout(location = 0) out vec2 uv;\n"
                "const vec2 c[6] = vec2[6](vec2(-1,-1), vec2(1,-1), vec2(1,1), vec2(-1,-1), vec2(1,1), vec2(-1,1));\n"
                "void main() {\n"
@@ -263,7 +263,17 @@ static const char *builtin_src(const char *name, int *stage) {
                "  gl_Position = pc.mvp * vec4(p, 0.0, 1.0);\n"
                "  uv = vec2(p.x * 0.5 + 0.5, 0.5 - p.y * 0.5);\n"
                "  if (pc.a.x > 0.5) uv.y = 1.0 - uv.y;\n"
+               "  uv = pc.rect.xy + uv * pc.rect.zw;\n"
                "}\n";
+    }
+    if (!strcmp(name, "present_srgb.frag")) {  // (the VR mirror's layers: read decoded, encoded again for the window)
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(location = 0) in vec2 uv;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 enc(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }\n"
+               "void main() { vec4 c = texture(t, uv); o = vec4(enc(clamp(c.rgb, 0.0, 1.0)), c.a); }\n";
     }
     if (!strcmp(name, "present_over.frag")) {  // (the VR HUD texture over the desktop mirror: premultiplied, blended)
         *stage = STAGE_FRAGMENT;

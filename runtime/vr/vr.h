@@ -80,4 +80,16 @@ bool vr_view_fade_available(void);
 // Latest OpenXR grip poses (vr_input.c) for the wrist HUD: {qx, qy, qz, qw, px, py, pz} in the local space.
 void vr_set_grip_poses(bool left_tracked, const float left_pose[7], bool right_tracked, const float right_pose[7]);
 void vr_frame_end(void);
+// The desktop mirror: the composition layers this frame submits, in order, as the left eye sees them. image: a
+// VkImage (the swapchain's, sampled through a UNORM view); rect: the sub-image in uv (origin, size); mvp:
+// column-major clip-from-quad over its (x, y) in -1..1 (full: the eye image filling the window instead); blend: its
+// premultiplied alpha, else opaque.
+typedef struct VrMirrorLayer {
+    void *image;
+    uint32_t format, width, height, layers;
+    float rect[4], mvp[16];
+    bool blend, full;
+} VrMirrorLayer;
+int vr_mirror_layers(VrMirrorLayer *out, int max);
+void vr_mirror_barriers(void *command_buffer, const VrMirrorLayer *layers, int n, bool to_read);
 extern float g_vr_gpu_ms;  // the last measured GPU frame time in ms (exec.c), for dynamic resolution

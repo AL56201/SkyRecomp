@@ -98,6 +98,8 @@ static VkDevice vk_device;
 static VkPhysicalDevice vk_physical_device;
 static VkImage staging;              // (create_staging)
 static VkDeviceMemory staging_memory;
+// The desktop mirror samples the very images the compositor gets (vr_mirror_layers).
+#define MIRROR_USAGE XR_SWAPCHAIN_USAGE_SAMPLED_BIT
 static XrSwapchain swapchain = XR_NULL_HANDLE;  // one image per frame, array layer = eye
 static VkFormat swapchain_format;
 static uint32_t eye_width, eye_height, image_count;
@@ -389,7 +391,7 @@ static bool create_swapchain(void) {
     }
 
     XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
-                                .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
+                                .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | MIRROR_USAGE,
                                 .format = swapchain_format, .sampleCount = 1, .width = eye_width, .height = eye_height,
                                 .faceCount = 1, .arraySize = 2, .mipCount = 1};
     if (!xr_ok(p_xrCreateSwapchain(xr_session, &ci, &swapchain), "xrCreateSwapchain") ||
@@ -1111,7 +1113,7 @@ static bool hud_create(void) {
     if (hud_failed || !xr_session || swapchain_format == VK_FORMAT_UNDEFINED) return false;
     hud_failed = true;  // (until it all succeeds)
     XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
-                                .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
+                                .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | MIRROR_USAGE,
                                 .format = swapchain_format, .sampleCount = 1, .width = HUD_W, .height = HUD_H,
                                 .faceCount = 1, .arraySize = 1, .mipCount = 1};
     if (!xr_ok(p_xrCreateSwapchain(xr_session, &ci, &hud_swapchain), "xrCreateSwapchain (HUD)") ||
@@ -1186,7 +1188,7 @@ bool vr_view_fade_available(void) {
     if (!view_fade_swapchain) {
         view_fade_failed = true;
         XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
-            .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
+            .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | MIRROR_USAGE,
             .format = swapchain_format, .sampleCount = 1, .width = 8, .height = 8,
             .faceCount = 1, .arraySize = 1, .mipCount = 1};
         if (!xr_ok(p_xrCreateSwapchain(xr_session, &ci, &view_fade_swapchain), "xrCreateSwapchain (fade)") ||
@@ -1384,7 +1386,7 @@ static bool menu_create(void) {
     if (menu_failed || !xr_session || swapchain_format == VK_FORMAT_UNDEFINED) return false;
     menu_failed = true;  // (until it all succeeds)
     XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO,
-                                .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
+                                .usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | MIRROR_USAGE,
                                 .format = swapchain_format, .sampleCount = 1, .width = MENU_W, .height = MENU_H,
                                 .faceCount = 1, .arraySize = 1, .mipCount = 1};
     if (!xr_ok(p_xrCreateSwapchain(xr_session, &ci, &menu_swapchain), "xrCreateSwapchain (menu)") ||
@@ -1425,7 +1427,7 @@ static void beam_fill(VkCommandBuffer cb) {
     if (beam_ready || beam_failed || !xr_session || swapchain_format == VK_FORMAT_UNDEFINED) return;
     beam_failed = true;  // (until it all succeeds)
     XrSwapchainCreateInfo ci = {.type = XR_TYPE_SWAPCHAIN_CREATE_INFO, .createFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT,
-                                .usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT,
+                                .usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | MIRROR_USAGE,
                                 .format = swapchain_format, .sampleCount = 1, .width = BEAM_W, .height = BEAM_H,
                                 .faceCount = 1, .arraySize = 1, .mipCount = 1};
     uint32_t n = 1;
@@ -1780,70 +1782,60 @@ static bool wrist_hud_glanced(int hand, XrPosef panel) {
     return hand_facing > .25f && head_gaze > .87f;
 }
 
-void vr_frame_end(void) {
-    if (!frame.begun) return;
-    static int release_logged, end_logged;
-    static uint64_t frames;
-    set_stage(STAGE_END_FRAME);
-    // Release only after the blits were queued (OpenXR orders the compositor's reads after prior submissions on the
-    // session's queue; no CPU wait for the GPU is needed).
-    bool release_ok = frame.acquired &&
-        xr_frame_ok(p_xrReleaseSwapchainImage(swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
-                    "xrReleaseSwapchainImage", &release_logged);
+// ---- this frame's composition layers, built once: xrEndFrame submits them, and the desktop mirror draws the very
+// same list (vr_mirror_layers) - so whatever the headset shows, the mirror shows, without per-layer mirror code.
+// Built from what was acquired and copied this frame; vr_frame_end then drops any whose release failed.
+static struct {
+    bool built, proj, hud, menu, beam, fade, use_wrist;
+    uint32_t wrist_count;
     XrCompositionLayerProjectionView pv[2];
+    XrCompositionLayerProjection layer;
+    XrCompositionLayerQuad quad, menu_quad, beam_quad, wrist[2], fade_layer;
+} fl;
+
+static void build_layers(void) {
+    if (fl.built) return;
+    fl.built = true;
     for (uint32_t eye = 0; eye < 2; eye++)
-        pv[eye] = (XrCompositionLayerProjectionView){
+        fl.pv[eye] = (XrCompositionLayerProjectionView){
             .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
             .pose = frame.frozen_used ? frozen_views[eye].pose : frame.views[eye].pose,
             .fov = frame.frozen_used ? frozen_views[eye].fov : frame.views[eye].fov,
             .subImage = {.swapchain = swapchain, .imageRect = {{0, 0}, {(int32_t)eye_width, (int32_t)eye_height}},
                          .imageArrayIndex = eye}};
-    XrCompositionLayerProjection layer = {.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION, .space = local_space,
-                                          .viewCount = 2, .views = pv};
-    const bool submit = release_ok && frame.copied;
+    fl.layer = (XrCompositionLayerProjection){.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION, .space = local_space,
+                                              .viewCount = 2, .views = fl.pv};
+    fl.proj = frame.acquired && frame.copied;
     // The HUD panel (vr_record_hud_copy): over the eyes, blended by its (premultiplied) alpha; opaque for a
     // full-screen 2D frame (the map), in front of the frozen world.
-    static int hud_release_logged;
-    const bool hud_ok = frame.hud_acquired &&
-        xr_frame_ok(p_xrReleaseSwapchainImage(hud_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
-                    "xrReleaseSwapchainImage (HUD)", &hud_release_logged) && frame.hud_copied;
+    fl.hud = frame.hud_acquired && frame.hud_copied;
     const float hud_w = 1.6f * g_vr_hud_config.hud_scale * hud_size_factor();
-    XrCompositionLayerQuad quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
-                                   .layerFlags = frame.hud_opaque ? 0 : XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-                                   .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
-                                   .subImage = {.swapchain = hud_swapchain, .imageRect = {{0, 0}, {HUD_W, HUD_H}}, .imageArrayIndex = 0},
-                                   .pose = hud_ok ? hud_pose() : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}},
-                                   .size = {hud_w, hud_w * HUD_H / HUD_W}};
+    fl.quad = (XrCompositionLayerQuad){.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+                                       .layerFlags = frame.hud_opaque ? 0 : XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                                       .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+                                       .subImage = {.swapchain = hud_swapchain, .imageRect = {{0, 0}, {HUD_W, HUD_H}}, .imageArrayIndex = 0},
+                                       .pose = fl.hud ? hud_pose() : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}},
+                                       .size = {hud_w, hud_w * HUD_H / HUD_W}};
     // The settings menu's panel and the beam (menu_panel_update, vr_record_menu_copy), in front of everything.
-    static int menu_release_logged;
-    const bool menu_ok = menu_acquired &&
-        xr_frame_ok(p_xrReleaseSwapchainImage(menu_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
-                    "xrReleaseSwapchainImage (menu)", &menu_release_logged) && menu_copied && g_menu_placed;
-    menu_acquired = menu_copied = false;
-    {   static bool beam_released;  // (the static image: released once, after its fill was recorded)
-        if (beam_ready && !beam_released)
-            beam_released = XR_SUCCEEDED(p_xrReleaseSwapchainImage(beam_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}));
-        if (!beam_ready) beam_released = false;
-    }
+    fl.menu = menu_acquired && menu_copied && g_menu_placed;
     const float menu_w = menu_panel_width();
-    const XrCompositionLayerQuad menu_quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+    fl.menu_quad = (XrCompositionLayerQuad){.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
         .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
         .subImage = {.swapchain = menu_swapchain, .imageRect = {{0, 0}, {MENU_W, MENU_H}}, .imageArrayIndex = 0},
-        .pose = menu_ok ? menu_pose() : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}}, .size = {menu_w, menu_w * MENU_H / MENU_W}};
+        .pose = fl.menu ? menu_pose() : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}}, .size = {menu_w, menu_w * MENU_H / MENU_W}};
     XrPosef bp;
     float beam_len = 0;
-    const bool beam_ok = menu_ok && !g_menu_passive && beam_pose(&bp, &beam_len);
-    const XrCompositionLayerQuad beam_quad = {.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+    fl.beam = fl.menu && !g_menu_passive && beam_pose(&bp, &beam_len);
+    fl.beam_quad = (XrCompositionLayerQuad){.type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
         .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
         .subImage = {.swapchain = beam_swapchain, .imageRect = {{0, 0}, {BEAM_W, BEAM_H}}, .imageArrayIndex = 0},
-        .pose = beam_ok ? bp : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}}, .size = {0.006f, beam_len}};
-    XrCompositionLayerQuad wrist[2];
-    uint32_t wrist_count = 0;
+        .pose = fl.beam ? bp : (XrPosef){{0, 0, 0, 1}, {0, 0, 0}}, .size = {0.006f, beam_len}};
+    fl.wrist_count = 0;
     extern bool player_eye(float eye[3]);
     const bool gameplay = player_eye(NULL);  // false on boot, title, loading, and file-select screens
-    const bool use_wrist = hud_ok && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay &&
-                           (hud_grip_tracked[0] || hud_grip_tracked[1]);
-    if (use_wrist) {
+    fl.use_wrist = fl.hud && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay &&
+                   (hud_grip_tracked[0] || hud_grip_tracked[1]);
+    if (fl.use_wrist) {
         const int status_hand = g_vr_hud_config.wrist_hud_swap_hands ? 1 : 0;
         const int item_hand = 1 - status_hand;
         const XrPosef panels[2] = {hud_grip_tracked[0] ? wrist_hud_pose(0) : (XrPosef){{0,0,0,1},{0,0,0}},
@@ -1852,39 +1844,136 @@ void vr_frame_end(void) {
                                     (!g_vr_hud_config.wrist_hud_glance ||
                                      wrist_hud_glanced(status_hand, panels[status_hand]));
         if (status_visible)
-            wrist[wrist_count++] = (XrCompositionLayerQuad){
+            fl.wrist[fl.wrist_count++] = (XrCompositionLayerQuad){
                 .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
                 .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
                 .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
                 .subImage = {.swapchain = hud_swapchain, .imageRect = {{0, 0}, {480, 480}}, .imageArrayIndex = 0},
                 .pose = panels[status_hand],
                 .size = {g_vr_hud_config.wrist_hud_size, g_vr_hud_config.wrist_hud_size}};
-        if (hud_grip_tracked[item_hand]) wrist[wrist_count++] = (XrCompositionLayerQuad){
+        if (hud_grip_tracked[item_hand]) fl.wrist[fl.wrist_count++] = (XrCompositionLayerQuad){
             .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
             .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
             .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
             .subImage = {.swapchain = hud_swapchain, .imageRect = {{1440, 0}, {480, 480}}, .imageArrayIndex = 0},
             .pose = panels[item_hand],
             .size = {g_vr_hud_config.wrist_hud_size, g_vr_hud_config.wrist_hud_size}};
-        quad.subImage.imageRect = (XrRect2Di){{480, 0}, {960, HUD_H}};
-        quad.size.width = hud_w * 960.0f / HUD_W;
+        fl.quad.subImage.imageRect = (XrRect2Di){{480, 0}, {960, HUD_H}};
+        fl.quad.size.width = hud_w * 960.0f / HUD_W;
     }
-    const XrCompositionLayerBaseHeader *layers[8];
-    uint32_t nlayers = 0;
-    if (submit) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&layer;
-    if (submit && hud_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&quad;
-    if (submit && use_wrist)
-        for (uint32_t i = 0; i < wrist_count; i++) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&wrist[i];
-    if (submit && menu_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&menu_quad;
-    if (submit && beam_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&beam_quad;
     // Use the overlay path for the final veil, just like the HUD/keyboard it must cover. A second scene
     // projection layer is not sufficient to keep the veil in front of SteamVR's separately composed overlays.
     // Head-locked and close to the eyes, with far more angular coverage than the headset FOV: no visible edges.
-    const XrCompositionLayerQuad fade_layer = {.type=XR_TYPE_COMPOSITION_LAYER_QUAD,
+    fl.fade_layer = (XrCompositionLayerQuad){.type=XR_TYPE_COMPOSITION_LAYER_QUAD,
         .layerFlags=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT, .space=view_space,
         .eyeVisibility=XR_EYE_VISIBILITY_BOTH,
         .subImage={.swapchain=view_fade_swapchain, .imageRect={{0,0},{8,8}}, .imageArrayIndex=0},
         .pose={{0,0,0,1},{0,0,-VR_FADE_OVERLAY_DISTANCE}}, .size={VR_FADE_OVERLAY_SIZE,VR_FADE_OVERLAY_SIZE}};
+    fl.fade = view_fade_acquired && view_fade_ready;
+}
+
+// (device.c, the desktop mirror) The left eye's view of a quad layer: column-major clip-from-quad over its (x, y) in
+// -1..1. view: the pose is in view space (head-locked: the head between the eyes, facing as eye 0).
+static bool layer_quad_mvp(const XrCompositionLayerQuad *q, bool view, float out[16]) {
+    XrPosef p = q->pose;
+    if (view) {
+        const XrPosef *a = &frame.views[0].pose, *b = &frame.views[1].pose;
+        const XrVector3f head = {(a->position.x + b->position.x) / 2, (a->position.y + b->position.y) / 2,
+                                 (a->position.z + b->position.z) / 2};
+        const XrVector3f o = rotate_vector(a->orientation, p.position);
+        p.position = (XrVector3f){head.x + o.x, head.y + o.y, head.z + o.z};
+        p.orientation = multiply_quaternion(a->orientation, p.orientation);
+    }
+    const float x = p.orientation.x, y = p.orientation.y, z = p.orientation.z, w = p.orientation.w;
+    // world-from-quad as mirror_quad_mvp reads it: rows of a 3x4 (columns right, up, back, centre)
+    const float m[16] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), p.position.x,
+                         2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), p.position.y,
+                         2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), p.position.z,
+                         0, 0, 0, 1};
+    return mirror_quad_mvp(m, q->size.width / 2, q->size.height / 2, out);
+}
+
+static bool mirror_quad(VrMirrorLayer *l, const XrCompositionLayerQuad *q, VkImage image, uint32_t w, uint32_t h, bool view) {
+    if (!image || !layer_quad_mvp(q, view, l->mvp)) return false;
+    l->image = (void *)image;
+    l->format = (uint32_t)swapchain_format;
+    l->width = w, l->height = h, l->layers = 1;
+    l->rect[0] = (float)q->subImage.imageRect.offset.x / w, l->rect[1] = (float)q->subImage.imageRect.offset.y / h;
+    l->rect[2] = (float)q->subImage.imageRect.extent.width / w, l->rect[3] = (float)q->subImage.imageRect.extent.height / h;
+    l->blend = (q->layerFlags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) != 0;
+    l->full = false;
+    return true;
+}
+
+// The layers this frame submits, in order, as the left eye sees them (the eye image fills the window).
+int vr_mirror_layers(VrMirrorLayer *out, int max) {
+    if (!frame.begun || !frame.stereo || max < 9) return 0;
+    build_layers();
+    if (!fl.proj) return 0;
+    int n = 0;
+    out[n++] = (VrMirrorLayer){.image = (void *)images[frame.image].image, .format = (uint32_t)swapchain_format,
+                               .width = eye_width, .height = eye_height, .layers = 2, .rect = {0, 0, 1, 1}, .full = true};
+    if (fl.hud && mirror_quad(&out[n], &fl.quad, hud_images[frame.hud_image].image, HUD_W, HUD_H, false)) n++;
+    for (uint32_t i = 0; fl.use_wrist && i < fl.wrist_count; i++)
+        if (mirror_quad(&out[n], &fl.wrist[i], hud_images[frame.hud_image].image, HUD_W, HUD_H, false)) n++;
+    if (fl.menu && mirror_quad(&out[n], &fl.menu_quad, menu_images[menu_image_index].image, MENU_W, MENU_H, false)) n++;
+    if (fl.beam && mirror_quad(&out[n], &fl.beam_quad, beam_image.image, BEAM_W, BEAM_H, false)) n++;
+    if (fl.fade && mirror_quad(&out[n], &fl.fade_layer, view_fade_images[view_fade_index].image, 8, 8, true)) n++;
+    return n;
+}
+
+// (device.c) The mirror's layer images between sampled (GENERAL) and the layout the runtime takes them back in.
+void vr_mirror_barriers(void *command_buffer, const VrMirrorLayer *l, int n, bool to_read) {
+    VkCommandBuffer cb = (VkCommandBuffer)command_buffer;
+    for (int i = 0; i < n; i++) {
+        bool seen = false;
+        for (int j = 0; j < i; j++) seen |= l[j].image == l[i].image;
+        if (seen) continue;
+        eye_barrier_layers(cb, (VkImage)l[i].image,
+                           to_read ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,
+                           to_read ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                           to_read ? VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                           to_read ? VK_ACCESS_2_SHADER_SAMPLED_READ_BIT : VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+                           l[i].layers);
+    }
+}
+
+void vr_frame_end(void) {
+    if (!frame.begun) return;
+    static int release_logged, end_logged;
+    static uint64_t frames;
+    set_stage(STAGE_END_FRAME);
+    build_layers();
+    // Release only after the blits were queued (OpenXR orders the compositor's reads after prior submissions on the
+    // session's queue; no CPU wait for the GPU is needed).
+    bool release_ok = frame.acquired &&
+        xr_frame_ok(p_xrReleaseSwapchainImage(swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
+                    "xrReleaseSwapchainImage", &release_logged);
+    const bool submit = release_ok && fl.proj;
+    static int hud_release_logged;
+    const bool hud_ok = frame.hud_acquired &&
+        xr_frame_ok(p_xrReleaseSwapchainImage(hud_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
+                    "xrReleaseSwapchainImage (HUD)", &hud_release_logged) && fl.hud;
+    static int menu_release_logged;
+    const bool menu_ok = menu_acquired &&
+        xr_frame_ok(p_xrReleaseSwapchainImage(menu_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}),
+                    "xrReleaseSwapchainImage (menu)", &menu_release_logged) && fl.menu;
+    menu_acquired = menu_copied = false;
+    {   static bool beam_released;  // (the static image: released once, after its fill was recorded)
+        if (beam_ready && !beam_released)
+            beam_released = XR_SUCCEEDED(p_xrReleaseSwapchainImage(beam_swapchain, &(XrSwapchainImageReleaseInfo){.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}));
+        if (!beam_ready) beam_released = false;
+    }
+    const bool beam_ok = menu_ok && fl.beam;
+    const bool use_wrist = hud_ok && fl.use_wrist;
+    const XrCompositionLayerBaseHeader *layers[8];
+    uint32_t nlayers = 0;
+    if (submit) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.layer;
+    if (submit && hud_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.quad;
+    if (submit && use_wrist)
+        for (uint32_t i = 0; i < fl.wrist_count; i++) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.wrist[i];
+    if (submit && menu_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.menu_quad;
+    if (submit && beam_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.beam_quad;
     const bool has_view_fade = submit && view_fade_acquired && view_fade_ready;
     static bool had_view_fade;
     if (had_view_fade && !has_view_fade && getenv("SKYRECOMP_VR_FADE_TRACE")) LOG("[vr-fade] compositor fade cleared\n");
@@ -1892,13 +1981,14 @@ void vr_frame_end(void) {
     if (view_fade_acquired) {
         const bool released = xr_ok(p_xrReleaseSwapchainImage(view_fade_swapchain,
             &(XrSwapchainImageReleaseInfo){.type=XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO}), "xrReleaseSwapchainImage (fade)");
-        if (submit && released && view_fade_ready) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fade_layer;
+        if (submit && released && view_fade_ready) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.fade_layer;
         if (getenv("SKYRECOMP_VR_FADE_TRACE") && view_fade_ready) {
             static unsigned traced;
             if (traced++ % 30 == 0) LOG("[vr-fade] compositor FINAL head-locked QUAD layer %u, both eyes, release %d, submitted %d\n", nlayers, released, submit);
         }
         view_fade_acquired = view_fade_ready = false;
     }
+    fl.built = false;
     if (g_vr_config.dynamic_resolution && frame.work_start_ns && frame.display_period > 0) {
         adaptive_work_sum += (double)(SDL_GetTicksNS() - frame.work_start_ns);
         adaptive_budget_sum += (double)frame.display_period;
@@ -2001,5 +2091,9 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
     return false;
 }
 void vr_frame_end(void) {}
+int vr_mirror_layers(VrMirrorLayer *out, int max) { (void)out; (void)max; return 0; }
+void vr_mirror_barriers(void *command_buffer, const VrMirrorLayer *layers, int n, bool to_read) {
+    (void)command_buffer; (void)layers; (void)n; (void)to_read;
+}
 
 #endif
