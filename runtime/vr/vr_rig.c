@@ -296,10 +296,28 @@ static float tilt(const float m[9]) {
 // A planar reflection block (mirror floors, lakes): view Vm = F Vg D M - the game camera Vg reflected in a
 // horizontal plane (D = diag(1,-1,1) on world axes), the image turned upside down (F, the same on view axes), times
 // a model matrix M. A normal block is Vm = Vg M. Whichever reading gives the upright M wins.
+// Passes where a block's view was the game camera itself: the scene seen normally, never a reflection pass (whose
+// camera is mirrored). Link's head turning in the void dream gave its block an orientation that read as "upright
+// only when mirrored": the scene pass flipped to reflection for a few frames and his head was drawn above his body.
+enum { DIRECT_PASSES = 16 };
+static uint64_t g_direct_pass[DIRECT_PASSES];
+static int g_direct_next;
+static void note_direct_pass(void) {
+    for (int i = 0; i < DIRECT_PASSES; i++)
+        if (g_direct_pass[i] == g_vr_pass_id) return;
+    g_direct_pass[g_direct_next] = g_vr_pass_id;
+    g_direct_next = (g_direct_next + 1) % DIRECT_PASSES;
+}
+static bool direct_pass(void) {
+    for (int i = 0; i < DIRECT_PASSES; i++)
+        if (g_vr_pass_id && g_direct_pass[i] == g_vr_pass_id) return true;
+    return false;
+}
+
 static bool planar_reflection(const float v[12], const float g[12]) {
     static int off = -1;  // SKYRECOMP_VR_NO_REFLECTION_FIX=1: the earlier behaviour
     if (off < 0) off = getenv("SKYRECOMP_VR_NO_REFLECTION_FIX") != NULL;
-    if (off) return false;
+    if (off || direct_pass()) return false;
     float plain[9], mirror[9];  // Vg^-1 Vm and D Vg^-1 F Vm (rotation parts; Vg^-1 = Vg^T)
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 3; c++) {
@@ -354,6 +372,7 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
         extern uint64_t renderer_present_count(void);
         g_memory_seen_now = true;
         atomic_store(&g_memory_seen_frame, renderer_present_count() + 1);
+        note_direct_pass();
     }
     // Without the memory camera (the title screen, file select, cutscenes: another camera draws), a plain camera
     // block of the same render pass (its targets; this frame or kept from an earlier one) stands for Vg in that
