@@ -112,6 +112,10 @@ static XrSession session = XR_NULL_HANDLE;
 static XrActionSet action_set = XR_NULL_HANDLE;
 static XrAction actions[ACT_COUNT];
 static XrSpace aim_space[2], grip_space[2];
+static _Atomic int g_pointer_hand = -1;   // (menu_input) the hand the menu pointer follows, -1 none
+static _Atomic bool g_pointer_held;       // the trigger is being pulled: the pointer stays where it was
+static _Atomic uint64_t g_last_space;     // (vr_input_sync) the space hands are located in
+static void locate_hand(XrSpace hand, XrSpace space, XrTime time, SkyVrHand *out);
 
 static bool ok(XrResult r, const char *what) {
     if (XR_SUCCEEDED(r)) return true;
@@ -271,9 +275,17 @@ static void menu_input(SkyVrControllers *s) {
     static float aim_q[4];
     static int aim_hand = -1;
     const SkyVrHand *ah = &s->hand[hand];
-    if (!s->active || !ah->tracked) { aim_hand = -1; vr_pointer_set_aim(false, ah->orientation, ah->position); return; }
+    if (!s->active || !ah->tracked) {
+        aim_hand = -1;
+        atomic_store(&g_pointer_hand, -1);
+        vr_pointer_set_aim(false, ah->orientation, ah->position);
+        return;
+    }
     const float pull = hand ? s->zr : s->zl;
-    if (captured && !down && pull > 0.08f && aim_hand == hand) return;  // (held: the last aim stays)
+    const bool held = captured && !down && pull > 0.08f && aim_hand == hand;
+    atomic_store(&g_pointer_held, held);
+    atomic_store(&g_pointer_hand, hand);
+    if (held) return;  // (held: the last aim stays)
     const float *q = ah->orientation;
     if (aim_hand != hand) memcpy(aim_q, q, sizeof aim_q), aim_hand = hand;
     float dot = aim_q[0] * q[0] + aim_q[1] * q[1] + aim_q[2] * q[2] + aim_q[3] * q[3];
@@ -286,6 +298,20 @@ static void menu_input(SkyVrControllers *s) {
     l = sqrtf(l);
     for (int i = 0; i < 4; i++) aim_q[i] /= l;
     vr_pointer_set_aim(true, aim_q, ah->position);
+}
+
+// (vr_controls.c, game thread) The pointing hand where it will be at `time` (this session's last space): the menu
+// pointer is placed per game frame, not from whichever render-thread sample happens to be latest.
+bool vr_input_pointer_at(int64_t time, float q[4], float p[3]) {
+    const int hand = atomic_load(&g_pointer_hand);
+    const XrSpace space = (XrSpace)(uintptr_t)atomic_load(&g_last_space);
+    if (!session || !space || hand < 0 || hand > 1 || time <= 0 || atomic_load(&g_pointer_held)) return false;
+    SkyVrHand h;
+    locate_hand(aim_space[hand], space, (XrTime)time, &h);
+    if (!h.tracked) return false;
+    memcpy(q, h.orientation, 4 * sizeof(float));
+    memcpy(p, h.position, 3 * sizeof(float));
+    return true;
 }
 
 static bool get_bool(int a) {
@@ -328,6 +354,7 @@ static void locate_hand(XrSpace hand, XrSpace space, XrTime time, SkyVrHand *out
 
 void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
     SkyVrControllers s = {.reference = {0, 0, 0, 1}};
+    atomic_store(&g_last_space, (uint64_t)(uintptr_t)space);
     if (session && space && time > 0) {
         XrActiveActionSet active = {.actionSet = action_set};
         XrActionsSyncInfo sync = {.type = XR_TYPE_ACTIONS_SYNC_INFO, .countActiveActionSets = 1, .activeActionSets = &active};

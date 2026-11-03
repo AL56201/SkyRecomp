@@ -988,6 +988,18 @@ void backend_present(NvnTexture *t) {
                 vr_record_hud_copy((void *)vk_cmd(), (void *)hb->image, hb->width, hb->height, renderer_origin_lower_left(),
                                vk_hud_opaque() && !g_had_scene && !g_fade);
                 vk_label_end(vk_cmd());
+                // The panel into both eye images (vr_eye_panel: SteamVR's quad layers judder the game's cursor)
+                extern void vk_vr_panel_into_eye(VkCommandBuffer cb, void *image, uint32_t format, uint32_t w, uint32_t h,
+                                                 uint32_t layer, TexBackend *src, const float mvp[16], const float rect[4],
+                                                 bool flip, bool opaque);
+                for (int e = 0; e < 2; e++) {
+                    void *img;
+                    uint32_t w, h, fmt;
+                    float mvp[16], rect[4];
+                    bool op;
+                    if (vr_eye_panel(e, &img, &w, &h, &fmt, mvp, rect, &op))
+                        vk_vr_panel_into_eye(vk_cmd(), img, fmt, w, h, (uint32_t)e, hb, mvp, rect, renderer_origin_lower_left(), op);
+                }
             }
             pt_mark(PT_HUD);
         }

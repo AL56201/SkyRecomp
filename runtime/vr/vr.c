@@ -200,6 +200,7 @@ static void hud_destroy(void);
 static void view_fade_destroy(void);
 static void menu_destroy(void);
 static bool mirror_quad_mvp(const float m[16], float hx, float hy, float out[16]);
+static bool eye_quad_mvp(int eye, const float m[16], float hx, float hy, float out[16]);
 static void frozen_destroy(void);
 extern bool vk_hud_layer_enabled(void);  // (exec.c: SKYRECOMP_VR_HUD_LAYER)
 
@@ -575,6 +576,20 @@ void vr_poll(void) {
 }
 
 // ================================================================== frame loop
+// The runtime's display lead (predicted display time - wall clock at xrBeginFrame), averaged: the game thread places
+// the menu pointer by it (vr_display_time_now), wherever the render thread is meanwhile.
+static pthread_mutex_t timing_lock = PTHREAD_MUTEX_INITIALIZER;
+static double timing_lead;
+static bool timing_lead_ok;
+// The display time of a frame begun now: the wall clock plus the runtime's display lead, averaged over frames
+// (OpenXR time is in nanoseconds, as SDL's clock). Evenly spaced reads get evenly spaced times.
+int64_t vr_display_time_now(void) {
+    pthread_mutex_lock(&timing_lock);
+    const int64_t t = timing_lead_ok ? (int64_t)SDL_GetTicksNS() + (int64_t)timing_lead : 0;
+    pthread_mutex_unlock(&timing_lock);
+    return t;
+}
+
 static void store_pose(float out[7], const XrPosef *p) {
     out[0] = p->orientation.x; out[1] = p->orientation.y; out[2] = p->orientation.z; out[3] = p->orientation.w;
     out[4] = p->position.x; out[5] = p->position.y; out[6] = p->position.z;
@@ -697,10 +712,10 @@ bool vr_frame_begin(void) {
                     fs.predictedDisplayPeriod > 0 ? 1e9 / (double)fs.predictedDisplayPeriod : 0.0, waited / 1e6 / frames,
                     (unsigned long long)hist[0], (unsigned long long)hist[1], (unsigned long long)hist[2],
                     (unsigned long long)hist[3]);
-                LOG("[vr] pace: per frame ms: idle %.2f wait %.2f begin %.2f render %.2f acquire %.2f wait-image %.2f end %.2f\n",
+                LOG("[vr] pace: per frame ms: idle %.2f wait %.2f begin %.2f render %.2f acquire %.2f wait-image %.2f end %.2f, GPU (last) %.2f\n",
                     stage_ns[0] / 1e6 / frames, stage_ns[1] / 1e6 / frames, stage_ns[2] / 1e6 / frames,
                     stage_ns[3] / 1e6 / frames, stage_ns[4] / 1e6 / frames, stage_ns[5] / 1e6 / frames,
-                    stage_ns[6] / 1e6 / frames);
+                    stage_ns[6] / 1e6 / frames, g_vr_gpu_ms);
                 memset(stage_ns, 0, sizeof stage_ns);
                 waited = frames = 0;
                 memset(hist, 0, sizeof hist);
@@ -716,6 +731,15 @@ bool vr_frame_begin(void) {
     frame.begun = true;
     frame.display_time = fs.predictedDisplayTime;
     frame.display_period = fs.predictedDisplayPeriod;
+    {   pthread_mutex_lock(&timing_lock);
+        const int64_t timing_wall = (int64_t)SDL_GetTicksNS();
+        // (the display lead, averaged: the render thread's begin times wobble by up to a frame - two begins close
+        // together, then a gap - and following each one made the menu pointer step big, small, big)
+        const double lead = (double)(fs.predictedDisplayTime - timing_wall);
+        timing_lead = timing_lead_ok && fabs(lead - timing_lead) < 1e8 ? timing_lead + (lead - timing_lead) * 0.02 : lead;
+        timing_lead_ok = true;
+        pthread_mutex_unlock(&timing_lock);
+    }
     frame.work_start_ns = SDL_GetTicksNS();
     frame.stereo = fs.shouldRender && locate_views();
     static bool hidden_logged;
@@ -1631,10 +1655,11 @@ bool vr_mirror_hud_mvp(float out[16]) {
 }
 
 // m: world-from-quad (columns right, up, back, centre); hx, hy: the half extents along its first two columns.
-static bool mirror_quad_mvp(const float m[16], float hx, float hy, float out[16]) {
+static bool mirror_quad_mvp(const float m[16], float hx, float hy, float out[16]) { return eye_quad_mvp(0, m, hx, hy, out); }
+static bool eye_quad_mvp(int eye, const float m[16], float hx, float hy, float out[16]) {
     if (!frame.begun || !frame.stereo) return false;
-    const XrPosef *e = &frame.views[0].pose;
-    const XrFovf *f = &frame.views[0].fov;
+    const XrPosef *e = &frame.views[eye].pose;
+    const XrFovf *f = &frame.views[eye].fov;
     const float x = e->orientation.x, y = e->orientation.y, z = e->orientation.z, w = e->orientation.w;
     const float R[9] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
                         2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
@@ -1786,7 +1811,7 @@ static bool wrist_hud_glanced(int hand, XrPosef panel) {
 // same list (vr_mirror_layers) - so whatever the headset shows, the mirror shows, without per-layer mirror code.
 // Built from what was acquired and copied this frame; vr_frame_end then drops any whose release failed.
 static struct {
-    bool built, proj, hud, menu, beam, fade, use_wrist;
+    bool built, proj, hud, menu, beam, use_wrist, panel_in_eyes;
     uint32_t wrist_count;
     XrCompositionLayerProjectionView pv[2];
     XrCompositionLayerProjection layer;
@@ -1796,6 +1821,7 @@ static struct {
 static void build_layers(void) {
     if (fl.built) return;
     fl.built = true;
+    fl.panel_in_eyes = false;
     for (uint32_t eye = 0; eye < 2; eye++)
         fl.pv[eye] = (XrCompositionLayerProjectionView){
             .type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
@@ -1869,12 +1895,13 @@ static void build_layers(void) {
         .eyeVisibility=XR_EYE_VISIBILITY_BOTH,
         .subImage={.swapchain=view_fade_swapchain, .imageRect={{0,0},{8,8}}, .imageArrayIndex=0},
         .pose={{0,0,0,1},{0,0,-VR_FADE_OVERLAY_DISTANCE}}, .size={VR_FADE_OVERLAY_SIZE,VR_FADE_OVERLAY_SIZE}};
-    fl.fade = view_fade_acquired && view_fade_ready;
 }
 
 // (device.c, the desktop mirror) The left eye's view of a quad layer: column-major clip-from-quad over its (x, y) in
 // -1..1. view: the pose is in view space (head-locked: the head between the eyes, facing as eye 0).
-static bool layer_quad_mvp(const XrCompositionLayerQuad *q, bool view, float out[16]) {
+static bool layer_quad_mvp_eye(int eye, const XrCompositionLayerQuad *q, bool view, float out[16]);
+static bool layer_quad_mvp(const XrCompositionLayerQuad *q, bool view, float out[16]) { return layer_quad_mvp_eye(0, q, view, out); }
+static bool layer_quad_mvp_eye(int eye, const XrCompositionLayerQuad *q, bool view, float out[16]) {
     XrPosef p = q->pose;
     if (view) {
         const XrPosef *a = &frame.views[0].pose, *b = &frame.views[1].pose;
@@ -1890,7 +1917,28 @@ static bool layer_quad_mvp(const XrCompositionLayerQuad *q, bool view, float out
                          2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), p.position.y,
                          2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), p.position.z,
                          0, 0, 0, 1};
-    return mirror_quad_mvp(m, q->size.width / 2, q->size.height / 2, out);
+    return eye_quad_mvp(eye, m, q->size.width / 2, q->size.height / 2, out);
+}
+
+// The HUD panel drawn into the eye images themselves (device.c, vk_vr_panel_into_eye) instead of submitted as a quad
+// layer: SteamVR shows quad layers through its overlay path, which takes their contents on its own schedule - the
+// game's cursor on the panel juddered in the headset while the eyes (and the desktop mirror) were smooth. In the eye
+// images the panel is part of the frame it was drawn for. SKYRECOMP_VR_PANEL_QUAD=1: the quad layer (as before).
+// eye: 0 / 1; rect: the part of the HUD image the panel shows (uv origin, size); opaque: a full-screen 2D frame.
+bool vr_eye_panel(int eye, void **image, uint32_t *width, uint32_t *height, uint32_t *format, float mvp[16],
+                  float rect[4], bool *opaque) {
+    static int quad = -1;
+    if (quad < 0) quad = getenv("SKYRECOMP_VR_PANEL_QUAD") != NULL;
+    if (quad || eye < 0 || eye > 1 || !frame.begun || !frame.stereo || !frame.acquired || !frame.copied) return false;
+    build_layers();
+    if (!fl.hud || !layer_quad_mvp_eye(eye, &fl.quad, false, mvp)) return false;
+    fl.panel_in_eyes = true;
+    *image = (void *)images[frame.image].image;
+    *width = eye_width, *height = eye_height, *format = (uint32_t)swapchain_format;
+    rect[0] = (float)fl.quad.subImage.imageRect.offset.x / HUD_W, rect[1] = (float)fl.quad.subImage.imageRect.offset.y / HUD_H;
+    rect[2] = (float)fl.quad.subImage.imageRect.extent.width / HUD_W, rect[3] = (float)fl.quad.subImage.imageRect.extent.height / HUD_H;
+    *opaque = frame.hud_opaque;
+    return true;
 }
 
 static bool mirror_quad(VrMirrorLayer *l, const XrCompositionLayerQuad *q, VkImage image, uint32_t w, uint32_t h, bool view) {
@@ -1913,12 +1961,12 @@ int vr_mirror_layers(VrMirrorLayer *out, int max) {
     int n = 0;
     out[n++] = (VrMirrorLayer){.image = (void *)images[frame.image].image, .format = (uint32_t)swapchain_format,
                                .width = eye_width, .height = eye_height, .layers = 2, .rect = {0, 0, 1, 1}, .full = true};
-    if (fl.hud && mirror_quad(&out[n], &fl.quad, hud_images[frame.hud_image].image, HUD_W, HUD_H, false)) n++;
+    if (fl.hud && !fl.panel_in_eyes && mirror_quad(&out[n], &fl.quad, hud_images[frame.hud_image].image, HUD_W, HUD_H, false)) n++;
     for (uint32_t i = 0; fl.use_wrist && i < fl.wrist_count; i++)
         if (mirror_quad(&out[n], &fl.wrist[i], hud_images[frame.hud_image].image, HUD_W, HUD_H, false)) n++;
     if (fl.menu && mirror_quad(&out[n], &fl.menu_quad, menu_images[menu_image_index].image, MENU_W, MENU_H, false)) n++;
     if (fl.beam && mirror_quad(&out[n], &fl.beam_quad, beam_image.image, BEAM_W, BEAM_H, false)) n++;
-    if (fl.fade && mirror_quad(&out[n], &fl.fade_layer, view_fade_images[view_fade_index].image, 8, 8, true)) n++;
+    if (view_fade_acquired && view_fade_ready && mirror_quad(&out[n], &fl.fade_layer, view_fade_images[view_fade_index].image, 8, 8, true)) n++;
     return n;
 }
 
@@ -1969,7 +2017,7 @@ void vr_frame_end(void) {
     const XrCompositionLayerBaseHeader *layers[8];
     uint32_t nlayers = 0;
     if (submit) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.layer;
-    if (submit && hud_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.quad;
+    if (submit && hud_ok && !fl.panel_in_eyes) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.quad;
     if (submit && use_wrist)
         for (uint32_t i = 0; i < fl.wrist_count; i++) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.wrist[i];
     if (submit && menu_ok) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.menu_quad;
@@ -2091,7 +2139,13 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
     return false;
 }
 void vr_frame_end(void) {}
+int64_t vr_display_time_now(void) { return 0; }
 int vr_mirror_layers(VrMirrorLayer *out, int max) { (void)out; (void)max; return 0; }
+bool vr_eye_panel(int eye, void **image, uint32_t *width, uint32_t *height, uint32_t *format, float mvp[16],
+                  float rect[4], bool *opaque) {
+    (void)eye; (void)image; (void)width; (void)height; (void)format; (void)mvp; (void)rect; (void)opaque;
+    return false;
+}
 void vr_mirror_barriers(void *command_buffer, const VrMirrorLayer *layers, int n, bool to_read) {
     (void)command_buffer; (void)layers; (void)n; (void)to_read;
 }

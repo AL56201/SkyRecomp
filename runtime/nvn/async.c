@@ -42,6 +42,7 @@ extern __thread uint64_t g_blocked_ns;
 
 #ifdef __APPLE__
 bool nvn_async_on(void) { return false; }
+uint64_t nvn_async_game_frame(void) { return 0; }
 bool nvn_async_is_replay_thread(void) { return false; }
 uint64_t nvn_async_idle_ns(void) { return 0; }
 void nvn_async_execute(uint64_t handle) { (void)handle; }
@@ -90,6 +91,14 @@ bool nvn_async_on(void) {
 
 static __thread bool tl_replay;
 bool nvn_async_is_replay_thread(void) { return tl_replay; }
+
+// (VR menu pointer, game thread) The frames the game has presented so far: the one it is building is the next.
+uint64_t nvn_async_game_frame(void) {
+    pthread_mutex_lock(&q_lock);
+    const uint64_t n = presents_enq;
+    pthread_mutex_unlock(&q_lock);
+    return n;
+}
 
 static void *replay_main(void *arg) {
     (void)arg;

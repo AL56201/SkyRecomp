@@ -266,6 +266,15 @@ static const char *builtin_src(const char *name, int *stage) {
                "  uv = pc.rect.xy + uv * pc.rect.zw;\n"
                "}\n";
     }
+    if (!strcmp(name, "present_decode.frag")) {  // (VR: the 2D layer's encoded values into an sRGB eye image)
+        *stage = STAGE_FRAGMENT;
+        return "#version 450\n"
+               "layout(set = 0, binding = 0) uniform sampler2D t;\n"
+               "layout(location = 0) in vec2 uv;\n"
+               "layout(location = 0) out vec4 o;\n"
+               "vec3 dec(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }\n"
+               "void main() { vec4 c = texture(t, uv); o = vec4(dec(clamp(c.rgb, 0.0, 1.0)), c.a); }\n";
+    }
     if (!strcmp(name, "present_srgb.frag")) {  // (the VR mirror's layers: read decoded, encoded again for the window)
         *stage = STAGE_FRAGMENT;
         return "#version 450\n"

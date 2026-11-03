@@ -169,6 +169,46 @@ static bool panel_pointer(SkyJoyConSensor *s) {
     memcpy(hud, g_ptr_hud, sizeof hud);
     pthread_mutex_unlock(&g_ptr_lock);
     if (!on) return false;
+    {   // The controller where it is when the game reads it (once per game frame, evenly spaced), with the runtime's
+        // display lead - not the render thread's latest sample: the game thread reads that on its own schedule, so
+        // some game frames got the same pose twice and the next one a double step (the cursor juddered).
+        extern int64_t vr_display_time_now(void);
+        extern bool vr_input_pointer_at(int64_t time, float q[4], float p[3]);
+        extern bool nvn_async_on(void);
+        extern uint64_t nvn_async_game_frame(void), renderer_present_count(void);
+        const int64_t when = vr_display_time_now();
+        const uint64_t g = (nvn_async_on() ? nvn_async_game_frame() : renderer_present_count()) + 1;
+        if (when > 0) {
+            float q[4], p[3];
+            if (vr_input_pointer_at(when, q, p)) {
+                // Tremor (and the prediction's noise): small turns eased in, once per game frame (the same frame
+                // read twice gets the same pose); larger, deliberate turns followed at once.
+                static float sq[4];
+                static uint64_t sg;
+                static bool sq_ok;
+                static float out[4];
+                if (!sq_ok || g < sg || g > sg + 8) memcpy(sq, q, sizeof sq), sq_ok = true;
+                else if (g != sg) {
+                    float dot = sq[0] * q[0] + sq[1] * q[1] + sq[2] * q[2] + sq[3] * q[3];
+                    const float sign = dot < 0 ? -1.0f : 1.0f;
+                    const float angle = 2 * acosf(fminf(1.0f, fabsf(dot)));
+                    const float a = fminf(1.0f, fmaxf(0.25f, angle / 0.02f));  // (fully eased below ~1 degree)
+                    float l = 0;
+                    for (int i = 0; i < 4; i++) sq[i] += (q[i] * sign - sq[i]) * a, l += sq[i] * sq[i];
+                    l = sqrtf(l);
+                    for (int i = 0; i < 4; i++) sq[i] /= l;
+                }
+                sg = g;
+                memcpy(out, sq, sizeof out);
+                const float x = out[0], y = out[1], z = out[2], w = out[3];
+                const float m[16] = {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w), p[0],
+                                     2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w), p[1],
+                                     2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y), p[2],
+                                     0, 0, 0, 1};
+                memcpy(aim, m, sizeof aim);
+            }
+        }
+    }
     float u, v;
     if (!panel_uv(aim, hud, &u, &v)) return false;
     {   // (diagnostics) every half second while the pointer is active: the panel point, the ray, the panel
