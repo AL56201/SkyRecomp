@@ -4424,6 +4424,9 @@ static void draw_(CmdRec *r, bool indexed) {
         // scene - at the headset's resolution its edges turn blocky around characters, and in VR the eyes focus by
         // themselves. Skipping this pass (the first of its chain) leaves the scene sharp. VR Options: Depth of Field.
         if (last_hash == 0x3dffee7e4b168544ull && vr_stereo_active() && !g_settings.vr_dof) { stat_skipped++; return; }
+        // The end of the void dream (before the bedroom) blends its own blurred low-resolution copy over the scene:
+        // Link turned soft and pixelated in the headset. Measured: skipping this composite alone leaves him sharp.
+        if (last_hash == 0xe9b84cc0aebb7adaull && vr_stereo_active() && !g_settings.vr_dof) { stat_skipped++; return; }
         if (last_hash == WATER_SURFACE_FS && vr_stereo_active() && getenv("LARECOMP_VR_NO_WATER_SURFACE")) {
             stat_skipped++;
             return;

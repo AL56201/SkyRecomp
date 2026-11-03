@@ -237,7 +237,11 @@ int input_pad_family(void) {
     return env >= 0 ? env : pad_family;
 }
 // A controller is open (or LARECOMP_PAD_TYPE pretends one): Auto prompts follow it, else the keyboard's
-bool input_pad_connected(void) { return pad || getenv("LARECOMP_PAD_TYPE"); }
+// A running VR session counts too: its controllers come through OpenXR (as Joy-Cons), not SDL.
+bool input_pad_connected(void) {
+    extern bool vr_running(void);  // runtime/vr/vr.c
+    return pad || getenv("LARECOMP_PAD_TYPE") || vr_running();
+}
 
 // The controller's motion, for the game's six-axis sensor (gyro aiming and the motion camera, which the game offers
 // with a Pro Controller): written by sensor events on the main thread, read by GetSixAxisSensorState on the game's.
@@ -832,7 +836,6 @@ HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj", hid_state_fullk
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj", hid_state_dual) {
     note_state("JoyDual");
     fill_state(c, 1u | 1u << 2 | 1u << 4);
-}
 }
 HLE_FUNC("_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj", hid_state_left) {
     note_state("JoyLeft");
