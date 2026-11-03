@@ -563,7 +563,10 @@ static Frame cur_frame;
 
 // Acquire the next window image and begin rendering into it (cleared to `clear`). Returns false when there is
 // nothing to draw into (minimised window).
-bool vk_frame_begin(const float clear[4]) {
+// nowait (the VR desktop mirror): never block the caller - not on the GPU finishing this slot's earlier frame, not
+// on the window having an image free (Windows can hold one back, e.g. while a capture or streaming app reads the
+// window). The mirror then skips this refresh; the headset frame goes on at its own rate.
+static bool frame_begin(const float clear[4], bool nowait) {
     cur_frame.ok = false;
     int w, h;
     SDL_GetWindowSizeInPixels(window, &w, &h);
@@ -573,10 +576,12 @@ bool vk_frame_begin(const float clear[4]) {
     static int trace = -1;
     if (trace < 0) trace = getenv("LARECOMP_VK_TRACE") != NULL;
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
+    if (nowait && slot_seq[(slot + 1) % FRAMES] && vk_completed_seq() < slot_seq[(slot + 1) % FRAMES]) return false;
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     vk_wait_seq(slot_seq[slot]);
-    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, nowait ? 0 : UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    if (nowait && (r == VK_NOT_READY || r == VK_TIMEOUT)) return false;  // (no image free now: the semaphore is untouched)
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         if (!g_vk.swapchain) return false;
@@ -601,6 +606,8 @@ bool vk_frame_begin(const float clear[4]) {
     cur_frame.ok = true;
     return true;
 }
+bool vk_frame_begin(const float clear[4]) { return frame_begin(clear, false); }
+static bool vk_frame_begin_nowait(const float clear[4]) { return frame_begin(clear, true); }
 
 // Passes of their own between vk_frame_begin and vk_frame_end (exec.c post passes): end the window image's
 // rendering, and begin it again keeping what was drawn.
@@ -1020,7 +1027,7 @@ void backend_present(NvnTexture *t) {
         const double mirror_hz = g_settings.vr_mirror_hz;
         const uint64_t now_ns = SDL_GetTicksNS();
         const bool mirror_due = menu_on_vr_panel() || mirror_hz <= 0 || now_ns >= mirror_next;
-        const bool mirror = (g_vr_config.desktop_mirror || menu_on_vr_panel()) && mirror_due && vk_frame_begin(mirror_black);
+        const bool mirror = (g_vr_config.desktop_mirror || menu_on_vr_panel()) && mirror_due && vk_frame_begin_nowait(mirror_black);
         if (mirror && mirror_hz > 0) {
             const uint64_t period = (uint64_t)(1e9 / mirror_hz);
             mirror_next = now_ns + period - period / 8 > mirror_next + period ? now_ns + period - period / 8 : mirror_next + period;
