@@ -22,6 +22,7 @@
 #include "hle.h"
 #include "vr_xr.h"
 #include "vr_internal.h"
+#include "vr_settings.h"
 #include "nvn/vulkan/JoyConTranslator.h"
 
 enum {
@@ -381,6 +382,28 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
         for (int h = 0; h < 2; h++) locate_hand(aim_space[h], space, time, &s.hand[h]);
     }
     menu_input(&s);
+    {   // The game walks Link relative to its own camera; in the headset the player looks around with the head.
+        // During gameplay the left stick is turned by how far the eyes look from the game camera: forward walks
+        // (and turns Link) where the player looks. Not in menus or cutscenes (the stick picks there).
+        // SKYRECOMP_VR_STICK_FOLLOWS=camera: the game's own (as before).
+        static int mode = -1;
+        if (mode < 0) { const char *e = getenv("SKYRECOMP_VR_STICK_FOLLOWS"); mode = e && !strcmp(e, "camera") ? 0 : 1; }
+        extern bool player_eye(float eye[3]);
+        extern float vr_rig_view_yaw(void);
+        const bool paused = *(const volatile uint32_t *)(uintptr_t)(MAIN_BASE + 0x1827370) != 0;
+        if (mode && s.active && !paused && player_eye(NULL)) {
+            // VR Options > Movement Direction: the head, or where the left / right controller points (the head
+            // while that controller points too steeply up or down, or isn't tracked)
+            extern bool vr_rig_pointing_yaw(const float reference[4], const float q[4], float *yaw);
+            float yaw = vr_rig_view_yaw();
+            const int h = g_vr_config.move_direction - 1;
+            if (h >= 0 && h <= 1 && s.hand[h].tracked) vr_rig_pointing_yaw(s.reference, s.hand[h].orientation, &yaw);
+            const float phi = -yaw;  // (toward the right: positive)
+            const float c = cosf(phi), sn = sinf(phi), x = s.stick[0][0], y = s.stick[0][1];
+            s.stick[0][0] = x * c + y * sn;
+            s.stick[0][1] = -x * sn + y * c;
+        }
+    }
     // The game's motion sensors follow the aim poses (where each controller points); the grip poses (the controller
     // in the palm) place the wrist HUD.
     SkyVrHand grip[2] = {0};

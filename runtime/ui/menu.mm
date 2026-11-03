@@ -895,6 +895,14 @@ static void tab_vr_options(void) {
     static const char *view_modes[] = {"3rd Person", "1st Person"};
     changed |= opt_choice("Default View Mode", &g_vr_config.view_mode, view_modes, 2, 0,
                           "3rd Person follows Link from the game camera. 1st Person places the view at Link's head.");
+    static const char *link_bodies[] = {"Hidden", "Visible"};
+    changed |= opt_choice("Link's Body (1st Person)", &g_vr_config.link_body, link_bodies, 2, 0,
+                          "In 1st person: Hidden shows only Link's hands; Visible also shows his body when you look "
+                          "down. His head is always hidden, so it never blocks the view.");
+    static const char *move_dirs[] = {"Head", "Left Controller", "Right Controller"};
+    changed |= opt_choice("Movement Direction", &g_vr_config.move_direction, move_dirs, 3, 0,
+                          "Which way pushing the movement stick forward walks Link: where you look (Head), or where a "
+                          "controller points - so you can look around while walking straight.");
 
     changed |= opt_toggle("Level Horizon", &g_vr_config.level_horizon, true,
                           "Keeps the VR horizon level when the game camera rolls or tilts.");

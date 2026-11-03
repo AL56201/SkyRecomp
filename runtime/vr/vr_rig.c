@@ -33,9 +33,15 @@ bool game_camera_view(float view[12]);  // runtime/hle/player.c: the game camera
 // up to ~100 swimming / jumping, where the eye point stays at floor + 150; other characters' nearest bones stayed
 // 150+ away).
 #define LINK_BONE_RADIUS 110.0f
-// Link's skinned body parts use at least 26 matrices; held items use small palettes (the Slingshot has 5). Do not
-// let an item become "Link" merely because it is brought close to the headset.
-#define LINK_BODY_MIN_PALETTE 26
+// His head's own meshes (measured in his room): palettes of 16..99 matrices (hair 24, face 44) with a bone this close
+// to the eye point; his body's meshes use the whole skeleton (186..368); his eyes are rigid, tiny, at the eye point.
+// Held items use small palettes (the Slingshot has 5), at his hands: never taken for Link.
+#define LINK_HEAD_MIN_PALETTE 16
+#define LINK_SKELETON_MIN_PALETTE 100
+#define LINK_HEAD_RADIUS 30.0f
+#define LINK_EYE_PART_MAX_VERTS 96
+#define LINK_EYE_PART_RADIUS 12.0f
+#define LINK_BELT_RADIUS 18.0f
 #define LINK_MESH_CACHE 64
 // Swimming: the game keeps the eye point at the water surface (even while Link dives), which cuts the view in half.
 // In water the eye point is more than SWIM_EYE_ABOVE_FEET above Link's feet (on land it is feet + 150, measured up to
@@ -506,25 +512,35 @@ bool vr_rig_is_link_draw(const float *slot0, uint64_t size0, const float *bones,
     const float *v = g_rig.game_view;
     float e[3];
     for (int r = 0; r < 3; r++) e[r] = v[r * 4] * g_rig.link[0] + v[r * 4 + 1] * g_rig.link[1] + v[r * 4 + 2] * g_rig.link[2] + v[r * 4 + 3];
-    // Rigid draws include equipment and effects. Proximity cannot distinguish those from Link, so leave them alone;
-    // the first-person near plane clips head intersections.
-    if (!bones || bone_bytes < LINK_BODY_MIN_PALETTE * 48) return false;
-    const int n = (int)(bone_bytes / 48);
-    const uint64_t hash = mesh_hash(vb, vb_size);
-    if (known_link_mesh(hash, count, vb_size)) {
-        if (g_water) g_water_hits_now++;
-        return true;
+    // Rigid draws: only the tiny ones at the eye point are Link's (his eyes, measured in his room: four of 42 vertices
+    // there); equipment and effects elsewhere can't be told from Link by proximity and stay.
+    if (!bones || bone_bytes < 48) {
+        const float dx = slot0[19] - e[0], dy = slot0[23] - e[1], dz = slot0[27] - e[2];
+        if (count <= LINK_EYE_PART_MAX_VERTS && dx * dx + dy * dy + dz * dz < LINK_EYE_PART_RADIUS * LINK_EYE_PART_RADIUS)
+            return true;
+        // His belt's rigid pieces (measured: 12 and 216 vertices, 27 and 48 units below the eye point): on his
+        // centre line, between chest and knees - part of his body. (His hands hang ~25 units to the sides.)
+        float w[3];  // the offset in the world (view = R | t: R^T d)
+        for (int i = 0; i < 3; i++) w[i] = v[0 * 4 + i] * dx + v[1 * 4 + i] * dy + v[2 * 4 + i] * dz;
+        const bool belt = w[0] * w[0] + w[2] * w[2] < LINK_BELT_RADIUS * LINK_BELT_RADIUS && w[1] < -15.0f && w[1] > -110.0f;
+        return belt && g_vr_config.link_body == 0;
     }
+    const int n = (int)(bone_bytes / 48);
+    float nearest = 1e30f;
     for (int i = 0; i < n; i++) {
         const float *b = bones + i * 12;
         const float dx = b[3] - e[0], dy = b[7] - e[1], dz = b[11] - e[2];
-        if (dx * dx + dy * dy + dz * dz < LINK_BONE_RADIUS * LINK_BONE_RADIUS) {
-            remember_link_mesh(hash, count, vb_size);
-            if (g_water) g_water_hits_now++;
-            return true;
-        }
+        nearest = fminf(nearest, dx * dx + dy * dy + dz * dz);
     }
-    return false;
+    // Head-only palettes (his face: 44 matrices, his hair: 24), all at the eye point: hidden in both settings, they
+    // would fill the view. (Held items have small palettes too, but at his hands, not his eye.)
+    if (n < LINK_SKELETON_MIN_PALETTE) return n >= LINK_HEAD_MIN_PALETTE && nearest < LINK_HEAD_RADIUS * LINK_HEAD_RADIUS;
+    // His body: the whole skeleton's palette with a bone near his eye (VR Options > Link's Body: hidden, or shown)
+    const uint64_t hash = mesh_hash(vb, vb_size);
+    bool body = known_link_mesh(hash, count, vb_size);
+    if (!body && nearest < LINK_BONE_RADIUS * LINK_BONE_RADIUS) remember_link_mesh(hash, count, vb_size), body = true;
+    if (body && g_water) g_water_hits_now++;
+    return body && g_vr_config.link_body == 0;
 #endif
 }
 
@@ -541,6 +557,30 @@ static uint64_t g_cull_view_frame;
 // title / file select another camera draws and the rig's camera is a substitute (a pass's plain camera block): the
 // headset frustum built on it culled objects the eyes were looking at (islands flickering, vanishing).
 bool vr_rig_cull_trusted(void) { return memory_recent(); }
+
+// How far the eyes look turned from the game camera, about the vertical (radians, the sense of atan2(x, z) of the
+// forward directions): the left stick is turned by it (JoyConTranslator), so "forward" walks where the player looks.
+static _Atomic float g_view_yaw;
+float vr_rig_view_yaw(void) { return memory_recent() ? atomic_load(&g_view_yaw) : 0.0f; }
+
+// The same for a controller (its OpenXR orientation q, in the space of the head reference): where it points, turned
+// from the game camera. False when it points too steeply up or down for a heading (or without the game camera).
+bool vr_rig_pointing_yaw(const float reference[4], const float q[4], float *yaw) {
+    if (!memory_recent() || !g_rig.have_game_view) return false;
+    VrRigAnchor a;
+    vr_rig_current_anchor(&a, g_rig.game_view);
+    const float ref7[7] = {reference[0], reference[1], reference[2], reference[3], 0, 0, 0};
+    const float q7[7] = {q[0], q[1], q[2], q[3], 0, 0, 0};
+    float rel[9], off[3], rw[9], f[3];
+    vr_rig_relative(ref7, q7, 1.0f, rel, off);
+    m_mul(a.rotation, rel, rw);
+    m_vec(rw, (const float[3]){0, 0, -1}, f);  // (the aim pose points along its -z)
+    const float *v = g_rig.game_view;
+    const float c[3] = {-v[8], -v[9], -v[10]};
+    if (f[0] * f[0] + f[2] * f[2] < 0.1f || c[0] * c[0] + c[2] * c[2] < 0.01f) return false;
+    *yaw = remainderf(atan2f(f[0], f[2]) - atan2f(c[0], c[2]), 2.0f * (float)M_PI);
+    return true;
+}
 
 bool vr_rig_cull_view(float view[12], float tangents[4]) {
     extern uint64_t renderer_present_count(void);
@@ -565,7 +605,9 @@ void vr_rig_update_cull(const float reference[7], const float eye0[7], const flo
     m_mul(a.rotation, rel, rw);
     m_vec(rw, (const float[3]){0, 0, -1}, f);
     const float c[3] = {-g_rig.game_view[8], -g_rig.game_view[9], -g_rig.game_view[10]};
-    const float yaw_off = fabsf(remainderf(atan2f(f[0], f[2]) - atan2f(c[0], c[2]), 2.0f * (float)M_PI));
+    const float yaw_signed = remainderf(atan2f(f[0], f[2]) - atan2f(c[0], c[2]), 2.0f * (float)M_PI);
+    const float yaw_off = fabsf(yaw_signed);
+    if (f[0] * f[0] + f[2] * f[2] > 0.01f && c[0] * c[0] + c[2] * c[2] > 0.01f) atomic_store(&g_view_yaw, yaw_signed);
     const float pitch_off = fabsf(asinf(fmaxf(-1, fminf(1, f[1]))) - asinf(fmaxf(-1, fminf(1, c[1]))));
     const float margin = 5.0f * (float)(M_PI / 180.0), limit = 80.0f * (float)(M_PI / 180.0);
     half_h = fminf(half_h + yaw_off + margin, limit);

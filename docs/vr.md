@@ -166,7 +166,12 @@ In 1st person Link's own draws are filtered (`vr_rig_is_link_draw`): a large pla
 more) with a bone within 110 units of his eye confirms that mesh as Link; its sampled vertex-data identity then stays
 hidden through animations that move the bones away. Small palettes are held items and rigid draws can be equipment
 or effects, so neither is hidden by proximity. The near plane clips remaining head intersections; his shadow stays.
-`SKYRECOMP_VR_SHOW_LINK=1` keeps all of Link. Theatre: while the game camera is more than 1500 units from Link's
+His head is always hidden: head-only palettes (16..99 matrices: hair 24, face 44) with a bone within 30 units of
+the eye, and tiny rigid meshes (his eyes, <= 96 vertices) within 12 units. VR Options > Link's Body (1st Person):
+Hidden also hides the whole-skeleton meshes (186..368 matrices) and his belt's rigid pieces (centred under him,
+15..110 units below the eye); Visible shows them. His hands (rigid, to the sides) always stay. VR Options >
+Movement Direction turns the left stick by the head's (or a controller's) yaw from the game camera, during gameplay,
+so forward walks where the player looks (or points). `SKYRECOMP_VR_SHOW_LINK=1` keeps all of Link. Theatre: while the game camera is more than 1500 units from Link's
 eye point (Loftwing flight, where that point stops updating; far cinematic cameras) 1st person shows the 3rd-person
 view after 20 frames (a one-off camera cut doesn't switch it), and returns below 1000 units.
 

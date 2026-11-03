@@ -4361,14 +4361,19 @@ static void draw_(CmdRec *r, bool indexed) {
         // VR 1st person: Link's own skinned draws are skipped (both eyes), like the game's own 1st-person view.
         // Only a bone slot the vertex shader reads counts: bindings stay bound for later, unskinned draws.
         const Range cam = st.ubuf[0][0];
-        bool link = false;
+        bool link = false, skinned = false;
         for (int idx = 3; idx <= 5 && !link; idx++) {
             if (!(pr->vi->cbuf_mask & (1u << (idx + 3)))) continue;
             const Range bones = st.ubuf[0][idx];
+            skinned |= bones.addr != 0;
             link = bones.addr && cam.addr &&
                    vr_rig_is_link_draw((const float *)(uintptr_t)cam.addr, cam.size, (const float *)(uintptr_t)bones.addr,
                                        bones.size, r->x[2], st.vbuf[0].addr, st.vbuf[0].size);
         }
+        // (rigid draws: his eyes - vr_rig_is_link_draw tells them by size and place)
+        if (!skinned && cam.addr)
+            link = vr_rig_is_link_draw((const float *)(uintptr_t)cam.addr, cam.size, NULL, 0, r->x[2], st.vbuf[0].addr,
+                                       st.vbuf[0].size);
         if (link) { stat_skipped++; return; }
     }
     g_mirror_w = 0;
