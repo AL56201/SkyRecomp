@@ -2859,6 +2859,19 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
             if (size <= sizeof local) {
                 memcpy(local, (const void *)(uintptr_t)r.addr, size);
                 memcpy(local, camera, sizeof camera);
+                float orig[12], repl[12];  // (Link's hand: its view block again past the camera - see below)
+                if (vr_rig_hand_blocks(orig, repl)) {
+                    float *f = (float *)local;
+                    for (int o = 28; o + 12 <= (int)(size / 4); o += 4) {
+                        bool same = true;
+                        for (int i = 0; same && i < 12; i++) same = fabsf(f[o + i] - orig[i]) <= 1e-4f * (1.0f + fabsf(orig[i]));
+                        if (!same) continue;
+                        static int said;
+                        if (said++ < 4) LOG("[vr] hand: stage %d slot 0 offset %d holds its view block\n", stage, o * 4);
+                        memcpy(f + o, repl, sizeof repl);
+                        o += 8;
+                    }
+                }
                 const int slot = (stage ? DEDUPE_CAMERA_F0 : DEDUPE_CAMERA_V0) + (int)vk_vr_eye();
                 patched = copy_dedupe(slot, local, size, 256);
             } else {
@@ -2867,6 +2880,42 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
                 memcpy(patched.ptr, camera, sizeof camera);
             }
             return ubo_span(patched, size);
+        }
+    }
+    if (stage <= 1 && idx >= 1 && vr_stereo_active() && size >= 48 && size <= 0x2000) {
+        // Link's hand on its controller (vr_rig.c): wherever another block holds the hand's game view block (its
+        // normals' matrix, for the lighting), the controller's replaces it too - else the light followed the game's
+        // hand (his arm swinging as he walks) instead of the hand seen.
+        float orig[12], repl[12];
+        if (vr_rig_hand_blocks(orig, repl)) {
+            const float *b = (const float *)(uintptr_t)r.addr;
+            const int n = (int)(size / 4);
+            float *out = NULL;
+            VkSpan patched = {0};
+            // (measured: vertex slot 1 holds its rotation alone - the view block with no translation - at float 24:
+            // the normals' matrix; a spheremap's follows. The whole block is matched too, should a shader carry it.)
+            for (int o = 0; o + 12 <= n; o += 4) {
+                bool rot = true, whole = true;
+                for (int i = 0; rot && i < 12; i++) {
+                    if ((i & 3) == 3) continue;
+                    rot = fabsf(b[o + i] - orig[i]) <= 1e-4f * (1.0f + fabsf(orig[i]));
+                }
+                if (!rot) continue;
+                for (int i = 3; whole && i < 12; i += 4) whole = fabsf(b[o + i] - orig[i]) <= 1e-4f * (1.0f + fabsf(orig[i]));
+                const bool rot_only = !whole && b[o + 3] == 0 && b[o + 7] == 0 && b[o + 11] == 0;
+                if (!whole && !rot_only) continue;
+                if (!out) {
+                    patched = vk_transient(size, 256);
+                    memcpy(patched.ptr, b, size);
+                    out = patched.ptr;
+                    static int said;
+                    if (said++ < 4) LOG("[vr] hand: stage %d slot %d offset %d holds its %s\n", stage, idx, o * 4,
+                                        whole ? "view block" : "rotation");
+                }
+                for (int i = 0; i < 12; i++) out[o + i] = (i & 3) == 3 ? (whole ? repl[i] : 0.0f) : repl[i];
+                o += 8;
+            }
+            if (out) return ubo_span(patched, size);
         }
     }
     if (stage == 0 && idx >= 1 && g_draw_samples_screen && vr_stereo_active() && size >= 96 && size <= 0x2000) {
@@ -4357,6 +4406,7 @@ static void draw_(CmdRec *r, bool indexed) {
             LOG("\n");
         }
     }
+    vr_rig_set_hand_draw(-1);
     if (vr_stereo_active() && pr->vi) {
         // VR 1st person: Link's own skinned draws are skipped (both eyes), like the game's own 1st-person view.
         // Only a bone slot the vertex shader reads counts: bindings stay bound for later, unskinned draws.
@@ -4375,6 +4425,10 @@ static void draw_(CmdRec *r, bool indexed) {
             link = vr_rig_is_link_draw((const float *)(uintptr_t)cam.addr, cam.size, NULL, 0, r->x[2], st.vbuf[0].addr,
                                        st.vbuf[0].size);
         if (link) { stat_skipped++; return; }
+        // (rigid draws: Link's hands, placed on the controllers by their camera - vr_rig.c)
+        if (!skinned && cam.addr)
+            vr_rig_set_hand_draw(vr_rig_hand_side((const float *)(uintptr_t)cam.addr, cam.size, r->x[2], st.vbuf[0].addr,
+                                                  st.vbuf[0].size));
     }
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored

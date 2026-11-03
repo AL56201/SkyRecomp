@@ -35,6 +35,13 @@ bool vr_rig_eye_camera_direct(const float mono[28], const float reference[7], co
 // SKYRECOMP_VR_SHOW_LINK=1 keeps him.
 bool vr_rig_is_link_draw(const float *slot0, uint64_t size0, const float *bones, uint64_t bone_bytes,
                          uint64_t count, uint64_t vb, uint64_t vb_size);
+// 1st person: Link's hands on the controllers (vr_rig.c). vr.c: the controllers' grip poses (OpenXR local space:
+// x y z w, position) each frame; exec.c: which hand a rigid draw is (0 left, 1 right, -1 none) and that the draw
+// being recorded is one (its camera then places it on the controller).
+void vr_rig_set_grips(bool left_ok, const float left[7], bool right_ok, const float right[7]);
+int vr_rig_hand_side(const float *slot0, uint64_t size0, uint64_t count, uint64_t vb, uint64_t vb_size);
+void vr_rig_set_hand_draw(int side);
+bool vr_rig_hand_blocks(float orig[12], float repl[12]);  // (exec.c) this hand draw's view block: game's, replacement
 // Once per stereo frame: both eyes (pose, fov) -> the field of view the game culls with (vr_rig_cull_fov).
 void vr_rig_update_cull(const float reference[7], const float eye0[7], const float fov0[4], const float eye1[7],
                         const float fov1[4]);

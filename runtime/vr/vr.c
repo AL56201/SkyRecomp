@@ -160,6 +160,7 @@ static bool hud_grip_tracked[2];
 static XrPosef hud_grip_pose[2];
 
 void vr_set_grip_poses(bool left_tracked, const float left[7], bool right_tracked, const float right[7]) {
+    vr_rig_set_grips(left_tracked, left, right_tracked, right);  // (Link's hands on the controllers)
     const bool tracked[2] = {left_tracked, right_tracked};
     const float *pose[2] = {left, right};
     for (int h = 0; h < 2; h++) {

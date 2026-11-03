@@ -358,6 +358,10 @@ static bool planar_reflection(const float v[12], const float g[12]) {
     return state > 0;
 }
 
+static int g_hand_draw = -1;
+static bool hand_block(const VrRigAnchor *a, const float reference[7], const float game[12], float out[12]);
+static float g_hand_orig[12], g_hand_repl[12];
+static bool g_hand_blocks;
 static bool eye_camera(const float mono[28], const float reference[7], const float eye[7], const float fov[4],
                        float out[28], bool direct) {
 #if defined(__APPLE__)
@@ -439,6 +443,16 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
     }
     float view[12];
     if (!vr_rig_view(&a, reference, eye, vr_rig_units_per_metre(), view)) return false;
+    // Link's hand: on its controller - its own view block replaced (game camera x the controller's hand frame), so
+    // its lighting turns with it too
+    float hand_mono[28];
+    if (g_hand_draw >= 0 && hand_block(&a, reference, game, hand_mono + 16)) {
+        memcpy(hand_mono, mono, 16 * sizeof(float));
+        memcpy(g_hand_orig, mono + 16, sizeof g_hand_orig);
+        memcpy(g_hand_repl, hand_mono + 16, sizeof g_hand_repl);
+        g_hand_blocks = true;
+        mono = hand_mono;
+    }
     const float near = g_rig.mode == 1 ? near_units() : 0.0f;
     if (!direct && source != 1 && planar_reflection(mono + 16, game)) {
         // The block draws the reflection in a horizontal mirror: Vm = F Vg R (R the world's reflection in the plane,
@@ -496,6 +510,139 @@ static void remember_link_mesh(uint64_t hash, uint64_t count, uint64_t size) {
     static int next;
     g_link_mesh[next] = (LinkMesh){hash, count, size};
     next = (next + 1) % LINK_MESH_CACHE;
+}
+
+// ---- 1st person: Link's hands on the controllers. His hands are their own rigid meshes (one per hand and pose,
+// rooted at the wrist; measured: 744 vertices relaxed, a 28672-byte vertex buffer, within reach of his eye). Each
+// hand draw is placed on its controller instead of the game's hand pose H: drawn through the world transform
+// X = C K H^-1 (C: the controller's grip pose in the game world, K: the mesh in that grip - its fingers along the
+// controller, its palm inward, the wrist behind the grip's centre). Only the drawing moves: the game's own hand and
+// what it holds are unchanged. SKYRECOMP_VR_NO_HANDS=1: the game's hands as it places them.
+#define HAND_MESH_VB 28672
+#define HAND_REACH 130.0f
+static bool g_grip_ok[2];
+static float g_grip[2][7];     // (render thread) each controller's grip pose (OpenXR local space: x y z w, position)
+// (g_hand_draw: the draw being recorded is Link's left (0) / right (1) hand, -1 none)
+static struct { uint64_t vb, count; int side; } g_hand_mesh[8];  // (hand meshes learned: which side each is)
+static float g_hand_last[2][3];   // each hand's last game position (game world) and the frame it was drawn
+static uint64_t g_hand_last_frame[2];
+
+void vr_rig_set_grips(bool left_ok, const float left[7], bool right_ok, const float right[7]) {
+    g_grip_ok[0] = left_ok && left, g_grip_ok[1] = right_ok && right;
+    if (g_grip_ok[0]) memcpy(g_grip[0], left, sizeof g_grip[0]);
+    if (g_grip_ok[1]) memcpy(g_grip[1], right, sizeof g_grip[1]);
+}
+// (g_hand_orig, g_hand_repl: this hand draw's game view block and the one replacing it)
+void vr_rig_set_hand_draw(int side) { g_hand_draw = side, g_hand_blocks = false; }
+// (exec.c) This hand draw's game view block and its replacement: other uniform blocks holding the same matrix (the
+// shader's normals, for its lighting) get the replacement too.
+bool vr_rig_hand_blocks(float orig[12], float repl[12]) {
+    if (!g_hand_blocks || g_hand_draw < 0) return false;
+    memcpy(orig, g_hand_orig, sizeof g_hand_orig);
+    memcpy(repl, g_hand_repl, sizeof g_hand_repl);
+    return true;
+}
+static int hand_side(const float *slot0, uint64_t count, uint64_t vb, uint64_t vb_size, const float e[3]);
+int vr_rig_hand_side(const float *slot0, uint64_t size0, uint64_t count, uint64_t vb, uint64_t vb_size);
+
+static bool hands_on(void) {
+    static int off = -1;
+    if (off < 0) off = getenv("SKYRECOMP_VR_NO_HANDS") != NULL;
+    return !off && g_rig.mode == 1 && g_rig.have_game_view;
+}
+
+// Which hand a rigid draw is (-1: not a hand). slot0 + 16: its view (game camera x its model); e: his eye, same space.
+static int hand_side(const float *slot0, uint64_t count, uint64_t vb, uint64_t vb_size, const float e[3]) {
+    if (vb_size != HAND_MESH_VB || count < 600 || count > 900) return -1;
+    const float dx = slot0[19] - e[0], dy = slot0[23] - e[1], dz = slot0[27] - e[2];
+    if (dx * dx + dy * dy + dz * dz > HAND_REACH * HAND_REACH) return -1;
+    extern uint64_t renderer_present_count(void);
+    const uint64_t now = renderer_present_count() + 1;
+    const float *v = g_rig.game_view;
+    float w[3];  // (its game position in the world: R^T (o - t))
+    for (int i = 0; i < 3; i++)
+        w[i] = v[0 * 4 + i] * (slot0[19] - v[3]) + v[1 * 4 + i] * (slot0[23] - v[7]) + v[2 * 4 + i] * (slot0[27] - v[11]);
+    int side = -1;
+    for (int i = 0; i < 8; i++)
+        if (g_hand_mesh[i].vb == vb && g_hand_mesh[i].count == count) side = g_hand_mesh[i].side;
+    if (side < 0) {
+        // A new mesh (taking out an item or pulling a trigger swaps in another pose's mesh): the side not drawn yet
+        // this frame, else the one whose last position is nearer; with neither known yet, the side of the game
+        // camera it hangs on (measured: the mesh first seen on the camera's left is his right hand).
+        const bool known[2] = {g_hand_last_frame[0] + 30 >= now && g_hand_last_frame[0], g_hand_last_frame[1] + 30 >= now && g_hand_last_frame[1]};
+        const bool drawn[2] = {g_hand_last_frame[0] == now, g_hand_last_frame[1] == now};
+        if (known[0] && known[1]) {
+            float d2[2];
+            for (int h = 0; h < 2; h++) {
+                const float a0 = w[0] - g_hand_last[h][0], a1 = w[1] - g_hand_last[h][1], a2 = w[2] - g_hand_last[h][2];
+                d2[h] = a0 * a0 + a1 * a1 + a2 * a2;
+            }
+            side = drawn[0] != drawn[1] ? (drawn[0] ? 1 : 0) : d2[0] <= d2[1] ? 0 : 1;
+        } else side = dx < 0 ? 1 : 0;
+        static int next;
+        g_hand_mesh[next] = (__typeof__(g_hand_mesh[0])){vb, count, side};
+        next = (next + 1) % 8;
+    }
+    memcpy(g_hand_last[side], w, sizeof w);
+    g_hand_last_frame[side] = now;
+    return side;
+}
+
+// K: the hand mesh in its controller's grip (as on the vr-port branch, measured from the game's rest pose). Both hand
+// meshes are right-handed frames: fingers along +x, the thumb along +y (the right palm faces +z, the left -z), the
+// wrist at the origin. OpenXR grip: -z forward, +y up. So for both hands: fingers forward, thumb up; the wrist 5.5 cm
+// behind the grip's palm point. SKYRECOMP_VR_HAND_K=<rx>,<ry>,<rz>,<back cm>: an extra turn (degrees about the
+// grip's x, y, z) and wrist distance - for tuning.
+static void hand_k(int side, float k[12]) {
+    (void)side;
+    static const float grip[9] = {0, 0, 1, 0, 1, 0, -1, 0, 0};  // (columns: mesh x -> -z, y -> y, z -> x)
+    static float adj[4] = {-90, 0, 0, 5.5f};  // (measured live: a quarter turn forward about x on top of vr-port's grip)
+    static int read = -1;
+    if (read < 0) {
+        read = 1;
+        const char *e = getenv("SKYRECOMP_VR_HAND_K");
+        if (e) sscanf(e, "%f,%f,%f,%f", &adj[0], &adj[1], &adj[2], &adj[3]);
+    }
+    const float ax = adj[0] * (float)(M_PI / 180.0), ay = adj[1] * (float)(M_PI / 180.0), az = adj[2] * (float)(M_PI / 180.0);
+    const float rx[9] = {1, 0, 0, 0, cosf(ax), -sinf(ax), 0, sinf(ax), cosf(ax)};
+    const float ry[9] = {cosf(ay), 0, sinf(ay), 0, 1, 0, -sinf(ay), 0, cosf(ay)};
+    const float rz[9] = {cosf(az), -sinf(az), 0, sinf(az), cosf(az), 0, 0, 0, 1};
+    float t1[9], t2[9], r[9];
+    m_mul(rz, ry, t1);
+    m_mul(t1, rx, t2);
+    m_mul(t2, grip, r);
+    const float back = adj[3] * 0.01f * vr_rig_units_per_metre();
+    for (int i = 0; i < 3; i++) k[i * 4 + 0] = r[i * 3 + 0], k[i * 4 + 1] = r[i * 3 + 1], k[i * 4 + 2] = r[i * 3 + 2];
+    k[3] = 0, k[7] = 0, k[11] = back;
+}
+
+// (exec.c) Which hand a rigid draw is: 0 left, 1 right, -1 none
+int vr_rig_hand_side(const float *slot0, uint64_t size0, uint64_t count, uint64_t vb, uint64_t vb_size) {
+    if (!slot0 || !hands_on() || !sky_vr_is_scene_projection(slot0, size0)) return -1;
+    const float *v = g_rig.game_view;
+    float e[3];
+    for (int r = 0; r < 3; r++) e[r] = v[r * 4] * g_rig.link[0] + v[r * 4 + 1] * g_rig.link[1] + v[r * 4 + 2] * g_rig.link[2] + v[r * 4 + 3];
+    return hand_side(slot0, count, vb, vb_size, e);
+}
+
+// The view block a hand draw is lit and placed by: game camera x C K (its normals then turn with the controller;
+// the projection stays the eye's, as for every draw). False: leave the draw as the game places it.
+static bool hand_block(const VrRigAnchor *a, const float reference[7], const float game[12], float out[12]) {
+    const int side = g_hand_draw;
+    if (side < 0 || side > 1 || !g_grip_ok[side] || !hands_on()) return false;
+    float rel[9], off[3], rc[9], c[12], k[12], ck[12];
+    vr_rig_relative(reference, g_grip[side], vr_rig_units_per_metre(), rel, off);
+    m_mul(a->rotation, rel, rc);
+    float p[3];
+    m_vec(a->rotation, off, p);
+    for (int i = 0; i < 3; i++) {
+        c[i * 4 + 0] = rc[i * 3 + 0], c[i * 4 + 1] = rc[i * 3 + 1], c[i * 4 + 2] = rc[i * 3 + 2];
+        c[i * 4 + 3] = p[i] + a->origin[i];
+    }
+    hand_k(side, k);
+    a_mul(c, k, ck);
+    a_mul(game, ck, out);
+    return true;
 }
 
 bool vr_rig_is_link_draw(const float *slot0, uint64_t size0, const float *bones, uint64_t bone_bytes,
