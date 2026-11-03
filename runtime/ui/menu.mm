@@ -868,22 +868,22 @@ static void tab_vr_options(void) {
                           "Moves status modules to the right hand and item modules to the left hand.");
     changed |= opt_slider("Wrist HUD Size", &g_vr_hud_config.wrist_hud_size, 0.08f, 0.50f, 0.01f, 0.20f, "%.2f m",
                           "Physical width and height of each wrist panel.");
-    changed |= opt_slider("Wrist HUD Sideways", &g_vr_hud_config.wrist_hud_side, -0.20f, 0.20f, 0.01f, 0.12f, "%.2f m",
+    changed |= opt_slider("Wrist HUD Sideways", &g_vr_hud_config.wrist_hud_side, -0.20f, 0.20f, 0.01f, 0.00f, "%.2f m",
                           "Moves each panel outward or inward from its controller grip.");
-    changed |= opt_slider("Wrist HUD Up", &g_vr_hud_config.wrist_hud_up, -0.20f, 0.20f, 0.01f, 0.02f, "%.2f m",
+    changed |= opt_slider("Wrist HUD Up", &g_vr_hud_config.wrist_hud_up, -0.20f, 0.20f, 0.01f, 0.04f, "%.2f m",
                           "Moves each panel above or below its controller grip.");
-    changed |= opt_slider("Wrist HUD Along Arm", &g_vr_hud_config.wrist_hud_forward, -0.20f, 0.25f, 0.01f, 0.10f, "%.2f m",
+    changed |= opt_slider("Wrist HUD Along Arm", &g_vr_hud_config.wrist_hud_forward, -0.20f, 0.25f, 0.01f, 0.06f, "%.2f m",
                           "Moves each panel along the hand and forearm axis.");
-    changed |= opt_slider("Wrist HUD Tilt", &g_vr_hud_config.wrist_hud_tilt, -90.0f, 90.0f, 5.0f, 0.0f, "%+g deg",
+    changed |= opt_slider("Wrist HUD Tilt", &g_vr_hud_config.wrist_hud_tilt, -90.0f, 90.0f, 5.0f, -15.0f, "%+g deg",
                           "Tilts both panels relative to the backs of the hands.");
     changed |= opt_slider("Wrist Background", &g_vr_hud_config.wrist_hud_background, 0.0f, 0.85f, 0.05f, 0.46f, "%g",
                           "Opacity of the dark translucent backing behind each wrist HUD.");
     if (opt_action("Reset Wrist HUD", "", "Restores wrist size, placement, tilt and background opacity.")) {
         g_vr_hud_config.wrist_hud_size = 0.20f;
-        g_vr_hud_config.wrist_hud_side = 0.12f;
-        g_vr_hud_config.wrist_hud_up = 0.02f;
-        g_vr_hud_config.wrist_hud_forward = 0.10f;
-        g_vr_hud_config.wrist_hud_tilt = 0.0f;
+        g_vr_hud_config.wrist_hud_side = 0.00f;
+        g_vr_hud_config.wrist_hud_up = 0.04f;
+        g_vr_hud_config.wrist_hud_forward = 0.06f;
+        g_vr_hud_config.wrist_hud_tilt = -15.0f;
         g_vr_hud_config.wrist_hud_background = 0.46f;
         changed = true;
     }

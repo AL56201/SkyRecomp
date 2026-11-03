@@ -8,7 +8,7 @@
 
 namespace {
 constexpr VRHUDConfig kDefaults = {2.0f, 1.0f, 0.0f, false, false, true, false, false,
-                                   0.20f, 0.12f, 0.02f, 0.10f, 0.0f, 0.46f};
+                                   0.20f, 0.00f, 0.04f, 0.06f, -15.0f, 0.46f};
 constexpr float kFollowTime = 0.25f;
 constexpr float kMaxDelta = 0.1f;
 constexpr float kCurveAngle = 0.35f; // radians from the centre to either edge

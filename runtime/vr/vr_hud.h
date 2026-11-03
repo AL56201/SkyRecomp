@@ -55,22 +55,22 @@ typedef struct VRHUDConfig {
         ;                         // width of each flat wrist panel in metres
     float wrist_hud_side
 #ifdef __cplusplus
-        = 0.12f
+        = 0.00f
 #endif
         ;                         // outward from each grip pose, metres
     float wrist_hud_up
 #ifdef __cplusplus
-        = 0.02f
+        = 0.04f
 #endif
         ;                         // above each grip pose, metres
     float wrist_hud_forward
 #ifdef __cplusplus
-        = 0.10f
+        = 0.06f
 #endif
         ;                         // towards the fingers from each grip pose, metres
     float wrist_hud_tilt
 #ifdef __cplusplus
-        = 0.0f
+        = -15.0f
 #endif
         ;                         // wrist-relative panel pitch in degrees
     float wrist_hud_background
