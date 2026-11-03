@@ -58,11 +58,6 @@ typedef struct VRConfig {
         = 0
 #endif
         ;                                // left stick forward: 0 where the head looks, 1 / 2 the left / right controller
-    int link_body
-#ifdef __cplusplus
-        = 0
-#endif
-        ;                                // 1st person: 0 Link's body hidden, 1 shown (his head is hidden either way)
 } VRConfig;
 
 // Always contains a validated configuration. LoadVRConfig resets it to defaults first.

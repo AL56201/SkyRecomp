@@ -523,7 +523,7 @@ bool vr_rig_is_link_draw(const float *slot0, uint64_t size0, const float *bones,
         float w[3];  // the offset in the world (view = R | t: R^T d)
         for (int i = 0; i < 3; i++) w[i] = v[0 * 4 + i] * dx + v[1 * 4 + i] * dy + v[2 * 4 + i] * dz;
         const bool belt = w[0] * w[0] + w[2] * w[2] < LINK_BELT_RADIUS * LINK_BELT_RADIUS && w[1] < -15.0f && w[1] > -110.0f;
-        return belt && g_vr_config.link_body == 0;
+        return belt;
     }
     const int n = (int)(bone_bytes / 48);
     float nearest = 1e30f;
@@ -535,12 +535,12 @@ bool vr_rig_is_link_draw(const float *slot0, uint64_t size0, const float *bones,
     // Head-only palettes (his face: 44 matrices, his hair: 24), all at the eye point: hidden in both settings, they
     // would fill the view. (Held items have small palettes too, but at his hands, not his eye.)
     if (n < LINK_SKELETON_MIN_PALETTE) return n >= LINK_HEAD_MIN_PALETTE && nearest < LINK_HEAD_RADIUS * LINK_HEAD_RADIUS;
-    // His body: the whole skeleton's palette with a bone near his eye (VR Options > Link's Body: hidden, or shown)
+    // His body: the whole skeleton's palette with a bone near his eye
     const uint64_t hash = mesh_hash(vb, vb_size);
     bool body = known_link_mesh(hash, count, vb_size);
     if (!body && nearest < LINK_BONE_RADIUS * LINK_BONE_RADIUS) remember_link_mesh(hash, count, vb_size), body = true;
     if (body && g_water) g_water_hits_now++;
-    return body && g_vr_config.link_body == 0;
+    return body;
 #endif
 }
 
