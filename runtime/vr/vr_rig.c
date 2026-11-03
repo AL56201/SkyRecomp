@@ -200,6 +200,17 @@ void vr_rig_toggle_view(void) {
     g_yaw_set = false;
 }
 
+// Spawning (an area loaded, Link placed): for the first frames his eye point still holds a stale position (measured
+// in his room: the view stood back by the wall, still, then jumped to him ~60 frames later). In 1st person the
+// headset view stays black until his own body is drawn around the eye point (a skeleton bone within reach of it:
+// the eye point is his) for SETTLE_FRAMES frames in a row, at most SETTLE_MAX frames: the load's own black screen
+// lasts a little longer instead of showing the wrong viewpoint.
+#define SETTLE_FRAMES 5
+#define SETTLE_MAX 150
+static bool g_settling;
+static uint64_t g_body_at_eye;  // (present count + 1 when his body was last drawn around the eye point)
+bool vr_rig_settling(void) { return g_settling; }
+
 void vr_rig_begin_frame(void) {
     g_water_hits_before = g_water_hits_now;
     g_water_hits_now = 0;
@@ -227,6 +238,18 @@ void vr_rig_begin_frame(void) {
         else if (camera_distance < THEATRE_LEAVE) theatre = false;
     }
     if (!have_eye) theatre = false;
+    {   // (spawn settling, above)
+        extern uint64_t renderer_present_count(void);
+        static bool had_eye;
+        static int since, found;
+        if (have_eye && !had_eye) since = found = 0;
+        if (have_eye) {
+            found = g_body_at_eye + 1 >= renderer_present_count() + 1 && g_body_at_eye ? found + 1 : 0;
+            since++;
+        }
+        had_eye = have_eye;
+        g_settling = have_eye && g_vr_config.view_mode == 1 && found < SETTLE_FRAMES && since < SETTLE_MAX;
+    }
     if (have_eye && !theatre) {
         // (entering 1st person: facing where the game camera looked, i.e. where you were already looking)
         if (!g_yaw_set) { g_yaw = g_rig.have_game_view ? vr_rig_camera_yaw(g_rig.game_view) : 0.0f; g_yaw_set = true; }
@@ -686,6 +709,10 @@ bool vr_rig_is_link_draw(const float *slot0, uint64_t size0, const float *bones,
     const uint64_t hash = mesh_hash(vb, vb_size);
     bool body = known_link_mesh(hash, count, vb_size);
     if (!body && nearest < LINK_BONE_RADIUS * LINK_BONE_RADIUS) remember_link_mesh(hash, count, vb_size), body = true;
+    if (nearest < LINK_BONE_RADIUS * LINK_BONE_RADIUS) {  // (his body at the eye point: spawn settling)
+        extern uint64_t renderer_present_count(void);
+        g_body_at_eye = renderer_present_count() + 1;
+    }
     if (body && g_water) g_water_hits_now++;
     return body;
 #endif

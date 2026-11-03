@@ -1014,6 +1014,8 @@ void backend_present(NvnTexture *t) {
                 vk_take_view_fade(rgba);
                 memcpy(last_fade,rgba,sizeof rgba);
             }
+            extern bool vr_rig_settling(void);  // (vr_rig.c)
+            if (vr_rig_settling()) rgba[0] = rgba[1] = rgba[2] = 0, rgba[3] = 1;  // (spawning: black until settled)
             if (rgba[3]>0) {
                 vr_record_view_fade((void *)vk_cmd(), rgba);
                 view_fade_mirror = vk_view_fade_mirror(rgba);
