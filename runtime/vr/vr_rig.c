@@ -217,6 +217,7 @@ static bool g_settling;
 static float g_head_world[3], g_head_offset[3];  // (vr_rig_is_link_draw) his head; the eye point minus it, usually
 static uint64_t g_head_frame;                      // (present count + 1 when his head was last drawn)
 static bool g_head_offset_ok;
+static bool g_scripted;  // (vr_rig_begin_frame) his head has left the eye point: a scripted move (a door) plays
 static uint64_t g_body_at_eye;  // (present count + 1 when his body was last drawn around the eye point)
 bool vr_rig_settling(void) { return g_settling; }
 
@@ -235,6 +236,7 @@ void vr_rig_begin_frame(void) {
     bool have_eye = g_vr_config.view_mode == 1 && player_eye(pos);
     {   // (scripted moves: the eye follows his animated head - LINK_HEAD_DETACH)
         extern uint64_t renderer_present_count(void);
+        g_scripted = false;
         if (have_eye && g_head_frame && g_head_frame + 2 >= renderer_present_count() + 1) {
             const float dx = g_head_world[0] - pos[0], dz = g_head_world[2] - pos[2], d = sqrtf(dx * dx + dz * dz);
             if (d < LINK_HEAD_ATTACHED) {
@@ -244,6 +246,7 @@ void vr_rig_begin_frame(void) {
                 g_head_offset_ok = true;
             } else if (g_head_offset_ok) {  // (eased in between: no jump as the head moves off)
                 const float w = fminf(1.0f, (d - LINK_HEAD_ATTACHED) / (LINK_HEAD_DETACH - LINK_HEAD_ATTACHED));
+                g_scripted = w > 0.5f;
                 for (int i = 0; i < 3; i++) pos[i] += (g_head_world[i] + g_head_offset[i] - pos[i]) * w;
             }
         }
@@ -676,7 +679,8 @@ int vr_rig_hand_side(const float *slot0, uint64_t size0, uint64_t count, uint64_
 // the projection stays the eye's, as for every draw). False: leave the draw as the game places it.
 static bool hand_block(const VrRigAnchor *a, const float reference[7], const float game[12], float out[12]) {
     const int side = g_hand_draw;
-    if (side < 0 || side > 1 || !g_grip_ok[side] || !hands_on()) return false;
+    // (during a scripted move his hands stay where the game animates them: on the door's handle)
+    if (side < 0 || side > 1 || !g_grip_ok[side] || !hands_on() || g_scripted) return false;
     float rel[9], off[3], rc[9], c[12], k[12], ck[12];
     vr_rig_relative(reference, g_grip[side], vr_rig_units_per_metre(), rel, off);
     m_mul(a->rotation, rel, rc);
