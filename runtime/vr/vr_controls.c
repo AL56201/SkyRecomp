@@ -70,6 +70,15 @@ void vr_controls_set_hud_panel(const float m[16]) {
 }
 
 bool vr_game_paused(void) { return *(volatile uint32_t *)(uintptr_t)(MAIN_BASE + 0x1827370) != 0; }  // (vr.c)
+// (vr.c) Paused, or within half a second after: a closing menu keeps fading out once the game runs again - its corner
+// pieces went to the wrist card for those frames, a flash of the menu on the wrist.
+bool vr_game_paused_recently(void) {
+    extern uint64_t renderer_present_count(void);
+    static uint64_t last = ~0ull;
+    const uint64_t now = renderer_present_count();
+    if (vr_game_paused()) last = now;
+    return last != ~0ull && now - last < 30;
+}
 static bool panel_pointer_on(void) {
     static int env = -1;
     if (env < 0) env = getenv("SKYRECOMP_VR_PANEL_POINTER") ? atoi(getenv("SKYRECOMP_VR_PANEL_POINTER")) != 0 : 1;

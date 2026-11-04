@@ -1871,8 +1871,8 @@ static void build_layers(void) {
     fl.wrist_count = 0;
     extern bool player_eye(float eye[3]);
     const bool gameplay = player_eye(NULL);  // false on boot, title, loading, and file-select screens
-    extern bool vr_game_paused(void);  // (vr_controls.c: a menu pauses the game - its screens stay whole)
-    fl.use_wrist = fl.hud && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay && !vr_game_paused() &&
+    extern bool vr_game_paused_recently(void);  // (vr_controls.c: a menu pauses the game - its screens stay whole)
+    fl.use_wrist = fl.hud && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay && !vr_game_paused_recently() &&
                    (hud_grip_tracked[0] || hud_grip_tracked[1]);
     fl.quad_full = fl.quad;  // (the whole HUD image: the eyes' panel, its wrist corners cut out - vr_eye_panel)
     if (fl.use_wrist) {
