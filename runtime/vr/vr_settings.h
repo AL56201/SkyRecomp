@@ -73,6 +73,11 @@ typedef struct VRConfig {
         = 120.0f
 #endif
         ;                                // degrees per second at full tilt (30..360)
+    int door_mode
+#ifdef __cplusplus
+        = 0
+#endif
+        ;                                // opening doors: 0 A or the grab-twist-pull gesture, 1 the gesture only, 2 A only
 } VRConfig;
 
 // Always contains a validated configuration. LoadVRConfig resets it to defaults first.

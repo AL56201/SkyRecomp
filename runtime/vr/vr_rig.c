@@ -228,6 +228,11 @@ void vr_rig_begin_frame(void) {
     g_memory_seen_now = false;
     int mode = 0;
     float pos[3];
+    {   // (RE, hle/player.c) SKYRECOMP_PLAYER_TRACE / SKYRECOMP_PLAYER_SNAP, once per frame
+        extern void player_trace_tick(uint64_t frame);
+        extern uint64_t renderer_present_count(void);
+        player_trace_tick(renderer_present_count());
+    }
     // Theatre: 1st person drops to the 3rd-person view while the game camera is far from Link's eye point. Link's
     // eye point stops updating while he rides his Loftwing, and cinematic cameras frame scenes from far away; the
     // view comes back once the camera follows Link again. Hysteresis keeps it from flickering at the edge.

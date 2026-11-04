@@ -49,6 +49,15 @@ static bool player_feet_y_live(float *y) {
     return true;
 }
 
+// Link's actor +0x118: u32, his current action. Measured 2026-11-04 in his room: 0x58 standing, 0x57 / 0x1b / 0x14 /
+// 0x15 starting and walking, 0x9 pushed against a wall, 0x6a at a door he can open (A opens it; with it the actor's
+// +0x14c and +0x314 change too, which a wall leaves alone).
+int player_action(void) {
+    const uint64_t actor = *(const uint64_t *)(uintptr_t)PLAYER_ACTOR_REF;
+    if (!heap_ptr(actor)) return -1;
+    return (int)*(const volatile uint32_t *)(uintptr_t)(actor + 0x118);
+}
+
 #define GAME_CAMERA_VIEW 0x7002bfda90ull
 
 static bool game_camera_view_live(float view[12]) {

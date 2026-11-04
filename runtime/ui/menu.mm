@@ -899,6 +899,10 @@ static void tab_vr_options(void) {
     changed |= opt_choice("Movement Direction", &g_vr_config.move_direction, move_dirs, 3, 0,
                           "Which way pushing the movement stick forward walks Link: where you look (Head), or where a "
                           "controller points - so you can look around while walking straight.");
+    static const char *door_modes[] = {"Button & Gesture", "Gesture only", "Button only"};
+    changed |= opt_choice("Door Opening", &g_vr_config.door_mode, door_modes, 3, 0,
+                          "At a door: grab the handle with a grip, turn your wrist a quarter turn and pull it towards "
+                          "you to open it. Gesture only ignores the A button at doors; Button only turns the gesture off.");
     static const char *turn_modes[] = {"Snap", "Smooth", "Off"};
     changed |= opt_choice("Turning", &g_vr_config.turn_mode, turn_modes, 3, 0,
                           "1st person: the right stick turns you. Snap turns in steps (comfortable for most people), "

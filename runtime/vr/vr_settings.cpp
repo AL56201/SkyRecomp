@@ -72,6 +72,7 @@ void validate(VRConfig &config) {
     if (config.view_mode != 0 && config.view_mode != 1) config.view_mode = kDefaults.view_mode;
     if (config.move_direction < 0 || config.move_direction > 2) config.move_direction = kDefaults.move_direction;
     if (config.turn_mode < 0 || config.turn_mode > 2) config.turn_mode = kDefaults.turn_mode;
+    if (config.door_mode < 0 || config.door_mode > 2) config.door_mode = kDefaults.door_mode;
     if (!std::isfinite(config.snap_turn_angle)) config.snap_turn_angle = kDefaults.snap_turn_angle;
     if (!std::isfinite(config.smooth_turn_speed)) config.smooth_turn_speed = kDefaults.smooth_turn_speed;
     config.snap_turn_angle = std::clamp(config.snap_turn_angle, 15.0f, 90.0f);
@@ -117,6 +118,7 @@ std::vector<std::string> vr_lines() {
             "view_mode = " + std::to_string(g_vr_config.view_mode),
             "move_direction = " + std::to_string(g_vr_config.move_direction),
             "turn_mode = " + std::to_string(g_vr_config.turn_mode),
+            "door_mode = " + std::to_string(g_vr_config.door_mode),
             "snap_turn_angle = " + std::to_string((int)g_vr_config.snap_turn_angle),
             "smooth_turn_speed = " + std::to_string((int)g_vr_config.smooth_turn_speed),
             "camera_height_offset = " + height.str(), "camera_distance_offset = " + distance.str(),
@@ -166,6 +168,7 @@ extern "C" void LoadVRConfig(const char *filepath) {
         else if (key == "view_mode") parse_int(value, g_vr_config.view_mode);
         else if (key == "move_direction") parse_int(value, g_vr_config.move_direction);
         else if (key == "turn_mode") parse_int(value, g_vr_config.turn_mode);
+        else if (key == "door_mode") parse_int(value, g_vr_config.door_mode);
         else if (key == "snap_turn_angle") parse_float(value, g_vr_config.snap_turn_angle);
         else if (key == "smooth_turn_speed") parse_float(value, g_vr_config.smooth_turn_speed);
         else if (key == "camera_height_offset") parse_float(value, g_vr_config.camera_height_offset);
