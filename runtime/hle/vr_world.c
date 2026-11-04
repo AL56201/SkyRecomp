@@ -197,8 +197,55 @@ static void re_actors(void) {
     if (at < 0 || (long)renderer_present_count() < at || !g_nsnap) return;
     at = -1;
     LOG("[re] room controller *(0x7002bfece8) = %#llx\n", (unsigned long long)*(const uint64_t *)(uintptr_t)0x7002bfece8ull);
-    for (int k = 0; k < 16; k++)  // (the room object's type: its first virtual methods)
-        LOG("[re] vtable 0x7001677230 +%#x = %#llx\n", k * 8, (unsigned long long)*(const uint64_t *)(uintptr_t)(0x7001677230ull + k * 8));
+    {   // (every object at the door's exact spot: a vtable in main at +0, (790.6, *, -2183) at +0x144 or +0x148)
+        for (uint64_t a = 0x7005000000ull; a < 0x7008000000ull; a += 8) {
+            const uint64_t vt = *(const uint64_t *)(uintptr_t)a;
+            if (vt < 0x7001000000ull || vt >= 0x7002000000ull) continue;
+            for (int o = 0x144; o <= 0x148; o += 4) {
+                const float *p = (const float *)(uintptr_t)(a + o);
+                if (fabsf(p[0] - 790.6f) < 0.5f && fabsf(p[2] + 2183.0f) < 0.5f)
+                    LOG("[re] at the door: %#llx vtable %#llx (position at +%#x) angles +0x130: %04x %04x %04x\n",
+                        (unsigned long long)a, (unsigned long long)vt, o, ((const uint16_t *)(uintptr_t)(a + 0x130))[0],
+                        ((const uint16_t *)(uintptr_t)(a + 0x130))[1], ((const uint16_t *)(uintptr_t)(a + 0x130))[2]);
+            }
+        }
+    }
+    {   // (the door object: 16-bit values from +0x130 - its angles, 22.5 degrees = 0x1000)
+        const uint16_t *h = (const uint16_t *)(uintptr_t)(0x7006229168ull + 0x130);
+        char line[512];
+        int len = snprintf(line, sizeof line, "[re] door +0x130..:");
+        for (int k = 0; k < 48; k++) len += snprintf(line + len, sizeof line - len, " %04x", h[k]);
+        LOG("%s\n", line);
+    }
+    {   // (the door object - type 0x7001600da0 - before A: its position and room bytes)
+        const uint8_t *d = (const uint8_t *)(uintptr_t)0x7006229168ull;
+        LOG("[re] door 0x7006229168 vtable %#llx pos %.1f %.1f %.1f bytes +0x7b8..: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+            (unsigned long long)*(const uint64_t *)d, *(const float *)(d + 0x144), *(const float *)(d + 0x148),
+            *(const float *)(d + 0x14c), d[0x7b8], d[0x7b9], d[0x7ba], d[0x7bb], d[0x7bc], d[0x7bd], d[0x7be], d[0x7bf]);
+    }
+    {   // (the door object that activated the hallway: where it keeps its position - floats near (790.6, *, -2183))
+        const float *f = (const float *)(uintptr_t)0x700622a908ull;
+        for (int k = 0; k < 0x900 / 4; k++)
+            if (fabsf(f[k] - 790.6f) < 1.0f || fabsf(f[k] + 2183.0f) < 1.0f)
+                LOG("[re] door object +%#x = %.2f\n", k * 4, f[k]);
+        LOG("[re] door object +0x7bc..: %02x %02x %02x %02x\n", ((const uint8_t *)f)[0x7bb], ((const uint8_t *)f)[0x7bc],
+            ((const uint8_t *)f)[0x7bd], ((const uint8_t *)f)[0x7be]);
+    }
+    {   // (the hallway's room object: its create phases - f_7000f0f19c runs table[index] until done)
+        const uint64_t room = 0x700622b0e8ull, ph = *(const uint64_t *)(uintptr_t)(room + 0x98);
+        LOG("[re] room %#llx vtable %#llx phase record %#llx\n", (unsigned long long)room,
+            (unsigned long long)*(const uint64_t *)(uintptr_t)room, (unsigned long long)ph);
+        if (ph >= 0x7000000000ull && ph < 0x7800000000ull) {
+            const uint64_t table = *(const uint64_t *)(uintptr_t)(ph + 0x10);
+            const int idx = *(const int16_t *)(uintptr_t)(ph + 0xa);
+            LOG("[re] phase state %u index %d table %#llx\n", *(const uint16_t *)(uintptr_t)(ph + 8), idx, (unsigned long long)table);
+            for (int k = 0; table >= 0x7000000000ull && table < 0x7800000000ull && k < 12; k++) {
+                const uint64_t f = *(const uint64_t *)(uintptr_t)(table + k * 8);
+                LOG("[re]   phase %d: %#llx%s\n", k, (unsigned long long)f, k == idx ? "  <- current" : "");
+                if (!f) break;
+            }
+        }
+    }
     const uint64_t r = scene_root();  // (the fullest list of the last frame: scene_snapshot)
     const uint64_t *list = g_snap;
     const uint32_t n = g_nsnap;
@@ -246,12 +293,13 @@ static void re_room(Cpu *c) {
     static int init;
     static uint64_t mgr;
     static unsigned room;
+    static bool on;
     if (!init) {
         init = 1;
         const char *e = getenv("SKYRECOMP_RE_ROOM");
-        if (!e || sscanf(e, "%llx,%u", (unsigned long long *)&mgr, &room) != 2) mgr = 0;
+        on = e && sscanf(e, "%llx,%u", (unsigned long long *)&mgr, &room) == 2;
     }
-    if (!mgr) return;
+    if (!on) return;
     const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
     if (link < 0x7000000000ull || link >= 0x7800000000ull || *(const uint32_t *)(uintptr_t)(link + 0x118) != 0x6a) return;
     static int wait;
@@ -259,25 +307,27 @@ static void re_room(Cpu *c) {
     uint64_t saved[31];
     memcpy(saved, c->x, sizeof saved);
     const uint64_t sp = c->sp;
-    // what the DoorPull event's room step calls (f_7000f7a218 at 0x7000f7b83c): f_7000f30944(*(0x7002bfeab0), room,
-    // room, &f) with f = -1.0 (a float out / in on the guest stack)
-    (void)mgr;
-    c->sp -= 0x20;
-    *(volatile uint32_t *)(uintptr_t)c->sp = 0xbf800000u;
-    c->x[0] = *(const uint64_t *)(uintptr_t)0x7002bfeab0ull;
-    c->x[1] = room;
+    // what an object's update calls as the hallway is activated (f_7000789748 at 0x7000789d50): f_7000e0854c(
+    // *(0x7002bf9d90), mgr (its +0x7bd), room (its +0x7bc)) - measured (0, 1)
+    c->x[0] = *(const uint64_t *)(uintptr_t)0x7002bf9d90ull;
+    c->x[1] = (uint32_t)mgr;
     c->x[2] = room;
-    c->x[3] = c->sp;
-    LOG("[re] calling f_7000f30944(%#llx, %u, %u) at frame %llu\n", (unsigned long long)c->x[0], room, room,
+    LOG("[re] calling f_7000e0854c(%#llx, %u, %u) at frame %llu\n", (unsigned long long)c->x[0], (unsigned)mgr, room,
         (unsigned long long)renderer_present_count());
-    guest_call(c, 0x7000f30944ull);
+    guest_call(c, 0x7000e0854cull);
     LOG("[re] returned %#llx\n", (unsigned long long)c->x[0]);
     memcpy(c->x, saved, sizeof saved);
     c->sp = sp;
-    mgr = 0;
+    on = false;
 }
 
 static void pre_execute(Cpu *c) {
+    extern void door_room_tick(Cpu *c);
+    door_room_tick(c);  // (physical doors: the room beyond, activated - hle/door.c)
+    extern void door_step_tick(void);
+    door_step_tick();
+    extern void door_yaw_tick(void);
+    door_yaw_tick();
     re_actors();
     re_room(c);
     if (world_in_menus()) {

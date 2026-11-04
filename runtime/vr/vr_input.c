@@ -506,10 +506,21 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                     while (a < -(float)M_PI) a += 2 * (float)M_PI;
                     const float lim = 75.0f * (float)(M_PI / 180);
                     door_set_open(fmaxf(-lim, fminf(lim, a)));
-                    // (early: the next room only loads in the game's sequence - beyond the opening was void)
-                    if (!opening && fabsf(a) > 10.0f * (float)(M_PI / 180)) {
-                        LOG("[door] swung open %.0f deg: the game's sequence\n", a * 57.2958f);
-                        press = 8, opening = true, haptic(hand, 0.6f, 40);
+                    // as it starts to open, the room beyond is activated (hle/door.c - no door event: the door stays in
+                    // the hand), so beyond the opening is never void
+                    if (!opening && fabsf(a) > 3.0f * (float)(M_PI / 180)) {
+                        extern void door_request_room(void);
+                        LOG("[door] swung open %.0f deg: activating the room beyond\n", a * 57.2958f);
+                        door_request_room();
+                        opening = true, haptic(hand, 0.6f, 40);
+                    }
+                    // swung wide: the game's door sequence takes Link through (the door's collision does not turn
+                    // with the drawn leaf yet) - the room beyond is already there
+                    static bool through;
+                    if (!opening) through = false;
+                    if (opening && !through && fabsf(a) > 60.0f * (float)(M_PI / 180)) {
+                        LOG("[door] swung wide %.0f deg: Link goes through\n", a * 57.2958f);
+                        press = 8, through = true;
                     }
                 }
                 // the pull: how far the hand moved (level) since the grab - after the turn, at a door, any pull opens it

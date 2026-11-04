@@ -20,6 +20,7 @@ extern bool player_eye(float eye[3]);
 #define DOOR_NEAR 160.0f  // (units, level: the door's origin from Link's eye point; measured ~60 at the door)
 
 static uint64_t g_door;  // the matrix's address; 0: none
+static uint64_t g_door_actor_found;  // (its door object, found with it - below)
 // How far VR holds the door open (radians, about its vertical through its origin - the leaf's draw turns about it in
 // the game's own sequence; measured -22.5 -> -82 degrees of its x axis). vr_input.c sets it; vr_rig.c draws it.
 #include <stdatomic.h>
@@ -83,6 +84,8 @@ void door_track(void) {
         g_door = scan(eye);
         if (g_door) {
             memcpy(g_door_m, (const float *)(uintptr_t)g_door, sizeof g_door_m);
+            extern uint64_t door_find_actor(const float m[12]);
+            g_door_actor_found = door_find_actor(g_door_m);
             LOG("[door] door at %.1f %.1f %.1f (matrix %#llx)\n", g_door_m[3], g_door_m[7], g_door_m[11],
                 (unsigned long long)g_door);
         }
@@ -95,6 +98,14 @@ void door_test_open(void) {
     static float deg;
     if (on < 0) on = getenv("SKYRECOMP_DOOR_TEST_OPEN") != NULL, deg = on ? (float)atof(getenv("SKYRECOMP_DOOR_TEST_OPEN")) : 0;
     if (on) door_set_open(g_door ? deg * (float)(M_PI / 180) : 0.0f);
+    static bool requested;  // (and the room beyond, once - as a pulled door does)
+    void door_request_room(void);
+    if (on && g_door && !requested) requested = true, door_request_room();
+    static int step_at = -1;  // (SKYRECOMP_DOOR_TEST_STEP=<frames>: and Link stepped through that long after)
+    if (step_at < 0) step_at = getenv("SKYRECOMP_DOOR_TEST_STEP") ? atoi(getenv("SKYRECOMP_DOOR_TEST_STEP")) : 0;
+    static int since;
+    void door_request_step(void);
+    if (on && requested && step_at > 0 && ++since == step_at) door_request_step();
 }
 
 // The leaf's world matrix (row-major 3x4) of the door Link is at. False: none.
@@ -144,3 +155,127 @@ bool door_handle_local(float *x, float *z) {
 // Where the hand holding the handle is drawn: the grip's centre further out from the door, the hand's mesh clear of it
 #define HANDLE_HAND_Z 30.0f
 bool door_handle_hand(float w[3]) { return handle_at(HANDLE_HAND_Z, w); }
+
+// ---- the room beyond the door (no door event). Measured 2026-11-04 (Link's room -> the academy hallway):
+// a door object (vtable 0x7001600da0) keeps its position at +0x144 / +0x148 / +0x14c and the two rooms it joins at
+// +0x7bc / +0x7bd (bytes; 1 and 0 there). The door event activates the far room with f_7000e0854c(rooms, to, from):
+// rooms = *(0x7002bf9d90), its room objects at +0xf0 + 8 * index; it clears the room's inactive bits (+0x9f0, 0xa
+// when inactive) and marks the rooms around it - the far room's objects are then built, as when the door opens.
+#define DOOR_VTABLE 0x7001600da0ull
+#define ROOMS_PTR 0x7002bf9d90ull
+#define g_door_actor g_door_actor_found
+static _Atomic int g_room_request;
+
+// (several objects of that type can stand at one door: all kept; door_rooms takes the one joining an active room to
+// an inactive one)
+static uint64_t g_door_actors[8];
+static int g_door_actor_count;
+uint64_t door_find_actor(const float m[12]) {
+    g_door_actor_count = 0;
+    for (uint64_t a = HEAP_LO; a < HEAP_HI && g_door_actor_count < 8; a += 8) {
+        if (*(const uint64_t *)(uintptr_t)a != DOOR_VTABLE) continue;
+        const float *p = (const float *)(uintptr_t)(a + 0x144);
+        if (fabsf(p[0] - m[3]) < 5 && fabsf(p[2] - m[11]) < 5) g_door_actors[g_door_actor_count++] = a;
+    }
+    return g_door_actor_count ? g_door_actors[0] : 0;
+}
+
+static uint64_t room_object(int index) {
+    const uint64_t rooms = *(const uint64_t *)(uintptr_t)ROOMS_PTR;
+    if (rooms < 0x7000000000ull || rooms >= 0x7800000000ull || index < 0 || index > 63) return 0;
+    const uint64_t r = *(const uint64_t *)(uintptr_t)(rooms + 0xf0 + 8 * (uint64_t)index);
+    return r >= 0x7000000000ull && r < 0x7800000000ull ? r : 0;
+}
+
+// The door's far room (the one of its two that is inactive) and the near one. False: no door object, or both active.
+bool door_rooms(int *to, int *from) {
+    if (!g_door_actor) return false;
+    for (int i = 0; i < g_door_actor_count; i++) {
+        const uint8_t *d = (const uint8_t *)(uintptr_t)g_door_actors[i];
+        const int a = d[0x7bd], b = d[0x7bc];
+        const uint64_t ra = room_object(a), rb = room_object(b);
+        if (!ra || !rb || a == b) continue;
+        const bool a_off = *(const uint8_t *)(uintptr_t)(ra + 0x9f0) & 0x1e, b_off = *(const uint8_t *)(uintptr_t)(rb + 0x9f0) & 0x1e;
+        if (a_off == b_off) continue;
+        *to = a_off ? a : b, *from = a_off ? b : a;
+        return true;
+    }
+    return false;
+}
+
+// (vr_input.c, any thread) Activate the room beyond the door: done on the game thread (door_room_tick).
+void door_request_room(void) { atomic_store(&g_room_request, 1); }
+
+// (hle/vr_world.c, the game thread, inside an object's update)
+void door_room_tick(Cpu *c) {
+    if (!atomic_exchange(&g_room_request, 0)) return;
+    int to, from;
+    const uint64_t rooms = *(const uint64_t *)(uintptr_t)ROOMS_PTR;
+    if (!door_rooms(&to, &from) || !rooms) {
+        const uint8_t *d = (const uint8_t *)(uintptr_t)g_door_actor;
+        const uint64_t ra = d ? room_object(d[0x7bd]) : 0, rb = d ? room_object(d[0x7bc]) : 0;
+        LOG("[door] room request: no far room to activate (door object %#llx rooms %d %d -> %#llx %#llx flags %x %x)\n",
+            (unsigned long long)g_door_actor, d ? d[0x7bd] : -1, d ? d[0x7bc] : -1, (unsigned long long)ra, (unsigned long long)rb,
+            ra ? *(const uint8_t *)(uintptr_t)(ra + 0x9f0) : 0xff, rb ? *(const uint8_t *)(uintptr_t)(rb + 0x9f0) : 0xff);
+        return;
+    }
+    uint64_t saved[31];
+    memcpy(saved, c->x, sizeof saved);
+    const uint64_t sp = c->sp, pc = c->pc;
+    c->x[0] = rooms, c->x[1] = (uint64_t)to, c->x[2] = (uint64_t)from;
+    guest_call(c, 0x7000e0854cull);
+    memcpy(c->x, saved, sizeof saved);
+    c->sp = sp, c->pc = pc;
+    LOG("[door] activated room %d beyond the door (from room %d)\n", to, from);
+}
+
+// ---- stepping through (the door's collision stays where the closed leaf is: the game's own sequence walks Link
+// through by animation). Link's actor keeps his position x / z at +0x148 / +0x150, with copies at +0x15c / +0x164 (the
+// previous frame's) - measured as the ones that follow him (snapshot diff, his room -> the door).
+static _Atomic int g_step_request;
+void door_request_step(void) { atomic_store(&g_step_request, 1); }
+
+// (game thread) Link moved through the door: to the far side of its plane, `dist` units beyond it, at the doorway's
+// centre line (the door's origin is the doorway's middle - its leaf spans x -70 .. 70)
+void door_step_tick(void) {
+    if (!atomic_exchange(&g_step_request, 0)) return;
+    float m[12], eye[3];
+    const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
+    if (!door_matrix(m) || !player_eye(eye) || link < 0x7000000000ull || link >= 0x7800000000ull) return;
+    const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
+    const float side = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;  // (his z in the door's frame)
+    const float dist = 90.0f;
+    // the door's z axis in the world (its third column), to the far side
+    const float x = m[3] - side * m[2] * dist, z = m[11] - side * m[10] * dist;
+    float *p = (float *)(uintptr_t)(link + 0x148);
+    LOG("[door] stepping Link through: %.1f %.1f -> %.1f %.1f\n", p[0], p[2], x, z);
+    // (every copy of his x / z that followed him in the snapshot diff: x at these, z 8 bytes on)
+    // (at a door, action 0x6a holds him in front of it: standing, 0x58, he stays where put)
+    if (*(volatile uint32_t *)(uintptr_t)(link + 0x118) == 0x6a) *(volatile uint32_t *)(uintptr_t)(link + 0x118) = 0x58;
+    static const uint32_t copies[] = {0x1c, 0x48, 0x148, 0x15c, 0x220, 0x234, 0x2d8};
+    for (unsigned i = 0; i < sizeof copies / sizeof *copies; i++) {
+        float *q = (float *)(uintptr_t)(link + copies[i]);
+        q[0] = x, q[2] = z;
+    }
+}
+
+// ---- the door object turned (its collision with it): its rotation, s16 x / y / z at +0x130 and a copy at +0x13c
+// (y 0x9000 = 202.5 degrees for Link's room's door, whose leaf faces 22.5). (test) SKYRECOMP_DOOR_TEST_YAW=<degrees>:
+// the door object at the door Link is at turned that much, every frame (game thread)
+void door_yaw_tick(void) {
+    static int on = -1;
+    static float deg;
+    if (on < 0) on = getenv("SKYRECOMP_DOOR_TEST_YAW") != NULL, deg = on ? (float)atof(getenv("SKYRECOMP_DOOR_TEST_YAW")) : 0;
+    if (!on || !g_door_actor_count) return;
+    int to, from;
+    if (!door_rooms(&to, &from)) {}  // (keeps none: any door object at the door turns)
+    static uint16_t base[8];
+    static uint64_t based[8];
+    for (int i = 0; i < g_door_actor_count; i++) {
+        const uint64_t a = g_door_actors[i];
+        uint16_t *y0 = (uint16_t *)(uintptr_t)(a + 0x132), *y1 = (uint16_t *)(uintptr_t)(a + 0x13e);
+        if (based[i] != a) based[i] = a, base[i] = *y0;
+        const uint16_t y = (uint16_t)(base[i] + (int)(deg * 65536.0f / 360.0f));
+        *y0 = y, *y1 = y;
+    }
+}
