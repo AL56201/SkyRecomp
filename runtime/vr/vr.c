@@ -1701,7 +1701,8 @@ static XrPosef hud_pose(void) {
     const float dt = frame.display_period > 0 ? (float)frame.display_period * 1e-9f : 1.0f / 90.0f;
     extern bool vr_menu_pointer_active(void);  // (vr_controls.c: the panel holds still while it is in use)
     extern bool menu_is_open(void), menu_on_vr_panel(void);
-    g_vr_hud_hold = vr_menu_pointer_active() || g_cinema;  // (a cutscene's screen holds still too)
+    extern bool vr_game_paused_recently(void);  // (vr_controls.c: a closing menu fades out after the pause ends)
+    g_vr_hud_hold = vr_menu_pointer_active() || g_cinema || vr_game_paused_recently();  // (a cutscene's screen too)
     ComputeHUDQuadMatrixDelta(m, head, NULL, dt);
     memcpy(g_hud_world, m, sizeof g_hud_world);
     g_hud_world_ok = true;
@@ -1871,8 +1872,8 @@ static void build_layers(void) {
     fl.wrist_count = 0;
     extern bool player_eye(float eye[3]);
     const bool gameplay = player_eye(NULL);  // false on boot, title, loading, and file-select screens
-    extern bool vr_game_paused_recently(void);  // (vr_controls.c: a menu pauses the game - its screens stay whole)
-    fl.use_wrist = fl.hud && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay && !vr_game_paused_recently() &&
+    extern bool vr_game_paused(void);  // (vr_controls.c: a menu pauses the game - its screens stay whole)
+    fl.use_wrist = fl.hud && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay && !vr_game_paused() &&
                    (hud_grip_tracked[0] || hud_grip_tracked[1]);
     fl.quad_full = fl.quad;  // (the whole HUD image: the eyes' panel, its wrist corners cut out - vr_eye_panel)
     if (fl.use_wrist) {

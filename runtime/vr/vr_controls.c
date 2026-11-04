@@ -70,8 +70,8 @@ void vr_controls_set_hud_panel(const float m[16]) {
 }
 
 bool vr_game_paused(void) { return *(volatile uint32_t *)(uintptr_t)(MAIN_BASE + 0x1827370) != 0; }  // (vr.c)
-// (vr.c) Paused, or within half a second after: a closing menu keeps fading out once the game runs again - its corner
-// pieces went to the wrist card for those frames, a flash of the menu on the wrist.
+// (vr.c) Paused, or within half a second after: a closing menu keeps fading out once the game runs again - the panel
+// holds still for it (it swung back to follow the head mid-fade: a flash of the menu at another angle).
 bool vr_game_paused_recently(void) {
     extern uint64_t renderer_present_count(void);
     static uint64_t last = ~0ull;
