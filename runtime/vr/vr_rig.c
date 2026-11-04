@@ -39,6 +39,12 @@ bool game_camera_view(float view[12]);  // runtime/hle/player.c: the game camera
 #define LINK_HEAD_MIN_PALETTE 16
 #define LINK_SKELETON_MIN_PALETTE 100
 #define LINK_HEAD_RADIUS 30.0f
+#define LINK_FACE_MIN_PALETTE 40  // (his face: 44 matrices - where his head is)
+// Scripted moves (opening a door): the game animates Link through it while his eye point (and his actor's position)
+// stay put, then jump. 1st person follows his animated head then: once it is this far (horizontally) from the eye
+// point, the eye is the head plus its usual offset from the eye point (measured while they stay together).
+#define LINK_HEAD_DETACH 45.0f
+#define LINK_HEAD_ATTACHED 20.0f
 #define LINK_EYE_PART_MAX_VERTS 96
 #define LINK_EYE_PART_RADIUS 12.0f
 #define LINK_BELT_RADIUS 18.0f
@@ -208,6 +214,9 @@ void vr_rig_toggle_view(void) {
 #define SETTLE_FRAMES 5
 #define SETTLE_MAX 150
 static bool g_settling;
+static float g_head_world[3], g_head_offset[3];  // (vr_rig_is_link_draw) his head; the eye point minus it, usually
+static uint64_t g_head_frame;                      // (present count + 1 when his head was last drawn)
+static bool g_head_offset_ok;
 static uint64_t g_body_at_eye;  // (present count + 1 when his body was last drawn around the eye point)
 bool vr_rig_settling(void) { return g_settling; }
 
@@ -223,7 +232,22 @@ void vr_rig_begin_frame(void) {
     // view comes back once the camera follows Link again. Hysteresis keeps it from flickering at the edge.
     static bool theatre;
     float camera_distance = -1;
-    const bool have_eye = g_vr_config.view_mode == 1 && player_eye(pos);
+    bool have_eye = g_vr_config.view_mode == 1 && player_eye(pos);
+    {   // (scripted moves: the eye follows his animated head - LINK_HEAD_DETACH)
+        extern uint64_t renderer_present_count(void);
+        if (have_eye && g_head_frame && g_head_frame + 2 >= renderer_present_count() + 1) {
+            const float dx = g_head_world[0] - pos[0], dz = g_head_world[2] - pos[2], d = sqrtf(dx * dx + dz * dz);
+            if (d < LINK_HEAD_ATTACHED) {
+                for (int i = 0; i < 3; i++)
+                    g_head_offset[i] = g_head_offset_ok ? g_head_offset[i] + (pos[i] - g_head_world[i] - g_head_offset[i]) * 0.1f
+                                                        : pos[i] - g_head_world[i];
+                g_head_offset_ok = true;
+            } else if (g_head_offset_ok) {  // (eased in between: no jump as the head moves off)
+                const float w = fminf(1.0f, (d - LINK_HEAD_ATTACHED) / (LINK_HEAD_DETACH - LINK_HEAD_ATTACHED));
+                for (int i = 0; i < 3; i++) pos[i] += (g_head_world[i] + g_head_offset[i] - pos[i]) * w;
+            }
+        }
+    }
     if (have_eye && g_rig.have_game_view) {
         const float *v = g_rig.game_view;
         float d2 = 0;
@@ -704,7 +728,24 @@ bool vr_rig_is_link_draw(const float *slot0, uint64_t size0, const float *bones,
     }
     // Head-only palettes (his face: 44 matrices, his hair: 24), all at the eye point: hidden in both settings, they
     // would fill the view. (Held items have small palettes too, but at his hands, not his eye.)
-    if (n < LINK_SKELETON_MIN_PALETTE) return n >= LINK_HEAD_MIN_PALETTE && nearest < LINK_HEAD_RADIUS * LINK_HEAD_RADIUS;
+    if (n < LINK_SKELETON_MIN_PALETTE) {
+        if (n < LINK_HEAD_MIN_PALETTE) return false;
+        // (remembered: in scripted moves - a door - his animated head leaves the eye point, which stays put)
+        const bool near = nearest < LINK_HEAD_RADIUS * LINK_HEAD_RADIUS;
+        const uint64_t hash = mesh_hash(vb, vb_size);
+        const bool known = known_link_mesh(hash, count, vb_size);
+        if (near && !known) remember_link_mesh(hash, count, vb_size);
+        if (!near && !known) return false;
+        if (n >= LINK_FACE_MIN_PALETTE) {  // where his head is (his face's bones, in the world: R^T (c - t))
+            float c[3] = {0, 0, 0};
+            for (int i = 0; i < n; i++) c[0] += bones[i * 12 + 3], c[1] += bones[i * 12 + 7], c[2] += bones[i * 12 + 11];
+            for (int r = 0; r < 3; r++) c[r] = c[r] / n - v[r * 4 + 3];
+            for (int i = 0; i < 3; i++) g_head_world[i] = v[0 * 4 + i] * c[0] + v[1 * 4 + i] * c[1] + v[2 * 4 + i] * c[2];
+            extern uint64_t renderer_present_count(void);
+            g_head_frame = renderer_present_count() + 1;
+        }
+        return true;
+    }
     // His body: the whole skeleton's palette with a bone near his eye
     const uint64_t hash = mesh_hash(vb, vb_size);
     bool body = known_link_mesh(hash, count, vb_size);
