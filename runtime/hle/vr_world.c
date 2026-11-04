@@ -237,8 +237,38 @@ static void re_actors(void) {
     }
 }
 
+// (RE) SKYRECOMP_RE_ROOM=<hex manager>,<room>: once Link stands at a door, f_7000f0f258(manager, room) is called once
+// (game thread) - what the door event's room switch calls (f_7000f0faac, on the door event)
+static void re_room(Cpu *c) {
+    static int init;
+    static uint64_t mgr;
+    static unsigned room;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("SKYRECOMP_RE_ROOM");
+        if (!e || sscanf(e, "%llx,%u", (unsigned long long *)&mgr, &room) != 2) mgr = 0;
+    }
+    if (!mgr) return;
+    const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
+    if (link < 0x7000000000ull || link >= 0x7800000000ull || *(const uint32_t *)(uintptr_t)(link + 0x118) != 0x6a) return;
+    static int wait;
+    if (++wait < 120) return;  // (standing at the door a while)
+    uint64_t saved[31];
+    memcpy(saved, c->x, sizeof saved);
+    const uint64_t sp = c->sp;
+    c->x[0] = mgr;
+    c->x[1] = room;
+    LOG("[re] calling f_7000f0f258(%#llx, %u) at frame %llu\n", (unsigned long long)mgr, room, (unsigned long long)renderer_present_count());
+    guest_call(c, 0x7000f0f258ull);
+    LOG("[re] returned %#llx\n", (unsigned long long)c->x[0]);
+    memcpy(c->x, saved, sizeof saved);
+    c->sp = sp;
+    mgr = 0;
+}
+
 static void pre_execute(Cpu *c) {
     re_actors();
+    re_room(c);
     if (world_in_menus()) {
         if (!*(volatile uint32_t *)(uintptr_t)EXEC_MASK) scene_snapshot();
         else scene_replay(c);
