@@ -3893,7 +3893,7 @@ static void draw_(CmdRec *r, bool indexed);
 // 16:9 texture instead of into each eye, for an OpenXR panel. Its draws are the last of a frame: an orthographic
 // 192-byte camera block (vertex slot 0) and the presented image as target (measured on the title, file select,
 // gameplay and map screens). On by default in VR; SKYRECOMP_VR_HUD_LAYER=0 turns it off.
-static NvnTexture g_hud_tex, g_hud_depth;  // (its own depth / stencil: some 2D draws depth-test, e.g. the map islands)
+static NvnTexture g_hud_tex, g_hud_depth, g_wrist_tex;  // (g_wrist_tex: the wrist panels' elements, vr.c)  // (its own depth / stencil: some 2D draws depth-test, e.g. the map islands)
 static uint64_t g_hud_cleared = ~0ull;
 
 bool vk_hud_layer_enabled(void) {  // (on by default; SKYRECOMP_VR_HUD_LAYER=0 draws the 2D layer into the eyes)
@@ -3962,6 +3962,36 @@ static bool hud_fullscreen_quad(void) {
 
 // The HUD texture's backend (NULL before the first HUD draw).
 TexBackend *vk_hud_backend(void) { return g_hud_tex.backend; }
+static bool g_wrist_drawn;  // a wrist element was drawn since the last present (device.c: else no card)
+TexBackend *vk_wrist_backend(void) { return g_wrist_drawn ? g_wrist_tex.backend : NULL; }
+
+// The wrist texture: made like the HUD texture (same size and format), cleared with it.
+static NvnTexture *wrist_texture(void) {
+    if (!g_wrist_tex.width && g_hud_tex.width) {
+        g_wrist_tex = g_hud_tex;
+        g_wrist_tex.backend = NULL;
+        snprintf(g_wrist_tex.label, sizeof g_wrist_tex.label, "vr-wrist");
+    }
+    return g_wrist_tex.width ? &g_wrist_tex : NULL;
+}
+static void wrist_clear(VkCommandBuffer cb) {
+    if (!g_wrist_tex.backend) return;
+    TexBackend *w = vk_tex(&g_wrist_tex, true);
+    VkClearColorValue zero = {{0, 0, 0, 0}};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, w->layer0, 1};
+    vkCmdClearColorImage(cb, w->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+}
+
+// A 2D draw of a wrist panel's element (vr.c WRIST_*_RECT): its layout anchor - the draw's model translation in the
+// 1920x1080 layout - in the hearts' row (y < 100, x < 340; the area name's banner, also top left, is all below
+// y 106 there) or by the rupee counter and Fi's prompt (x < 160, y > 740). Measured in Link's room.
+static bool hud_wrist_element(void) {
+    const Range c0 = st.ubuf[0][0];
+    if (!c0.addr || c0.size != 192) return false;
+    const float *f = (const float *)(uintptr_t)c0.addr;
+    const float x = ((f[0] * f[19] + f[3]) * 0.5f + 0.5f) * 1920, y = (0.5f - (f[5] * f[23] + f[7]) * 0.5f) * 1080;
+    return (y < 100 && x < 340) || (x < 160 && y > 740);
+}
 
 // The panel image is a per-present scratch surface, not retained UI state.  Clear it only after device.c has
 // recorded every headset and mirror read from it.  This makes stale full-screen screens impossible even when the
@@ -3975,6 +4005,8 @@ void vk_hud_discard_after_present(void) {
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+    wrist_clear(cb);
+    g_wrist_drawn = false;
     vk_full_barrier(cb);
     g_hud_cleared = ~0ull;
     st.rt_dirty = true;
@@ -4036,6 +4068,7 @@ static void hud_clear_for_frame(void) {
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     vkCmdClearColorImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+    wrist_clear(cb);
     if (g_hud_depth.backend) {  // (depth 0: the game's reversed-Z far plane; stencil 0)
         TexBackend *d = vk_tex(&g_hud_depth, true);
         VkClearDepthStencilValue dz = {0.0f, 0};
@@ -4069,6 +4102,16 @@ bool vk_hud_black_backdrop(NvnTexture *screen) {
 bool vk_take_view_fade(float rgba[4]) {
     g_view_fade_target = NULL;
     return vr_fade_frame_take(&g_view_fade,rgba);
+}
+// (device.c) A 1x1 texture of one premultiplied colour (the wrist card's backing).
+TexBackend *vk_solid_texture(const float rgba[4]) {
+    extern void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride);
+    static NvnTexture texture = {.width = 1, .height = 1, .depth = 1, .levels = 1, .samples = 1, .target = 1, .format = 0x25};
+    static uint8_t last[4] = {1, 2, 3, 4};
+    uint8_t pixel[4];
+    for (int i = 0; i < 4; i++) pixel[i] = (uint8_t)lroundf(fminf(1, fmaxf(0, rgba[i])) * 255);
+    if (memcmp(pixel, last, 4)) renderer_upload_rgba(&texture, pixel, 1, 1, 4), memcpy(last, pixel, 4);
+    return vk_tex(&texture, false);
 }
 TexBackend *vk_view_fade_mirror(const float rgba[4]) {
     extern void renderer_upload_rgba(NvnTexture *t, const void *rgba, uint32_t w, uint32_t h, uint32_t stride);
@@ -4261,10 +4304,19 @@ static bool hud_route(Prog *pr) {
         g_hud_cleared = ~0ull;
         hud_clear_for_frame();
     }
+    // (vr.c, the wrist panels on: their elements go whole to the wrist texture, the rest stays in the HUD's)
+    NvnTexture *wrist = vr_wrist_elements() && hud_wrist_element() ? wrist_texture() : NULL;
+    if (wrist && !wrist->backend) {
+        vk_tex(wrist, true);
+        vk_end_pass();
+        wrist_clear(vk_cmd());
+        vk_full_barrier(vk_cmd());
+    }
     g_hud_saved_rt = st.rt;
     st.rt = (RtState){0};
     st.rt.ncolor = 1;
-    st.rt.color[0] = hud;
+    st.rt.color[0] = wrist ? wrist : hud;
+    if (wrist) g_wrist_drawn = true;
     st.rt.depth = hd;
     st.rt_dirty = true;
     g_hud_sub_from = g_menu_screen = g_hud_saved_rt.color[0];
@@ -4379,7 +4431,10 @@ static void draw_(CmdRec *r, bool indexed) {
     // A recognized full-view fill stays in the eyes while we decide whether it is a final veil or an opaque
     // background followed by scene content. Routing that native hold to the HUD leaves a black card over the
     // world even after later scene draws correctly cancel promotion to the final compositor fade.
-    if (g_hud_candidate && !view_fade_draw && !hud_route(pr)) { stat_skipped++; return; }
+    if (g_hud_candidate && !view_fade_draw && !hud_route(pr)) {
+        stat_skipped++;
+        return;
+    }
     if (vk_hud_layer_on()) hud_mark_scene_targets(pr);
     {   // SKYRECOMP_VR_DRAW_LOG=<frame>: that frame's draws (eye 0)
         static long at = -2;

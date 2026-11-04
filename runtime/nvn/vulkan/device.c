@@ -995,10 +995,45 @@ void backend_present(NvnTexture *t) {
                 for (int e = 0; e < 2; e++) {
                     void *img;
                     uint32_t w, h, fmt;
-                    float mvp[16], rect[4];
+                    float mvp[16], rect[4], cut[2];
                     bool op;
-                    if (vr_eye_panel(e, &img, &w, &h, &fmt, mvp, rect, &op))
-                        vk_vr_panel_into_eye(vk_cmd(), img, fmt, w, h, (uint32_t)e, hb, mvp, rect, renderer_origin_lower_left(), op);
+                    if (!vr_eye_panel(e, &img, &w, &h, &fmt, mvp, rect, &op, cut)) continue;
+                    // the whole image, or (wrist panels on) all but its two top corners: three pieces - the middle
+                    // column, and the left / right columns below the corners
+                    const float pieces[3][4] = {{cut[0], 0, 1 - 2 * cut[0], 1}, {0, cut[1], cut[0], 1 - cut[1]},
+                                                {1 - cut[0], cut[1], cut[0], 1 - cut[1]}};
+                    const int n = cut[0] > 0 ? 3 : 1;
+                    for (int i = 0; i < n; i++) {
+                        const float *pc = n == 1 ? rect : pieces[i];  // (uv: top-down origin, size)
+                        // the piece's quad in the panel's -1..1 (its +y is the image's top): mvp * S
+                        const float sx = pc[2], sy = pc[3], cx = 2 * pc[0] - 1 + pc[2], cy = 1 - 2 * pc[1] - pc[3];
+                        float m[16];
+                        for (int r = 0; r < 4; r++) {
+                            m[0 * 4 + r] = mvp[0 * 4 + r] * sx;
+                            m[1 * 4 + r] = mvp[1 * 4 + r] * sy;
+                            m[2 * 4 + r] = mvp[2 * 4 + r];
+                            m[3 * 4 + r] = mvp[0 * 4 + r] * cx + mvp[1 * 4 + r] * cy + mvp[3 * 4 + r];
+                        }
+                        const bool flip = renderer_origin_lower_left();  // (the texture's rows bottom-up: its rect too)
+                        const float r2[4] = {pc[0], flip ? 1 - pc[1] - pc[3] : pc[1], pc[2], pc[3]};
+                        vk_vr_panel_into_eye(vk_cmd(), img, fmt, w, h, (uint32_t)e, hb, m, r2, flip, op);
+                    }
+                    // the wrist card: its backing, then its element groups from the wrist texture (vr.c, exec.c)
+                    extern TexBackend *vk_wrist_backend(void), *vk_solid_texture(const float rgba[4]);
+                    TexBackend *wb = vk_wrist_backend();
+                    for (int i = 0; wb && i < 3; i++) {
+                        float wm[16], wr[4], backing;
+                        if (!vr_eye_wrist(e, i, wm, wr, &backing)) continue;
+                        if (i == 0) {  // (the HUD copy's backing colour, premultiplied; skipped when transparent)
+                            const float c[4] = {.022f * backing, .026f * backing, .039f * backing, backing};
+                            if (backing > 0.001f)
+                                vk_vr_panel_into_eye(vk_cmd(), img, fmt, w, h, (uint32_t)e, vk_solid_texture(c), wm, wr, false, false);
+                            continue;
+                        }
+                        const bool flip = renderer_origin_lower_left();
+                        const float r2[4] = {wr[0], flip ? 1 - wr[1] - wr[3] : wr[1], wr[2], wr[3]};
+                        vk_vr_panel_into_eye(vk_cmd(), img, fmt, w, h, (uint32_t)e, wb, wm, r2, flip, false);
+                    }
                 }
             }
             pt_mark(PT_HUD);

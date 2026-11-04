@@ -69,6 +69,7 @@ void vr_controls_set_hud_panel(const float m[16]) {
     pthread_mutex_unlock(&g_ptr_lock);
 }
 
+bool vr_game_paused(void) { return *(volatile uint32_t *)(uintptr_t)(MAIN_BASE + 0x1827370) != 0; }  // (vr.c)
 static bool panel_pointer_on(void) {
     static int env = -1;
     if (env < 0) env = getenv("SKYRECOMP_VR_PANEL_POINTER") ? atoi(getenv("SKYRECOMP_VR_PANEL_POINTER")) != 0 : 1;

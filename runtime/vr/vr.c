@@ -1816,8 +1816,19 @@ static struct {
     uint32_t wrist_count;
     XrCompositionLayerProjectionView pv[2];
     XrCompositionLayerProjection layer;
-    XrCompositionLayerQuad quad, menu_quad, beam_quad, wrist[2], fade_layer;
+    XrCompositionLayerQuad quad, quad_full, menu_quad, beam_quad, wrist[2], fade_layer;
 } fl;
+// The wrist panels' element groups in the 1920x1080 2D layout (exec.c routes their draws to the wrist texture;
+// measured in Link's room): the status group - the hearts (two rows when he has many) - and the item group - the
+// rupee counter and Fi's prompt with the D-pad.
+#define WRIST_STATUS_RECT 20, 20, 640, 150
+#define WRIST_ITEM_RECT 30, 740, 240, 320
+// The card: the status group on top, the item group below it (left-aligned), a margin around (layout pixels)
+#define WRIST_CARD_MARGIN 16
+#define WRIST_CARD_W (640 + 2 * WRIST_CARD_MARGIN)
+#define WRIST_CARD_H (150 + 320 + 2 * WRIST_CARD_MARGIN)
+static _Atomic bool g_wrist_elements;
+bool vr_wrist_elements(void) { return atomic_load(&g_wrist_elements); }  // (exec.c: route them to the wrist texture)
 
 static void build_layers(void) {
     if (fl.built) return;
@@ -1860,8 +1871,10 @@ static void build_layers(void) {
     fl.wrist_count = 0;
     extern bool player_eye(float eye[3]);
     const bool gameplay = player_eye(NULL);  // false on boot, title, loading, and file-select screens
-    fl.use_wrist = fl.hud && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay &&
+    extern bool vr_game_paused(void);  // (vr_controls.c: a menu pauses the game - its screens stay whole)
+    fl.use_wrist = fl.hud && !frame.hud_opaque && g_vr_hud_config.wrist_hud && gameplay && !vr_game_paused() &&
                    (hud_grip_tracked[0] || hud_grip_tracked[1]);
+    fl.quad_full = fl.quad;  // (the whole HUD image: the eyes' panel, its wrist corners cut out - vr_eye_panel)
     if (fl.use_wrist) {
         const int status_hand = g_vr_hud_config.wrist_hud_swap_hands ? 1 : 0;
         const int item_hand = 1 - status_hand;
@@ -1870,24 +1883,40 @@ static void build_layers(void) {
         const bool status_visible = hud_grip_tracked[status_hand] &&
                                     (!g_vr_hud_config.wrist_hud_glance ||
                                      wrist_hud_glanced(status_hand, panels[status_hand]));
-        if (status_visible)
-            fl.wrist[fl.wrist_count++] = (XrCompositionLayerQuad){
-                .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
-                .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-                .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
-                .subImage = {.swapchain = hud_swapchain, .imageRect = {{0, 0}, {480, 480}}, .imageArrayIndex = 0},
-                .pose = panels[status_hand],
-                .size = {g_vr_hud_config.wrist_hud_size, g_vr_hud_config.wrist_hud_size}};
-        if (hud_grip_tracked[item_hand]) fl.wrist[fl.wrist_count++] = (XrCompositionLayerQuad){
-            .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
-            .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
-            .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
-            .subImage = {.swapchain = hud_swapchain, .imageRect = {{1440, 0}, {480, 480}}, .imageArrayIndex = 0},
-            .pose = panels[item_hand],
-            .size = {g_vr_hud_config.wrist_hud_size, g_vr_hud_config.wrist_hud_size}};
-        fl.quad.subImage.imageRect = (XrRect2Di){{480, 0}, {960, HUD_H}};
-        fl.quad.size.width = hud_w * 960.0f / HUD_W;
+        // Drawn into the eyes (vr_eye_wrist): one card on the status hand, from the wrist texture (exec.c draws the
+        // hearts, the rupees and Fi's prompt there, whole): the hearts' row on top, the rupees and the prompt below.
+        // As quad layers (SKYRECOMP_VR_PANEL_QUAD): the HUD image's top corners on both hands, as before.
+        const bool eyes = !getenv("SKYRECOMP_VR_PANEL_QUAD");
+        if (eyes) {
+            if (status_visible) {
+                const float s = g_vr_hud_config.wrist_hud_size;
+                fl.wrist[fl.wrist_count++] = (XrCompositionLayerQuad){
+                    .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+                    .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                    .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+                    .subImage = {.swapchain = hud_swapchain, .imageRect = {{0, 0}, {480, 480}}, .imageArrayIndex = 0},
+                    .pose = panels[status_hand], .size = {s, s * WRIST_CARD_H / WRIST_CARD_W}};
+            }
+        } else {
+            const XrPosef pose[2] = {panels[status_hand], panels[item_hand]};
+            const bool shown[2] = {status_visible, hud_grip_tracked[item_hand]};
+            for (int i = 0; i < 2; i++)
+                if (shown[i])
+                    fl.wrist[fl.wrist_count++] = (XrCompositionLayerQuad){
+                        .type = XR_TYPE_COMPOSITION_LAYER_QUAD, .space = local_space,
+                        .layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
+                        .eyeVisibility = XR_EYE_VISIBILITY_BOTH,
+                        .subImage = {.swapchain = hud_swapchain,
+                                     .imageRect = i ? (XrRect2Di){{1440, 0}, {480, 480}} : (XrRect2Di){{0, 0}, {480, 480}},
+                                     .imageArrayIndex = 0},
+                        .pose = pose[i], .size = {g_vr_hud_config.wrist_hud_size, g_vr_hud_config.wrist_hud_size}};
+        }
+        if (!eyes) {
+            fl.quad.subImage.imageRect = (XrRect2Di){{480, 0}, {960, HUD_H}};
+            fl.quad.size.width = hud_w * 960.0f / HUD_W;
+        }
     }
+    atomic_store(&g_wrist_elements, fl.use_wrist && !getenv("SKYRECOMP_VR_PANEL_QUAD"));
     // Use the overlay path for the final veil, just like the HUD/keyboard it must cover. A second scene
     // projection layer is not sufficient to keep the veil in front of SteamVR's separately composed overlays.
     // Head-locked and close to the eyes, with far more angular coverage than the headset FOV: no visible edges.
@@ -1926,19 +1955,50 @@ static bool layer_quad_mvp_eye(int eye, const XrCompositionLayerQuad *q, bool vi
 // game's cursor on the panel juddered in the headset while the eyes (and the desktop mirror) were smooth. In the eye
 // images the panel is part of the frame it was drawn for. SKYRECOMP_VR_PANEL_QUAD=1: the quad layer (as before).
 // eye: 0 / 1; rect: the part of the HUD image the panel shows (uv origin, size); opaque: a full-screen 2D frame.
+// cut: with the wrist panels on, the HUD image's top corners (WRIST_CUT_W x WRIST_CUT_H, uv) are on the wrists: the
+// panel shows everything else (device.c draws it as three pieces) - not just its middle band, which lost what sat
+// below the corners (the button prompts at the lower left) and split anything across the band's edges.
 bool vr_eye_panel(int eye, void **image, uint32_t *width, uint32_t *height, uint32_t *format, float mvp[16],
-                  float rect[4], bool *opaque) {
+                  float rect[4], bool *opaque, float cut[2]) {
     static int quad = -1;
     if (quad < 0) quad = getenv("SKYRECOMP_VR_PANEL_QUAD") != NULL;
     if (quad || eye < 0 || eye > 1 || !frame.begun || !frame.stereo || !frame.acquired || !frame.copied) return false;
     build_layers();
-    if (!fl.hud || !layer_quad_mvp_eye(eye, &fl.quad, false, mvp)) return false;
+    if (!fl.hud || !layer_quad_mvp_eye(eye, &fl.quad_full, false, mvp)) return false;
     fl.panel_in_eyes = true;
     *image = (void *)images[frame.image].image;
     *width = eye_width, *height = eye_height, *format = (uint32_t)swapchain_format;
-    rect[0] = (float)fl.quad.subImage.imageRect.offset.x / HUD_W, rect[1] = (float)fl.quad.subImage.imageRect.offset.y / HUD_H;
-    rect[2] = (float)fl.quad.subImage.imageRect.extent.width / HUD_W, rect[3] = (float)fl.quad.subImage.imageRect.extent.height / HUD_H;
+    rect[0] = 0, rect[1] = 0, rect[2] = 1, rect[3] = 1;
+    cut[0] = cut[1] = 0;  // (the wrist elements are drawn into their own texture: the HUD image is the rest, whole)
     *opaque = frame.hud_opaque;
+    return true;
+}
+
+// (device.c) The wrist card's piece `piece` as eye `eye` sees it: 0 its backing (the whole card; *backing: the Wrist
+// Background opacity), 1 the status group, 2 the item group - clip-from-quad and the uv rect in the wrist texture.
+bool vr_eye_wrist(int eye, int piece, float mvp[16], float rect[4], float *backing) {
+    float card[16];
+    if (eye < 0 || eye > 1 || piece < 0 || piece > 2 || !fl.built || !fl.panel_in_eyes || !fl.use_wrist ||
+        !fl.wrist_count || getenv("SKYRECOMP_VR_PANEL_QUAD") || !layer_quad_mvp_eye(eye, &fl.wrist[0], false, card))
+        return false;
+    *backing = g_vr_hud_config.wrist_hud_background;
+    static const int groups[2][4] = {{WRIST_STATUS_RECT}, {WRIST_ITEM_RECT}};
+    // the piece in the card (layout pixels: x, y, w, h from its top left)
+    float px = 0, py = 0, pw = WRIST_CARD_W, ph = WRIST_CARD_H;
+    if (piece) {
+        const int *g = groups[piece - 1];
+        px = WRIST_CARD_MARGIN, py = piece == 1 ? WRIST_CARD_MARGIN : WRIST_CARD_MARGIN + 150, pw = (float)g[2], ph = (float)g[3];
+        for (int k = 0; k < 4; k++) rect[k] = (float)g[k] / (k & 1 ? HUD_H : HUD_W);
+    } else rect[0] = rect[1] = 0, rect[2] = rect[3] = 1;
+    // its quad in the card's -1..1 (+y up): card * S
+    const float sx = pw / WRIST_CARD_W, sy = ph / WRIST_CARD_H;
+    const float cx = 2 * px / WRIST_CARD_W - 1 + sx, cy = 1 - 2 * py / WRIST_CARD_H - sy;
+    for (int r = 0; r < 4; r++) {
+        mvp[0 * 4 + r] = card[0 * 4 + r] * sx;
+        mvp[1 * 4 + r] = card[1 * 4 + r] * sy;
+        mvp[2 * 4 + r] = card[2 * 4 + r];
+        mvp[3 * 4 + r] = card[0 * 4 + r] * cx + card[1 * 4 + r] * cy + card[3 * 4 + r];
+    }
     return true;
 }
 
@@ -1963,7 +2023,7 @@ int vr_mirror_layers(VrMirrorLayer *out, int max) {
     out[n++] = (VrMirrorLayer){.image = (void *)images[frame.image].image, .format = (uint32_t)swapchain_format,
                                .width = eye_width, .height = eye_height, .layers = 2, .rect = {0, 0, 1, 1}, .full = true};
     if (fl.hud && !fl.panel_in_eyes && mirror_quad(&out[n], &fl.quad, hud_images[frame.hud_image].image, HUD_W, HUD_H, false)) n++;
-    for (uint32_t i = 0; fl.use_wrist && i < fl.wrist_count; i++)
+    for (uint32_t i = 0; fl.use_wrist && !fl.panel_in_eyes && i < fl.wrist_count; i++)
         if (mirror_quad(&out[n], &fl.wrist[i], hud_images[frame.hud_image].image, HUD_W, HUD_H, false)) n++;
     if (fl.menu && mirror_quad(&out[n], &fl.menu_quad, menu_images[menu_image_index].image, MENU_W, MENU_H, false)) n++;
     if (fl.beam && mirror_quad(&out[n], &fl.beam_quad, beam_image.image, BEAM_W, BEAM_H, false)) n++;
@@ -2014,7 +2074,7 @@ void vr_frame_end(void) {
         if (!beam_ready) beam_released = false;
     }
     const bool beam_ok = menu_ok && fl.beam;
-    const bool use_wrist = hud_ok && fl.use_wrist;
+    const bool use_wrist = hud_ok && fl.use_wrist && !fl.panel_in_eyes;
     const XrCompositionLayerBaseHeader *layers[8];
     uint32_t nlayers = 0;
     if (submit) layers[nlayers++] = (const XrCompositionLayerBaseHeader *)&fl.layer;
@@ -2142,9 +2202,14 @@ bool vr_record_eye_copies(void *command_buffer, void *left_image, void *right_im
 void vr_frame_end(void) {}
 int64_t vr_display_time_now(void) { return 0; }
 int vr_mirror_layers(VrMirrorLayer *out, int max) { (void)out; (void)max; return 0; }
+bool vr_eye_wrist(int eye, int piece, float mvp[16], float rect[4], float *backing) {
+    (void)eye; (void)piece; (void)mvp; (void)rect; (void)backing;
+    return false;
+}
+bool vr_wrist_elements(void) { return false; }
 bool vr_eye_panel(int eye, void **image, uint32_t *width, uint32_t *height, uint32_t *format, float mvp[16],
-                  float rect[4], bool *opaque) {
-    (void)eye; (void)image; (void)width; (void)height; (void)format; (void)mvp; (void)rect; (void)opaque;
+                  float rect[4], bool *opaque, float cut[2]) {
+    (void)eye; (void)image; (void)width; (void)height; (void)format; (void)mvp; (void)rect; (void)opaque; (void)cut;
     return false;
 }
 void vr_mirror_barriers(void *command_buffer, const VrMirrorLayer *layers, int n, bool to_read) {

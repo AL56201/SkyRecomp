@@ -92,6 +92,8 @@ typedef struct VrMirrorLayer {
 } VrMirrorLayer;
 int vr_mirror_layers(VrMirrorLayer *out, int max);
 bool vr_eye_panel(int eye, void **image, uint32_t *width, uint32_t *height, uint32_t *format, float mvp[16],
-                  float rect[4], bool *opaque);
+                  float rect[4], bool *opaque, float cut[2]);
+bool vr_eye_wrist(int eye, int piece, float mvp[16], float rect[4], float *backing);  // the wrist card (vr.c)
+bool vr_wrist_elements(void);  // the wrist panels are on: their HUD elements go to the wrist texture (exec.c)
 void vr_mirror_barriers(void *command_buffer, const VrMirrorLayer *layers, int n, bool to_read);
 extern float g_vr_gpu_ms;  // the last measured GPU frame time in ms (exec.c), for dynamic resolution
