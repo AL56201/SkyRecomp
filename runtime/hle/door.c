@@ -20,6 +20,12 @@ extern bool player_eye(float eye[3]);
 #define DOOR_NEAR 160.0f  // (units, level: the door's origin from Link's eye point; measured ~60 at the door)
 
 static uint64_t g_door;  // the matrix's address; 0: none
+// How far VR holds the door open (radians, about its vertical through its origin - the leaf's draw turns about it in
+// the game's own sequence; measured -22.5 -> -82 degrees of its x axis). vr_input.c sets it; vr_rig.c draws it.
+#include <stdatomic.h>
+static _Atomic float g_open;
+void door_set_open(float radians) { atomic_store(&g_open, radians); }
+float door_open(void) { return atomic_load(&g_open); }
 static float g_door_m[12];
 
 static bool level_matrix(const float *m) {
@@ -59,7 +65,9 @@ static uint64_t scan(const float eye[3]) {
 }
 
 // (once per frame, vr_rig.c)
+void door_test_open(void);
 void door_track(void) {
+    door_test_open();
     float eye[3];
     if (!player_eye(eye)) { g_door = 0; return; }
     if (g_door) {
@@ -79,6 +87,14 @@ void door_track(void) {
                 (unsigned long long)g_door);
         }
     }
+}
+
+// (test) SKYRECOMP_DOOR_TEST_OPEN=<degrees>: the door Link is at, held open that far
+void door_test_open(void) {
+    static int on = -1;
+    static float deg;
+    if (on < 0) on = getenv("SKYRECOMP_DOOR_TEST_OPEN") != NULL, deg = on ? (float)atof(getenv("SKYRECOMP_DOOR_TEST_OPEN")) : 0;
+    if (on) door_set_open(g_door ? deg * (float)(M_PI / 180) : 0.0f);
 }
 
 // The leaf's world matrix (row-major 3x4) of the door Link is at. False: none.
@@ -101,11 +117,30 @@ static bool handle_at(float out_z, float w[3]) {
     if (!door_matrix(m) || !player_eye(eye)) return false;
     const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
     const float side = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;  // (his z in the door's frame)
-    const float l[3] = {HANDLE_X, HANDLE_Y, out_z * side};
+    // (turned with the leaf: Ry(open) in the door's frame - x' = c x + s z, z' = -s x + c z)
+    const float o = door_open(), c = cosf(o), s = sinf(o), lx = HANDLE_X, lz = out_z * side;
+    const float l[3] = {c * lx + s * lz, HANDLE_Y, -s * lx + c * lz};
     for (int r = 0; r < 3; r++) w[r] = m[r * 4 + 0] * l[0] + m[r * 4 + 1] * l[1] + m[r * 4 + 2] * l[2] + m[r * 4 + 3];
     return true;
 }
 bool door_handle(float w[3]) { return handle_at(HANDLE_Z, w); }
+// A point in the world -> the door's frame (its closed frame: R^T (p - t)); false: no door
+bool door_local(const float p[3], float l[3]) {
+    float m[12];
+    if (!door_matrix(m)) return false;
+    const float d[3] = {p[0] - m[3], p[1] - m[7], p[2] - m[11]};
+    for (int i = 0; i < 3; i++) l[i] = m[0 * 4 + i] * d[0] + m[1 * 4 + i] * d[1] + m[2 * 4 + i] * d[2];
+    return true;
+}
+// The handle in the door's closed frame, on Link's side (x, z)
+bool door_handle_local(float *x, float *z) {
+    float m[12], eye[3];
+    if (!door_matrix(m) || !player_eye(eye)) return false;
+    const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
+    const float side = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;
+    *x = HANDLE_X, *z = HANDLE_Z * side;
+    return true;
+}
 // Where the hand holding the handle is drawn: the grip's centre further out from the door, the hand's mesh clear of it
 #define HANDLE_HAND_Z 30.0f
 bool door_handle_hand(float w[3]) { return handle_at(HANDLE_HAND_Z, w); }

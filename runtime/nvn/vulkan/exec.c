@@ -4521,10 +4521,22 @@ static void draw_(CmdRec *r, bool indexed) {
             link = vr_rig_is_link_draw((const float *)(uintptr_t)cam.addr, cam.size, NULL, 0, r->x[2], st.vbuf[0].addr,
                                        st.vbuf[0].size);
         if (link) { stat_skipped++; return; }
+        {   // (RE, SKYRECOMP_DOOR_TRACE) draws near the door Link is at: which one is its leaf
+            extern void vr_rig_door_probe(const float *slot0, uint64_t size0, bool skinned, const float *bones,
+                                          uint64_t bone_bytes, uint64_t count, uint64_t vb, uint64_t vb_size);
+            const Range b3 = st.ubuf[0][3];
+            if (cam.addr && !vk_vr_eye())
+                vr_rig_door_probe((const float *)(uintptr_t)cam.addr, cam.size, skinned, (const float *)(uintptr_t)b3.addr,
+                                  b3.size, r->x[2], st.vbuf[0].addr, st.vbuf[0].size);
+        }
         // (rigid draws: Link's hands, placed on the controllers by their camera - vr_rig.c)
         if (!skinned && cam.addr)
             vr_rig_set_hand_draw(vr_rig_hand_side((const float *)(uintptr_t)cam.addr, cam.size, r->x[2], st.vbuf[0].addr,
                                                   st.vbuf[0].size));
+        if (!skinned && cam.addr) {  // (the door held open in VR: its leaf turned - vr_rig.c)
+            extern void vr_rig_door_draw(const float *slot0, uint64_t size0);
+            vr_rig_door_draw((const float *)(uintptr_t)cam.addr, cam.size);
+        }
     }
     g_mirror_w = 0;
     {   // mirror mode (runtime/hle/mirror.c; as renderer.m): the scene's composite into the window image is mirrored

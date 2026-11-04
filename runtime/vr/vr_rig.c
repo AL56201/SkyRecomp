@@ -437,6 +437,7 @@ static int g_hand_draw = -1;
 static bool hand_block(const VrRigAnchor *a, const float reference[7], const float game[12], float out[12]);
 static float g_hand_orig[12], g_hand_repl[12];
 static bool g_hand_blocks;
+static bool g_door_blocks;  // (vr_rig_door_draw) this draw is the door's leaf, turned: g_hand_orig -> g_hand_repl
 static bool eye_camera(const float mono[28], const float reference[7], const float eye[7], const float fov[4],
                        float out[28], bool direct) {
 #if defined(__APPLE__)
@@ -526,6 +527,10 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
         memcpy(g_hand_orig, mono + 16, sizeof g_hand_orig);
         memcpy(g_hand_repl, hand_mono + 16, sizeof g_hand_repl);
         g_hand_blocks = true;
+        mono = hand_mono;
+    } else if (g_door_blocks) {  // (the door held open: its leaf's block turned - vr_rig_door_draw)
+        memcpy(hand_mono, mono, 16 * sizeof(float));
+        memcpy(hand_mono + 16, g_hand_repl, sizeof g_hand_repl);
         mono = hand_mono;
     }
     const float near = g_rig.mode == 1 ? near_units() : 0.0f;
@@ -631,11 +636,11 @@ void vr_rig_set_grips(bool left_ok, const float left[7], bool right_ok, const fl
     if (g_grip_ok[1]) memcpy(g_grip[1], right, sizeof g_grip[1]);
 }
 // (g_hand_orig, g_hand_repl: this hand draw's game view block and the one replacing it)
-void vr_rig_set_hand_draw(int side) { g_hand_draw = side, g_hand_blocks = false; }
+void vr_rig_set_hand_draw(int side) { g_hand_draw = side, g_hand_blocks = false, g_door_blocks = false; }
 // (exec.c) This hand draw's game view block and its replacement: other uniform blocks holding the same matrix (the
 // shader's normals, for its lighting) get the replacement too.
 bool vr_rig_hand_blocks(float orig[12], float repl[12]) {
-    if (!g_hand_blocks || g_hand_draw < 0) return false;
+    if (!g_hand_blocks || (g_hand_draw < 0 && !g_door_blocks)) return false;
     memcpy(orig, g_hand_orig, sizeof g_hand_orig);
     memcpy(repl, g_hand_repl, sizeof g_hand_repl);
     return true;
@@ -913,5 +918,87 @@ bool vr_rig_cull_fov(float *fovy_radians, float *aspect) {
     if (fovy_radians) *fovy_radians = atomic_load(&g_cull_fovy);
     if (aspect) *aspect = atomic_load(&g_cull_aspect);
     return true;
+}
+
+// (RE, exec.c) SKYRECOMP_DOOR_TRACE=1: every 60 frames at a door, the draws whose model (rigid: its translation;
+// skinned: its first bone) lies within 150 units of the door's origin - to tell its leaf's draw
+void vr_rig_door_probe(const float *slot0, uint64_t size0, bool skinned, const float *bones, uint64_t bone_bytes,
+                       uint64_t count, uint64_t vb, uint64_t vb_size) {
+    static int on = -1;
+    if (on < 0) on = getenv("SKYRECOMP_DOOR_TRACE") != NULL;
+    extern uint64_t renderer_present_count(void);
+    extern bool door_matrix(float m[12]);
+    float dm[12];
+    if (!on || renderer_present_count() % 20 || !g_rig.have_game_view || size0 < 112 || !door_matrix(dm)) return;
+    const float *v = g_rig.game_view;
+    if (skinned && bones && bone_bytes >= 48) {  // (any bone near the door: its nearest, and how many bones)
+        const int nb = (int)(bone_bytes / 48);
+        float best = 1e30f, bw[3] = {0, 0, 0};
+        for (int k = 0; k < nb && k < 512; k++) {
+            const float *bk = bones + k * 12;
+            float ww[3];
+            for (int i = 0; i < 3; i++)
+                ww[i] = v[0 * 4 + i] * (bk[3] - v[3]) + v[1 * 4 + i] * (bk[7] - v[7]) + v[2 * 4 + i] * (bk[11] - v[11]);
+            const float ex = ww[0] - dm[3], ey = ww[1] - dm[7], ez = ww[2] - dm[11], d2 = ex * ex + ey * ey + ez * ez;
+            if (d2 < best) best = d2, memcpy(bw, ww, sizeof bw);
+        }
+        if (best < 150 * 150 && nb < 100)
+            fprintf(stderr, "[door-draw] frame %llu skinned count %llu vb %#llx size %llu bones %d nearest %.1f\n",
+                    (unsigned long long)renderer_present_count(), (unsigned long long)count, (unsigned long long)vb,
+                    (unsigned long long)vb_size, nb, sqrtf(best));
+        return;
+    }
+    const float *t = NULL;
+    const float c[3] = {t ? t[3] : slot0[19], t ? t[7] : slot0[23], t ? t[11] : slot0[27]};  // (camera space)
+    float w[3];
+    for (int i = 0; i < 3; i++) w[i] = v[0 * 4 + i] * (c[0] - v[3]) + v[1 * 4 + i] * (c[1] - v[7]) + v[2 * 4 + i] * (c[2] - v[11]);
+    const float dx = w[0] - dm[3], dy = w[1] - dm[7], dz = w[2] - dm[11];
+    if (dx * dx + dy * dy + dz * dz > 150 * 150) return;
+    if (count != 276) return;
+    // its rotation in the world (R_view^T x the block's 3x3): the x axis' level components
+    float rx[3];
+    for (int i = 0; i < 3; i++) rx[i] = v[0 * 4 + i] * slot0[16] + v[1 * 4 + i] * slot0[20] + v[2 * 4 + i] * slot0[24];
+    fprintf(stderr, "[door-draw] frame %llu leaf? x-axis %.3f %.3f %.3f size0 %llu\n", (unsigned long long)renderer_present_count(),
+            rx[0], rx[1], rx[2], (unsigned long long)size0);
+    fprintf(stderr, "[door-draw] frame %llu %s count %llu vb %#llx size %llu bones %llu at %.1f %.1f %.1f (from door %.1f %.1f %.1f)\n",
+            (unsigned long long)renderer_present_count(), skinned ? "skinned" : "rigid", (unsigned long long)count,
+            (unsigned long long)vb, (unsigned long long)vb_size, (unsigned long long)(bone_bytes / 48), w[0], w[1], w[2], dx, dy, dz);
+}
+
+// (exec.c, rigid draws) The door Link holds open (hle/door.c door_open): its leaf's draw - a rigid draw at the door's
+// origin, turning about it in the game's own sequence - turned by the open angle about its own vertical: the block
+// (game view x model) times Ry. Where the game's sequence has it open wider, the game's stays.
+void vr_rig_door_draw(const float *slot0, uint64_t size0) {
+    extern bool door_matrix(float m[12]);
+    extern float door_open(void);
+    float dm[12];
+    const float open = door_open();
+    if (open == 0.0f || !g_rig.have_game_view || size0 < 112 || !door_matrix(dm)) return;
+    const float *v = g_rig.game_view, *b = slot0 + 16;
+    float w[3], x[3];  // its origin and x axis in the world: R_view^T (t - t_view), R_view^T x
+    for (int i = 0; i < 3; i++) {
+        w[i] = v[0 * 4 + i] * (b[3] - v[3]) + v[1 * 4 + i] * (b[7] - v[7]) + v[2 * 4 + i] * (b[11] - v[11]);
+        x[i] = v[0 * 4 + i] * b[0] + v[1 * 4 + i] * b[4] + v[2 * 4 + i] * b[8];
+    }
+    const float dx = w[0] - dm[3], dy = w[1] - dm[7], dz = w[2] - dm[11];
+    if (dx * dx + dy * dy + dz * dz > 4.0f || fabsf(x[1]) > 0.01f) return;
+    // the game's own angle (its x axis from the closed door's): kept when wider
+    // (the closed door's x axis in the world is its matrix's first column; angles as atan2(-z, x), as Ry turns them)
+    float game = atan2f(-x[2], x[0]) - atan2f(-dm[8], dm[0]);
+    while (game > (float)M_PI) game -= 2 * (float)M_PI;
+    while (game < -(float)M_PI) game += 2 * (float)M_PI;
+    if (fabsf(game) >= fabsf(open)) return;
+    const float c = cosf(open - game), s = sinf(open - game);
+    float r[12];
+    for (int row = 0; row < 3; row++) {
+        const float *br = b + row * 4;
+        r[row * 4 + 0] = br[0] * c - br[2] * s;  // B * Ry: [c 0 s; 0 1 0; -s 0 c]
+        r[row * 4 + 1] = br[1];
+        r[row * 4 + 2] = br[0] * s + br[2] * c;
+        r[row * 4 + 3] = br[3];
+    }
+    memcpy(g_hand_orig, b, sizeof g_hand_orig);
+    memcpy(g_hand_repl, r, sizeof g_hand_repl);
+    g_hand_blocks = g_door_blocks = true;
 }
 

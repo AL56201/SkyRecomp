@@ -416,6 +416,7 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
         {
             extern int player_action(void);
             static int hand = -1, press = 0;
+            static bool opening;  // (the game's door sequence started under the hand: it keeps holding the door)
             static float q0[4], p0[3];
             static bool turned;
             static int loose;          // (frames the grip has been nearly let go: a held grip's force wavers)
@@ -435,14 +436,15 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                             last_grip[h] ? "squeezed" : "released", g[h], at_door, s.hand[h].tracked);
                     }
             }
-            if (!at_door || !gesture) hand = -1;
+            if ((!at_door && !opening) || !gesture) hand = -1;
+            if (hand < 0) opening = false;
             const float grip[2] = {s.l, s.r};
             // the handle (hle/door.c): a hand within reach of it hovers (a light tick), and only such a hand grabs
             extern bool door_handle(float w[3]);
             extern bool vr_rig_controller_world(int side, float w[3]);
             extern float vr_rig_units_per_metre(void);
             float handle[3], cw[3];
-            const bool have_handle = at_door && gesture && door_handle(handle);
+            const bool have_handle = (at_door || opening) && gesture && door_handle(handle);
             const float reach = 0.40f * vr_rig_units_per_metre();
             bool near[2] = {!have_handle, !have_handle};  // (no handle found: any grab, as before)
             static bool hovering[2];
@@ -475,6 +477,8 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
             } else if (hand >= 0 && ((loose = grip[hand] < 0.1f ? loose + 1 : 0) > 20 || !s.hand[hand].tracked)) {
                 LOG("[door] let go: turned %.0f deg, pulled %.0f cm\n", best_turn * 57.2958f, best_pull * 100);
                 hand = -1;  // (let go: a third of a second under 10%)
+                extern void door_set_open(float radians);
+                door_set_open(0);  // (not opened: the door swings shut)
             } else if (hand >= 0) {
                 // the turn about the controller's own pointing axis since the grab: conj(q0) * q, its z (-forward) part
                 const float *q = s.hand[hand].orientation;
@@ -482,6 +486,25 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                 const float rz = q0[3] * q[2] - q0[2] * q[3] - q0[0] * q[1] + q0[1] * q[0];
                 const float turn = fabsf(2.0f * atan2f(rz, rw));
                 if (!turned && turn > (float)(M_PI / 2)) turned = true, haptic(hand, 0.5f, 30);
+                // turned: the door follows the hand about its origin (hle/door.c) - the angle that keeps the
+                // handle under it, measured as atan2(-z, x) in the door's closed frame; open wide enough, the game's
+                // own sequence takes over (the next room loads)
+                extern bool door_local(const float p[3], float l[3]);
+                extern bool door_handle_local(float *x, float *z);
+                extern void door_set_open(float radians);
+                float hl[3], kx, kz;
+                if (turned && have_handle && vr_rig_controller_world(hand, cw) && door_local(cw, hl) && door_handle_local(&kx, &kz)) {
+                    float a = atan2f(-hl[2], hl[0]) - atan2f(-kz, kx);
+                    while (a > (float)M_PI) a -= 2 * (float)M_PI;
+                    while (a < -(float)M_PI) a += 2 * (float)M_PI;
+                    const float lim = 75.0f * (float)(M_PI / 180);
+                    door_set_open(fmaxf(-lim, fminf(lim, a)));
+                    // (early: the next room only loads in the game's sequence - beyond the opening was void)
+                    if (!opening && fabsf(a) > 10.0f * (float)(M_PI / 180)) {
+                        LOG("[door] swung open %.0f deg: the game's sequence\n", a * 57.2958f);
+                        press = 8, opening = true, haptic(hand, 0.6f, 40);
+                    }
+                }
                 // the pull: how far the hand moved (level) since the grab - after the turn, at a door, any pull opens it
                 const float *pp = s.hand[hand].position;
                 const float pull = sqrtf((pp[0] - p0[0]) * (pp[0] - p0[0]) + (pp[2] - p0[2]) * (pp[2] - p0[2]));
@@ -497,6 +520,16 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
             }
             if (g_vr_config.door_mode == 1 && at_door) s.buttons &= ~(uint32_t)SKY_JC_A;  // (gesture only)
             if (press > 0) press--, s.buttons |= SKY_JC_A;
+            {   // the open angle stays (vr_rig.c keeps the game's once wider) until 2 s after the door left our hands
+                extern void door_set_open(float radians);
+                extern float door_open(void);
+                static uint64_t released;
+                if (hand >= 0) released = 0;
+                else if (door_open() != 0.0f) {
+                    if (!released) released = SDL_GetTicksNS();
+                    else if (SDL_GetTicksNS() - released > 2000000000ull) door_set_open(0), released = 0;
+                }
+            }
             // (at a door the grips are the gesture's, not the game's L / R: squeezed, they made Link leave the door)
             if ((at_door && gesture) || hand >= 0) s.l = s.r = 0;
         }
