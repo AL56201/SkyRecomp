@@ -437,9 +437,26 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
             }
             if (!at_door || !gesture) hand = -1;
             const float grip[2] = {s.l, s.r};
+            // the handle (hle/door.c): a hand within reach of it hovers (a light tick), and only such a hand grabs
+            extern bool door_handle(float w[3]);
+            extern bool vr_rig_controller_world(int side, float w[3]);
+            extern float vr_rig_units_per_metre(void);
+            float handle[3], cw[3];
+            const bool have_handle = at_door && gesture && door_handle(handle);
+            const float reach = 0.25f * vr_rig_units_per_metre();
+            bool near[2] = {!have_handle, !have_handle};  // (no handle found: any grab, as before)
+            static bool hovering[2];
+            for (int h = 0; h < 2; h++) {
+                if (have_handle && vr_rig_controller_world(h, cw)) {
+                    const float dx = cw[0] - handle[0], dy = cw[1] - handle[1], dz = cw[2] - handle[2];
+                    near[h] = dx * dx + dy * dy + dz * dz < reach * reach;
+                }
+                if (near[h] && have_handle && !hovering[h] && hand < 0) haptic(h, 0.15f, 10);
+                hovering[h] = near[h] && have_handle;
+            }
             if (at_door && gesture && hand < 0) {
                 for (int h = 0; h < 2 && hand < 0; h++)
-                    if (grip[h] > 0.5f && s.hand[h].tracked) {
+                    if (grip[h] > 0.5f && s.hand[h].tracked && near[h]) {
                         hand = h, turned = false, loose = 0, best_turn = best_pull = 0;
                         LOG("[door] grab (%s hand)\n", h ? "right" : "left");
                         memcpy(q0, s.hand[h].orientation, sizeof q0), memcpy(p0, s.hand[h].position, sizeof p0);
@@ -463,6 +480,10 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                     LOG("[door] opened: turned %.0f deg, pulled %.0f cm\n", best_turn * 57.2958f, pull * 100);
                     press = 8, hand = -1, haptic(1, 0.6f, 40), haptic(0, 0.6f, 40);
                 }
+            }
+            {   // (vr_rig.c) the hand holding the handle is drawn on it
+                extern void vr_rig_door_grab(int side);
+                vr_rig_door_grab(have_handle ? hand : -1);
             }
             if (g_vr_config.door_mode == 1 && at_door) s.buttons &= ~(uint32_t)SKY_JC_A;  // (gesture only)
             if (press > 0) press--, s.buttons |= SKY_JC_A;

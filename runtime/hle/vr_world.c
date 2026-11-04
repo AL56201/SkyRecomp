@@ -110,7 +110,67 @@ bool vr_world_menu_active(void) {
 
 #define PRE_EXECUTE 0x7000b175c0ull
 static GuestFn g_orig_pre_execute;
+// (RE) SKYRECOMP_RE_ACTORS=<frame>: the scene root's children that frame - address, vtable, and the floats where
+// Link's actor keeps his position (+0x148 x, +0x150 z) - to find objects near him (a door) and their fields
+static void re_actors(void) {
+    {   // (RE) SKYRECOMP_RE_DUMP=<hex address>,<hex length>,<file> - appended every 10 frames: frame, then the bytes
+        static FILE *f;
+        static uint64_t addr, len;
+        static int init;
+        static uint64_t last = ~0ull;
+        if (!init) {
+            init = 1;
+            const char *e = getenv("SKYRECOMP_RE_DUMP");
+            char path[512];
+            if (e && sscanf(e, "%llx,%llx,%511s", (unsigned long long *)&addr, (unsigned long long *)&len, path) == 3)
+                f = fopen(path, "wb");
+        }
+        const uint64_t fr = renderer_present_count();
+        if (f && fr != last && fr % 10 == 0) {
+            last = fr;
+            fwrite(&fr, 8, 1, f);
+            fwrite((const void *)(uintptr_t)addr, len, 1, f);
+            fflush(f);
+        }
+    }
+    static long at = -2;
+    if (at == -2) at = getenv("SKYRECOMP_RE_ACTORS") ? atol(getenv("SKYRECOMP_RE_ACTORS")) : -1;
+    if (at >= 0 && (long)renderer_present_count() >= at) {
+        static int said;
+        if (!said++) LOG("[re] at frame %llu: %u objects saved\n", (unsigned long long)renderer_present_count(), g_nsnap);
+    }
+    if (at < 0 || (long)renderer_present_count() < at || !g_nsnap) return;
+    at = -1;
+    const uint64_t r = scene_root();  // (the fullest list of the last frame: scene_snapshot)
+    const uint64_t *list = g_snap;
+    const uint32_t n = g_nsnap;
+    LOG("[re] scene root %#llx: %u children\n", (unsigned long long)r, n);
+    {   // objects positioned near Link: the position triplet at +0x148 (as his actor) within 150 units of his,
+        // their vtable (in main) at +0
+        const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
+        const float *lp = (const float *)(uintptr_t)(link + 0x148);
+        LOG("[re] Link actor %#llx at %.1f %.1f %.1f\n", (unsigned long long)link, lp[0], lp[1], lp[2]);
+        for (uint64_t a = 0x7005000000ull; a < 0x7008000000ull; a += 0x8) {
+            const float *p = (const float *)(uintptr_t)(a + 0x148);
+            if (!(fabsf(p[0] - lp[0]) < 150 && fabsf(p[2] - lp[2]) < 150 && fabsf(p[1] - lp[1]) < 400)) continue;
+            const uint64_t vt = *(const uint64_t *)(uintptr_t)a;
+            if (vt < MAIN_BASE || vt >= MAIN_BASE + 0x3000000 || a == link) continue;
+            LOG("[re] near %#llx vt main+%#llx pos %.1f %.1f %.1f | +0x158..: %08x %08x %08x %08x\n", (unsigned long long)a,
+                (unsigned long long)(vt - MAIN_BASE), p[0], p[1], p[2], ((const uint32_t *)p)[4], ((const uint32_t *)p)[5],
+                ((const uint32_t *)p)[6], ((const uint32_t *)p)[7]);
+        }
+    }
+    for (uint32_t i = 0; list && i < n && i < 2048; i++) {
+        const uint64_t a = list[i];
+        if (a < 0x7000000000ull || a >= 0x7800000000ull) continue;
+        const float *f = (const float *)(uintptr_t)(a + 0x148);
+        LOG("[re] %4u %#llx vt %#llx pos %.1f %.1f %.1f\n", i, (unsigned long long)a,
+            (unsigned long long)*(const uint64_t *)(uintptr_t)a, f[0], f[1], f[2]);
+    }
+}
+
 static void pre_execute(Cpu *c) {
+    re_actors();
     if (world_in_menus()) {
         if (!*(volatile uint32_t *)(uintptr_t)EXEC_MASK) scene_snapshot();
         else scene_replay(c);

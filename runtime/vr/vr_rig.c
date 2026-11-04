@@ -220,6 +220,7 @@ static bool g_head_offset_ok;
 static bool g_scripted;  // (vr_rig_begin_frame) his head has left the eye point: a scripted move (a door) plays
 static uint64_t g_body_at_eye;  // (present count + 1 when his body was last drawn around the eye point)
 bool vr_rig_settling(void) { return g_settling; }
+bool vr_rig_game_hand(int side, float w[3]);
 
 void vr_rig_begin_frame(void) {
     g_water_hits_before = g_water_hits_now;
@@ -232,6 +233,25 @@ void vr_rig_begin_frame(void) {
         extern void player_trace_tick(uint64_t frame);
         extern uint64_t renderer_present_count(void);
         player_trace_tick(renderer_present_count());
+        extern void door_track(void);
+        door_track();
+        static int door_trace = -1;  // (RE) SKYRECOMP_DOOR_TRACE=1: the game's hands in the door's frame, every 5 frames
+        if (door_trace < 0) door_trace = getenv("SKYRECOMP_DOOR_TRACE") != NULL;
+        extern bool door_matrix(float m[12]);
+        float dm[12], h[3];
+        if (door_trace && renderer_present_count() % 5 == 0 && door_matrix(dm)) {
+            char line[256];
+            int n = snprintf(line, sizeof line, "[door] frame %llu door %.1f %.1f %.1f x-axis %.2f %.2f",
+                             (unsigned long long)renderer_present_count(), dm[3], dm[7], dm[11], dm[0], dm[8]);
+            for (int side = 0; side < 2; side++)
+                if (vr_rig_game_hand(side, h)) {
+                    const float d[3] = {h[0] - dm[3], h[1] - dm[7], h[2] - dm[11]};
+                    float l[3];  // door local: R^T d
+                    for (int i = 0; i < 3; i++) l[i] = dm[0 * 4 + i] * d[0] + dm[1 * 4 + i] * d[1] + dm[2 * 4 + i] * d[2];
+                    n += snprintf(line + n, sizeof line - n, " | %s hand local %.1f %.1f %.1f", side ? "R" : "L", l[0], l[1], l[2]);
+                }
+            fprintf(stderr, "%s\n", line);
+        }
     }
     // Theatre: 1st person drops to the 3rd-person view while the game camera is far from Link's eye point. Link's
     // eye point stops updating while he rides his Loftwing, and cinematic cameras frame scenes from far away; the
@@ -582,6 +602,29 @@ static struct { uint64_t vb, count; int side; } g_hand_mesh[8];  // (hand meshes
 static float g_hand_last[2][3];   // each hand's last game position (game world) and the frame it was drawn
 static uint64_t g_hand_last_frame[2];
 
+// Physical doors (vr_input.c): each controller's grip in the game world (as drawn), and the hand holding a door's
+// handle - drawn on the handle (hle/door.c) wherever the controller is.
+static float g_ctrl_world[2][3];
+static uint64_t g_ctrl_world_frame[2];
+static _Atomic int g_door_grab = -1;
+void vr_rig_door_grab(int side) { atomic_store(&g_door_grab, side); }
+bool vr_rig_controller_world(int side, float w[3]) {
+    extern uint64_t renderer_present_count(void);
+    if (side < 0 || side > 1 || !g_ctrl_world_frame[side] || g_ctrl_world_frame[side] + 3 < renderer_present_count() + 1)
+        return false;
+    memcpy(w, g_ctrl_world[side], sizeof g_ctrl_world[side]);
+    return true;
+}
+
+// Where the game puts Link's hand (game world, the wrist) - last drawn within 2 frames
+bool vr_rig_game_hand(int side, float w[3]) {
+    extern uint64_t renderer_present_count(void);
+    if (side < 0 || side > 1 || !g_hand_last_frame[side] || g_hand_last_frame[side] + 2 < renderer_present_count() + 1)
+        return false;
+    memcpy(w, g_hand_last[side], sizeof g_hand_last[side]);
+    return true;
+}
+
 void vr_rig_set_grips(bool left_ok, const float left[7], bool right_ok, const float right[7]) {
     g_grip_ok[0] = left_ok && left, g_grip_ok[1] = right_ok && right;
     if (g_grip_ok[0]) memcpy(g_grip[0], left, sizeof g_grip[0]);
@@ -694,6 +737,15 @@ static bool hand_block(const VrRigAnchor *a, const float reference[7], const flo
     for (int i = 0; i < 3; i++) {
         c[i * 4 + 0] = rc[i * 3 + 0], c[i * 4 + 1] = rc[i * 3 + 1], c[i * 4 + 2] = rc[i * 3 + 2];
         c[i * 4 + 3] = p[i] + a->origin[i];
+    }
+    {
+        extern uint64_t renderer_present_count(void);
+        for (int i = 0; i < 3; i++) g_ctrl_world[side][i] = c[i * 4 + 3];
+        g_ctrl_world_frame[side] = renderer_present_count() + 1;
+        extern bool door_handle(float w[3]);
+        float h[3];
+        if (atomic_load(&g_door_grab) == side && door_handle(h))  // (holding the door: the hand on its handle)
+            for (int i = 0; i < 3; i++) c[i * 4 + 3] = h[i];
     }
     hand_k(side, k);
     a_mul(c, k, ck);
