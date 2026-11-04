@@ -402,7 +402,10 @@ static void storage(Service *s, IpcReq *req, IpcResp *resp) {
             static const char *last;
             if (path && path != last) {
                 last = path;
-                if (getenv("LARECOMP_LOG_FILES")) LOG("[fs] read %s\n", path);
+                if (getenv("LARECOMP_LOG_FILES")) {
+                    extern uint64_t renderer_present_count(void);
+                    LOG("[fs] frame %llu read %s\n", (unsigned long long)renderer_present_count(), path);
+                }
                 romfs_file_read_hook(path);
             }
         }

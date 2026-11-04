@@ -113,6 +113,17 @@ static GuestFn g_orig_pre_execute;
 // (RE) SKYRECOMP_RE_ACTORS=<frame>: the scene root's children that frame - address, vtable, and the floats where
 // Link's actor keeps his position (+0x148 x, +0x150 z) - to find objects near him (a door) and their fields
 static void re_actors(void) {
+    {   // (RE) SKYRECOMP_RE_POKE=<hex main offset>,<hex u32>,<from frame>: written every frame from then on
+        static int init;
+        static uint64_t off, from;
+        static uint32_t val;
+        if (!init) {
+            init = 1;
+            const char *e = getenv("SKYRECOMP_RE_POKE");
+            if (!e || sscanf(e, "%llx,%x,%llu", (unsigned long long *)&off, &val, (unsigned long long *)&from) != 3) off = 0;
+        }
+        if (off && renderer_present_count() >= from) *(volatile uint32_t *)(uintptr_t)(MAIN_BASE + off) = val;
+    }
     {   // (RE) SKYRECOMP_RE_DUMP=<hex address>,<hex length>,<file> - appended every 10 frames: frame, then the bytes
         static FILE *f;
         static uint64_t addr, len;
@@ -145,6 +156,19 @@ static void re_actors(void) {
     const uint64_t *list = g_snap;
     const uint32_t n = g_nsnap;
     LOG("[re] scene root %#llx: %u children\n", (unsigned long long)r, n);
+    {   // (RE) SKYRECOMP_RE_VTABLE=<hex>: every object in the heap with that vtable at +0 (that frame)
+        const char *e = getenv("SKYRECOMP_RE_VTABLE");
+        const uint64_t vt = e ? strtoull(e, NULL, 16) : 0;
+        int found = 0;
+        for (uint64_t a = 0x7005000000ull; vt && a < 0x7008000000ull; a += 0x10)
+            if (*(const uint64_t *)(uintptr_t)a == vt) {
+                bool in_root = false;
+                for (uint32_t k = 0; k < g_nsnap && !in_root; k++) in_root = g_snap[k] == a;
+                LOG("[re] vt-object %#llx%s\n", (unsigned long long)a, in_root ? " (in the scene)" : "");
+                found++;
+            }
+        if (vt) LOG("[re] %d objects with vtable %#llx\n", found, (unsigned long long)vt);
+    }
     {   // objects positioned near Link: the position triplet at +0x148 (as his actor) within 150 units of his,
         // their vtable (in main) at +0
         const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
