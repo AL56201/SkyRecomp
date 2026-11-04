@@ -64,7 +64,47 @@ static void bt_check(uint64_t a, uint64_t lr, uint64_t x0) {
         }
 }
 
+// LARECOMP_FNPROF_WATCH=<hex address>: inside the window, the first function entered after the u32 there changes -
+// logged with its caller and chain (the writer is the function before it, or its caller)
+static void watch_check(uint64_t a, uint64_t lr) {
+    static uint64_t addr = 1;
+    static uint32_t last;
+    static int done;
+    if (addr == 1) {
+        const char *e = getenv("LARECOMP_FNPROF_WATCH");
+        addr = e ? strtoull(e, NULL, 16) : 0;
+        if (addr) last = *(volatile uint32_t *)(uintptr_t)addr;
+    }
+    static uint64_t prev_a, prev_lr;
+    if (addr && done < 4) {
+        const uint32_t v = *(volatile uint32_t *)(uintptr_t)addr;
+        if (v != last) {
+            done++;
+            fprintf(stderr, "[fnprof-watch] %llx: %x -> %x before entering %llx (lr %llx); previous entry %llx (lr %llx)\n",
+                    (unsigned long long)addr, last, v, (unsigned long long)a, (unsigned long long)lr,
+                    (unsigned long long)prev_a, (unsigned long long)prev_lr);
+            last = v;
+#if defined(_WIN32)
+            extern unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long, unsigned long, void **, unsigned long *);
+            const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);
+            void *frames[64];
+            const unsigned short k = RtlCaptureStackBackTrace(1, 64, frames, NULL);
+            char line[4096];
+            int len = snprintf(line, sizeof line, "[fnprof-watch]   chain:");
+            for (unsigned short j = 0; j < k && len < (int)sizeof line - 40; j++) {
+                uint64_t off;
+                const char *s = rt_host_fn_name((uint64_t)(uintptr_t)frames[j], &off);
+                if (s) len += snprintf(line + len, sizeof line - len, " %s", s);
+            }
+            fprintf(stderr, "%s\n", line);
+#endif
+        }
+    }
+    prev_a = a, prev_lr = lr;
+}
+
 void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
+    watch_check(a, lr);
     if (bt_n) bt_check(a, lr, x0);
     uint32_t h = (uint32_t)((a >> 2) * 0x9E3779B1u) & (NSLOT - 1);
     for (int n = 0; n < NSLOT; n++, h = (h + 1) & (NSLOT - 1)) {

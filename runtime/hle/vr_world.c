@@ -154,16 +154,17 @@ static void re_actors(void) {
     }
     {   // (RE) SKYRECOMP_RE_POKE_ONCE=<hex address>,<hex u32>,<frame>: written once, that frame
         static int init;
-        static uint64_t addr, at;
-        static uint32_t val;
+        static uint64_t addr, at, val;  // (a value over 32 bits is written as a u64)
         if (!init) {
             init = 1;
             const char *e = getenv("SKYRECOMP_RE_POKE_ONCE");
-            if (!e || sscanf(e, "%llx,%x,%llu", (unsigned long long *)&addr, &val, (unsigned long long *)&at) != 3) addr = 0;
+            if (!e || sscanf(e, "%llx,%llx,%llu", (unsigned long long *)&addr, (unsigned long long *)&val, (unsigned long long *)&at) != 3) addr = 0;
         }
         if (addr && renderer_present_count() >= at) {
-            *(volatile uint32_t *)(uintptr_t)addr = val;
-            LOG("[re] poked %#llx = %#x at frame %llu\n", (unsigned long long)addr, val, (unsigned long long)renderer_present_count());
+            if (val >> 32) *(volatile uint64_t *)(uintptr_t)addr = val;
+            else *(volatile uint32_t *)(uintptr_t)addr = (uint32_t)val;
+            LOG("[re] poked %#llx = %#llx at frame %llu\n", (unsigned long long)addr, (unsigned long long)val,
+                (unsigned long long)renderer_present_count());
             addr = 0;
         }
     }
@@ -196,6 +197,8 @@ static void re_actors(void) {
     if (at < 0 || (long)renderer_present_count() < at || !g_nsnap) return;
     at = -1;
     LOG("[re] room controller *(0x7002bfece8) = %#llx\n", (unsigned long long)*(const uint64_t *)(uintptr_t)0x7002bfece8ull);
+    for (int k = 0; k < 16; k++)  // (the room object's type: its first virtual methods)
+        LOG("[re] vtable 0x7001677230 +%#x = %#llx\n", k * 8, (unsigned long long)*(const uint64_t *)(uintptr_t)(0x7001677230ull + k * 8));
     const uint64_t r = scene_root();  // (the fullest list of the last frame: scene_snapshot)
     const uint64_t *list = g_snap;
     const uint32_t n = g_nsnap;
@@ -256,10 +259,18 @@ static void re_room(Cpu *c) {
     uint64_t saved[31];
     memcpy(saved, c->x, sizeof saved);
     const uint64_t sp = c->sp;
-    c->x[0] = mgr;
+    // what the DoorPull event's room step calls (f_7000f7a218 at 0x7000f7b83c): f_7000f30944(*(0x7002bfeab0), room,
+    // room, &f) with f = -1.0 (a float out / in on the guest stack)
+    (void)mgr;
+    c->sp -= 0x20;
+    *(volatile uint32_t *)(uintptr_t)c->sp = 0xbf800000u;
+    c->x[0] = *(const uint64_t *)(uintptr_t)0x7002bfeab0ull;
     c->x[1] = room;
-    LOG("[re] calling f_7000f0f258(%#llx, %u) at frame %llu\n", (unsigned long long)mgr, room, (unsigned long long)renderer_present_count());
-    guest_call(c, 0x7000f0f258ull);
+    c->x[2] = room;
+    c->x[3] = c->sp;
+    LOG("[re] calling f_7000f30944(%#llx, %u, %u) at frame %llu\n", (unsigned long long)c->x[0], room, room,
+        (unsigned long long)renderer_present_count());
+    guest_call(c, 0x7000f30944ull);
     LOG("[re] returned %#llx\n", (unsigned long long)c->x[0]);
     memcpy(c->x, saved, sizeof saved);
     c->sp = sp;
