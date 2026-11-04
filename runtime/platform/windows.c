@@ -209,7 +209,23 @@ static void open_log_console(void) {
     swprintf(command, sizeof command / sizeof *command, L"\"%ls\" %ls", program, wide);
     STARTUPINFOW startup = {.cb = sizeof startup};
     PROCESS_INFORMATION process;
-    if (CreateProcessW(program, command, NULL, NULL, FALSE, CREATE_NEW_CONSOLE, NULL, NULL, &startup, &process)) {
+    // The window closes with the game: it runs in a job that ends when its last handle closes. The handle stays open
+    // in the game, inherited across the start screen's restart into the game (plat_exec), and is never closed - the
+    // job ends when the last game process exits, however it exits.
+    SECURITY_ATTRIBUTES inherit = {.nLength = sizeof inherit, .bInheritHandle = TRUE};
+    HANDLE job = CreateJobObjectW(&inherit, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {0};
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof limits))
+            CloseHandle(job), job = NULL;
+    }
+    if (CreateProcessW(program, command, NULL, NULL, FALSE, CREATE_NEW_CONSOLE | (job ? CREATE_SUSPENDED : 0), NULL,
+                       NULL, &startup, &process)) {
+        if (job) {
+            if (!AssignProcessToJobObject(job, process.hProcess)) CloseHandle(job);
+            ResumeThread(process.hThread);  // (created suspended either way)
+        }
         CloseHandle(process.hThread); CloseHandle(process.hProcess);
         _putenv("SKYRECOMP_CONSOLE_OPEN=1");
         DWORD processes[2];
