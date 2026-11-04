@@ -493,8 +493,15 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                 extern bool door_handle_local(float *x, float *z);
                 extern void door_set_open(float radians);
                 float hl[3], kx, kz;
-                if (turned && have_handle && vr_rig_controller_world(hand, cw) && door_local(cw, hl) && door_handle_local(&kx, &kz)) {
-                    float a = atan2f(-hl[2], hl[0]) - atan2f(-kz, kx);
+                // (from where the hand is once the turn is done: grabbed up to 40 cm off the handle, and moved by the
+                // turn itself, the hand alone read as the door already well open)
+                static float a0;
+                static bool a0_set;
+                if (!turned) a0_set = false;
+                (void)kx, (void)kz;
+                if (turned && have_handle && vr_rig_controller_world(hand, cw) && door_local(cw, hl)) {
+                    if (!a0_set) a0 = atan2f(-hl[2], hl[0]), a0_set = true;
+                    float a = atan2f(-hl[2], hl[0]) - a0;
                     while (a > (float)M_PI) a -= 2 * (float)M_PI;
                     while (a < -(float)M_PI) a += 2 * (float)M_PI;
                     const float lim = 75.0f * (float)(M_PI / 180);
@@ -509,10 +516,9 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                 const float *pp = s.hand[hand].position;
                 const float pull = sqrtf((pp[0] - p0[0]) * (pp[0] - p0[0]) + (pp[2] - p0[2]) * (pp[2] - p0[2]));
                 best_turn = fmaxf(best_turn, turn), best_pull = fmaxf(best_pull, pull);
-                if (turned && pull > 0.10f) {
-                    LOG("[door] opened: turned %.0f deg, pulled %.0f cm\n", best_turn * 57.2958f, pull * 100);
-                    press = 8, hand = -1, haptic(1, 0.6f, 40), haptic(0, 0.6f, 40);
-                }
+                // (the door opens by being swung, above - no longer by a set pull distance: the turn alone moved
+                // the controller that far)
+                (void)pull;
             }
             {   // (vr_rig.c) the hand holding the handle is drawn on it
                 extern void vr_rig_door_grab(int side);
