@@ -418,19 +418,36 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
             static int hand = -1, press = 0;
             static float q0[4], p0[3];
             static bool turned;
+            static int loose;          // (frames the grip has been nearly let go: a held grip's force wavers)
+            static float best_turn, best_pull;
             const bool at_door = !paused && player_action() == 0x6a;
             const bool gesture = g_vr_config.door_mode != 2;
+            {   // (diagnostics) Link's action as it changes, and each grip squeeze
+                static int last_action = -2;
+                static bool last_grip[2];
+                const int action = player_action();
+                if (action != last_action) LOG("[door] action %#x\n", action), last_action = action;
+                const float g[2] = {s.l, s.r};
+                for (int h = 0; h < 2; h++)
+                    if ((g[h] > 0.6f) != last_grip[h]) {
+                        last_grip[h] = g[h] > 0.6f;
+                        LOG("[door] %s grip %s (%.2f) at door %d, tracked %d\n", h ? "right" : "left",
+                            last_grip[h] ? "squeezed" : "released", g[h], at_door, s.hand[h].tracked);
+                    }
+            }
             if (!at_door || !gesture) hand = -1;
             const float grip[2] = {s.l, s.r};
             if (at_door && gesture && hand < 0) {
                 for (int h = 0; h < 2 && hand < 0; h++)
-                    if (grip[h] > 0.6f && s.hand[h].tracked) {
-                        hand = h, turned = false;
+                    if (grip[h] > 0.5f && s.hand[h].tracked) {
+                        hand = h, turned = false, loose = 0, best_turn = best_pull = 0;
+                        LOG("[door] grab (%s hand)\n", h ? "right" : "left");
                         memcpy(q0, s.hand[h].orientation, sizeof q0), memcpy(p0, s.hand[h].position, sizeof p0);
                         haptic(h, 0.3f, 20);
                     }
-            } else if (hand >= 0 && (grip[hand] < 0.35f || !s.hand[hand].tracked)) {
-                hand = -1;  // (let go)
+            } else if (hand >= 0 && ((loose = grip[hand] < 0.1f ? loose + 1 : 0) > 20 || !s.hand[hand].tracked)) {
+                LOG("[door] let go: turned %.0f deg, pulled %.0f cm\n", best_turn * 57.2958f, best_pull * 100);
+                hand = -1;  // (let go: a third of a second under 10%)
             } else if (hand >= 0) {
                 // the turn about the controller's own pointing axis since the grab: conj(q0) * q, its z (-forward) part
                 const float *q = s.hand[hand].orientation;
@@ -438,18 +455,19 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                 const float rz = q0[3] * q[2] - q0[2] * q[3] - q0[0] * q[1] + q0[1] * q[0];
                 const float turn = fabsf(2.0f * atan2f(rz, rw));
                 if (!turned && turn > (float)(M_PI / 2)) turned = true, haptic(hand, 0.5f, 30);
-                // the pull: back along where the controller pointed at the grab (level)
-                const float x = q0[0], y = q0[1], z = q0[2], w = q0[3];
-                float f[3] = {-(2 * (x * z + y * w)), 0, -(1 - 2 * (x * x + y * y))};
-                const float fl = sqrtf(f[0] * f[0] + f[2] * f[2]);
-                if (fl > 1e-3f) f[0] /= fl, f[2] /= fl;
+                // the pull: how far the hand moved (level) since the grab - after the turn, at a door, any pull opens it
                 const float *pp = s.hand[hand].position;
-                const float pull = -((pp[0] - p0[0]) * f[0] + (pp[2] - p0[2]) * f[2]);
-                if (turned && pull > 0.12f) press = 8, hand = -1, haptic(1, 0.6f, 40), haptic(0, 0.6f, 40);
+                const float pull = sqrtf((pp[0] - p0[0]) * (pp[0] - p0[0]) + (pp[2] - p0[2]) * (pp[2] - p0[2]));
+                best_turn = fmaxf(best_turn, turn), best_pull = fmaxf(best_pull, pull);
+                if (turned && pull > 0.10f) {
+                    LOG("[door] opened: turned %.0f deg, pulled %.0f cm\n", best_turn * 57.2958f, pull * 100);
+                    press = 8, hand = -1, haptic(1, 0.6f, 40), haptic(0, 0.6f, 40);
+                }
             }
             if (g_vr_config.door_mode == 1 && at_door) s.buttons &= ~(uint32_t)SKY_JC_A;  // (gesture only)
             if (press > 0) press--, s.buttons |= SKY_JC_A;
-            if (hand >= 0) (hand ? (s.r = 0) : (s.l = 0));  // (the grabbing grip is not the game's L / R meanwhile)
+            // (at a door the grips are the gesture's, not the game's L / R: squeezed, they made Link leave the door)
+            if ((at_door && gesture) || hand >= 0) s.l = s.r = 0;
         }
         // VR Options > Turning: in 1st person the right stick turns the player (snap: a step per flick, smooth:
         // continuously) instead of the game's camera.
