@@ -742,9 +742,9 @@ static bool hand_block(const VrRigAnchor *a, const float reference[7], const flo
         extern uint64_t renderer_present_count(void);
         for (int i = 0; i < 3; i++) g_ctrl_world[side][i] = c[i * 4 + 3];
         g_ctrl_world_frame[side] = renderer_present_count() + 1;
-        extern bool door_handle(float w[3]);
+        extern bool door_handle_hand(float w[3]);
         float h[3];
-        if (atomic_load(&g_door_grab) == side && door_handle(h))  // (holding the door: the hand on its handle)
+        if (atomic_load(&g_door_grab) == side && door_handle_hand(h))  // (holding the door: the hand on its handle)
             for (int i = 0; i < 3; i++) c[i * 4 + 3] = h[i];
     }
     hand_k(side, k);

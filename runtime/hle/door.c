@@ -91,15 +91,21 @@ bool door_matrix(float m[12]) {
 // The handle (its knob) of the door Link is at, in the world, on his side of it. The door's frame (measured on his
 // room's door): the leaf spans x -70 (the hinge, found from how the leaf turns) .. +70, its plane is z = 0, y up; the
 // knob sits near the free edge at hand height.
-#define HANDLE_X 55.0f
-#define HANDLE_Y 90.0f
-#define HANDLE_Z 7.0f
-bool door_handle(float w[3]) {
+// (measured 2026-11-04: the controllers held on the knob in VR sat at x 42..62, y 115, z 17..21 from the door's
+// side - the grip's centre, in the hand around the knob)
+#define HANDLE_X 52.0f
+#define HANDLE_Y 115.0f
+#define HANDLE_Z 19.0f
+static bool handle_at(float out_z, float w[3]) {
     float m[12], eye[3];
     if (!door_matrix(m) || !player_eye(eye)) return false;
     const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
     const float side = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;  // (his z in the door's frame)
-    const float l[3] = {HANDLE_X, HANDLE_Y, HANDLE_Z * side};
+    const float l[3] = {HANDLE_X, HANDLE_Y, out_z * side};
     for (int r = 0; r < 3; r++) w[r] = m[r * 4 + 0] * l[0] + m[r * 4 + 1] * l[1] + m[r * 4 + 2] * l[2] + m[r * 4 + 3];
     return true;
 }
+bool door_handle(float w[3]) { return handle_at(HANDLE_Z, w); }
+// Where the hand holding the handle is drawn: the grip's centre further out from the door, the hand's mesh clear of it
+#define HANDLE_HAND_Z 30.0f
+bool door_handle_hand(float w[3]) { return handle_at(HANDLE_HAND_Z, w); }

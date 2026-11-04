@@ -443,13 +443,23 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
             extern float vr_rig_units_per_metre(void);
             float handle[3], cw[3];
             const bool have_handle = at_door && gesture && door_handle(handle);
-            const float reach = 0.25f * vr_rig_units_per_metre();
+            const float reach = 0.40f * vr_rig_units_per_metre();
             bool near[2] = {!have_handle, !have_handle};  // (no handle found: any grab, as before)
             static bool hovering[2];
             for (int h = 0; h < 2; h++) {
                 if (have_handle && vr_rig_controller_world(h, cw)) {
                     const float dx = cw[0] - handle[0], dy = cw[1] - handle[1], dz = cw[2] - handle[2];
                     near[h] = dx * dx + dy * dy + dz * dz < reach * reach;
+                }
+                {   // (diagnostics) every half second at a door: the handle, each controller and its distance
+                    static uint64_t next[2];
+                    const uint64_t t = SDL_GetTicksNS();
+                    if (at_door && t >= next[h]) {
+                        next[h] = t + 500000000ull;
+                        const bool cok = vr_rig_controller_world(h, cw);
+                        LOG("[door] %s: handle %d (%.0f %.0f %.0f) controller %d (%.0f %.0f %.0f) reach %.0f\n",
+                            h ? "right" : "left", have_handle, handle[0], handle[1], handle[2], cok, cw[0], cw[1], cw[2], reach);
+                    }
                 }
                 if (near[h] && have_handle && !hovering[h] && hand < 0) haptic(h, 0.15f, 10);
                 hovering[h] = near[h] && have_handle;
