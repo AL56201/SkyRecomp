@@ -124,6 +124,49 @@ static void re_actors(void) {
         }
         if (off && renderer_present_count() >= from) *(volatile uint32_t *)(uintptr_t)(MAIN_BASE + off) = val;
     }
+    {   // (RE) SKYRECOMP_RE_CANCEL_DOOR=<hex u32>: once the scene's list more than doubles (a room activated by the door
+        // sequence), Link's action (actor +0x118) is set to that value once
+        static int on = -1;
+        static uint32_t val, base;
+        if (on < 0) on = getenv("SKYRECOMP_RE_CANCEL_DOOR") != NULL, val = on ? (uint32_t)strtoul(getenv("SKYRECOMP_RE_CANCEL_DOOR"), NULL, 16) : 0;
+        const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
+        const bool have_link = link >= 0x7000000000ull && link < 0x7800000000ull;
+        static bool armed;  // (Link stood at a door: the doubling that follows is the door's room)
+        {
+            static int said;
+            if (on == 1 && !said++) LOG("[re] cancel: watching (link %d)\n", have_link);
+        }
+        if (have_link && *(const uint32_t *)(uintptr_t)(link + 0x118) == 0x6a) {
+            if (!armed && on == 1) LOG("[re] cancel: armed at frame %llu, %u nodes\n", (unsigned long long)renderer_present_count(), g_nsnap);
+            armed = true, base = g_nsnap;
+        }
+        if (on == 1 && armed && renderer_present_count() % 20 == 0)
+            LOG("[re] cancel watch: frame %llu nodes %u base %u action %#x\n", (unsigned long long)renderer_present_count(),
+                g_nsnap, base, have_link ? *(const uint32_t *)(uintptr_t)(link + 0x118) : 0);
+        if (on == 1 && armed && have_link && g_nsnap) {
+            if (g_nsnap > 2 * base) {
+                LOG("[re] scene %u -> %u nodes at frame %llu: Link's action %#x -> %#x\n", base, g_nsnap,
+                    (unsigned long long)renderer_present_count(), *(const uint32_t *)(uintptr_t)(link + 0x118), val);
+                *(volatile uint32_t *)(uintptr_t)(link + 0x118) = val;
+                on = 2;
+            }
+        }
+    }
+    {   // (RE) SKYRECOMP_RE_POKE_ONCE=<hex address>,<hex u32>,<frame>: written once, that frame
+        static int init;
+        static uint64_t addr, at;
+        static uint32_t val;
+        if (!init) {
+            init = 1;
+            const char *e = getenv("SKYRECOMP_RE_POKE_ONCE");
+            if (!e || sscanf(e, "%llx,%x,%llu", (unsigned long long *)&addr, &val, (unsigned long long *)&at) != 3) addr = 0;
+        }
+        if (addr && renderer_present_count() >= at) {
+            *(volatile uint32_t *)(uintptr_t)addr = val;
+            LOG("[re] poked %#llx = %#x at frame %llu\n", (unsigned long long)addr, val, (unsigned long long)renderer_present_count());
+            addr = 0;
+        }
+    }
     {   // (RE) SKYRECOMP_RE_DUMP=<hex address>,<hex length>,<file> - appended every 10 frames: frame, then the bytes
         static FILE *f;
         static uint64_t addr, len;
@@ -152,6 +195,7 @@ static void re_actors(void) {
     }
     if (at < 0 || (long)renderer_present_count() < at || !g_nsnap) return;
     at = -1;
+    LOG("[re] room controller *(0x7002bfece8) = %#llx\n", (unsigned long long)*(const uint64_t *)(uintptr_t)0x7002bfece8ull);
     const uint64_t r = scene_root();  // (the fullest list of the last frame: scene_snapshot)
     const uint64_t *list = g_snap;
     const uint32_t n = g_nsnap;

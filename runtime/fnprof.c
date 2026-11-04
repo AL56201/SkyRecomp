@@ -11,7 +11,8 @@
 volatile int g_fnprof;
 
 #define NSLOT (1 << 18)
-static struct { _Atomic uint64_t addr; _Atomic uint64_t count; } slots[NSLOT];
+static struct { _Atomic uint64_t addr; _Atomic uint64_t count; uint64_t seq; } slots[NSLOT];
+static _Atomic uint64_t g_seq;  // (the order functions were first entered in the window)
 
 // LARECOMP_FNPROF_BT=<hex addr>[,...]: also print the host backtrace (guest functions are f_<addr>) the first time
 // each listed function is entered inside the window - who calls it
@@ -39,7 +40,24 @@ static void bt_check(uint64_t a, uint64_t lr, uint64_t x0) {
             fprintf(stderr, "[fnprof-bt] %llx entered from guest lr %llx x0 %llx (vtable %llx, +0x100 %llx, [x0+8] %llx):\n",
                     (unsigned long long)a, (unsigned long long)lr, (unsigned long long)x0, (unsigned long long)vt,
                     (unsigned long long)v100, (unsigned long long)p8);
+#if defined(_WIN32)
+            {   // the chain as guest functions (f_<address>)
+                extern unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long, unsigned long, void **, unsigned long *);
+                const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);
+                void *frames[64];
+                const unsigned short k = RtlCaptureStackBackTrace(1, 64, frames, NULL);
+                char line[4096];
+                int len = snprintf(line, sizeof line, "[fnprof-bt]   chain:");
+                for (unsigned short j = 0; j < k && len < (int)sizeof line - 40; j++) {
+                    uint64_t off;
+                    const char *s = rt_host_fn_name((uint64_t)(uintptr_t)frames[j], &off);
+                    if (s) len += snprintf(line + len, sizeof line - len, " %s", s);
+                }
+                fprintf(stderr, "%s\n", line);
+            }
+#else
             plat_print_backtrace();  // (execinfo is macOS / glibc only)
+#endif
         }
 }
 
@@ -48,7 +66,12 @@ void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
     uint32_t h = (uint32_t)((a >> 2) * 0x9E3779B1u) & (NSLOT - 1);
     for (int n = 0; n < NSLOT; n++, h = (h + 1) & (NSLOT - 1)) {
         uint64_t cur = atomic_load_explicit(&slots[h].addr, memory_order_relaxed);
-        if (cur == a || (cur == 0 && atomic_compare_exchange_strong(&slots[h].addr, &cur, a)) || cur == a) {
+        if (cur == 0 && atomic_compare_exchange_strong(&slots[h].addr, &cur, a)) {
+            slots[h].seq = atomic_fetch_add_explicit(&g_seq, 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&slots[h].count, 1, memory_order_relaxed);
+            return;
+        }
+        if (cur == a) {
             atomic_fetch_add_explicit(&slots[h].count, 1, memory_order_relaxed);
             return;
         }
@@ -71,14 +94,16 @@ void fnprof_frame(uint64_t frame) {
     if ((long)frame == from) { g_fnprof = 1; LOG("[fnprof] on at frame %llu\n", (unsigned long long)frame); }
     if ((long)frame != to) return;
     g_fnprof = 0;
-    uint64_t (*rows)[2] = malloc(sizeof(uint64_t[2]) * NSLOT);
+    uint64_t (*rows)[3] = malloc(sizeof(uint64_t[3]) * NSLOT);
     int n = 0;
     for (int i = 0; i < NSLOT; i++)
-        if (slots[i].addr) { rows[n][0] = slots[i].addr; rows[n][1] = slots[i].count; n++; }
+        if (slots[i].addr) { rows[n][0] = slots[i].addr; rows[n][1] = slots[i].count; rows[n][2] = slots[i].seq; n++; }
     qsort(rows, n, sizeof rows[0], cmp);
     const char *out = getenv("LARECOMP_FNPROF_OUT") ? getenv("LARECOMP_FNPROF_OUT") : "build/fnprof.txt";  // (parallel runs)
     FILE *f = fopen(out, "w");
-    for (int i = 0; f && i < n; i++) fprintf(f, "%llx %llu\n", (unsigned long long)rows[i][0], (unsigned long long)rows[i][1]);
+    for (int i = 0; f && i < n; i++)  // (address, entries, order of its first entry)
+        fprintf(f, "%llx %llu %llu\n", (unsigned long long)rows[i][0], (unsigned long long)rows[i][1],
+                (unsigned long long)rows[i][2]);
     if (f) fclose(f);
     free(rows);
     LOG("[fnprof] %d functions, written %s (frames %ld-%ld)\n", n, out, from, to);

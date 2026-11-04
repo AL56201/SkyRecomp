@@ -170,8 +170,68 @@ static GuestFn dispatch_slow(Cpu *c) {
     return f;
 }
 
+// (RE) SKYRECOMP_TRACE_DISPATCH=<from frame>,<to frame>: every function reached through the dispatcher (indirect
+// calls: virtual methods, function pointers) in that window, with the frame it was first reached and its count -
+// logged when the window closes (dispatch_trace_tick, once per frame)
+volatile int g_dispatch_trace;
+#define TRACE_SLOTS 65536
+static struct { uint64_t pc, first, seq, lr; uint32_t count; } g_trace[TRACE_SLOTS];
+static uint64_t g_trace_frame, g_trace_seq;
+static void trace_pc(uint64_t pc, uint64_t lr) {
+    unsigned h = (unsigned)((pc >> 2) * 2654435761u) & (TRACE_SLOTS - 1);
+    for (int i = 0; i < 64; i++, h = (h + 1) & (TRACE_SLOTS - 1)) {
+        if (g_trace[h].pc == pc) { g_trace[h].count++; return; }
+        if (!g_trace[h].pc) {  // (its first call: the order and its caller's return address)
+            g_trace[h].pc = pc, g_trace[h].first = g_trace_frame, g_trace[h].count = 1, g_trace[h].lr = lr;
+            g_trace[h].seq = __atomic_add_fetch(&g_trace_seq, 1, __ATOMIC_RELAXED);
+            {   // (SKYRECOMP_TRACE_STACK=<frame>: the host call stack, as guest functions, at that frame's first new calls)
+                static long at = -2;
+                static int n;
+                if (at == -2) at = getenv("SKYRECOMP_TRACE_STACK") ? atol(getenv("SKYRECOMP_TRACE_STACK")) : -1;
+                if (at >= 0 && (long)g_trace_frame >= at && n < 6) {
+                    n++;
+                    extern unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long, unsigned long, void **, unsigned long *);
+                    void *frames[48];
+                    const unsigned short k = RtlCaptureStackBackTrace(1, 48, frames, NULL);
+                    const char *rt_host_fn_name(uint64_t pc, uint64_t *offset);
+                    char line[2048];
+                    int len = snprintf(line, sizeof line, "[stack] new %#llx:", (unsigned long long)pc);
+                    for (unsigned short j = 0; j < k && len < (int)sizeof line - 40; j++) {
+                        uint64_t off;
+                        const char *s = rt_host_fn_name((uint64_t)(uintptr_t)frames[j], &off);
+                        if (s) len += snprintf(line + len, sizeof line - len, " %s", s);
+                    }
+                    LOG("%s\n", line);
+                }
+            }
+            return;
+        }
+    }
+}
+void dispatch_trace_tick(uint64_t frame) {
+    static int init;
+    static uint64_t from, to;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("SKYRECOMP_TRACE_DISPATCH");
+        if (!e || sscanf(e, "%llu,%llu", (unsigned long long *)&from, (unsigned long long *)&to) != 2) from = to = 0;
+    }
+    g_trace_frame = frame;
+    if (!to) return;
+    g_dispatch_trace = frame >= from && frame < to;
+    if (frame == to) {
+        to = 0;
+        g_dispatch_trace = 0;
+        for (int i = 0; i < TRACE_SLOTS; i++)
+            if (g_trace[i].pc) LOG("[trace] %#llx first %llu count %u seq %llu lr %#llx\n", (unsigned long long)g_trace[i].pc,
+                                   (unsigned long long)g_trace[i].first, g_trace[i].count,
+                                   (unsigned long long)g_trace[i].seq, (unsigned long long)g_trace[i].lr);
+    }
+}
+
 // Always tail-calls, so chains of indirect jumps don't grow the host stack.
 void rt_dispatch(Cpu *c) {
+    if (__builtin_expect(g_dispatch_trace, 0)) trace_pc(c->pc, c->x[30]);
     unsigned h = (unsigned)(c->pc >> 2) & (DCACHE - 1);
     GuestFn f = dcache[h].addr == c->pc ? dcache[h].fn : dispatch_slow(c);
     __attribute__((musttail)) return f(c);

@@ -233,6 +233,8 @@ void vr_rig_begin_frame(void) {
         extern void player_trace_tick(uint64_t frame);
         extern uint64_t renderer_present_count(void);
         player_trace_tick(renderer_present_count());
+        extern void dispatch_trace_tick(uint64_t frame);
+        dispatch_trace_tick(renderer_present_count());
         extern void door_track(void);
         door_track();
         static int door_trace = -1;  // (RE) SKYRECOMP_DOOR_TRACE=1: the game's hands in the door's frame, every 5 frames
