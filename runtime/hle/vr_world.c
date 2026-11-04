@@ -97,9 +97,15 @@ static void scene_replay(Cpu *c) {
 }
 
 // A menu pauses the game and the frozen world is re-entered (this frame or the last).
+// It stays so for half a second after: a closing menu keeps fading out once the game runs again, and its layers
+// must keep their routing (else, for those frames, its full-screen layers flashed flat over the whole view).
 bool vr_world_menu_active(void) {
-    return g_replay_frame != ~0ull && g_replay_frame + 1 >= renderer_present_count() &&
-           *(volatile uint32_t *)(uintptr_t)EXEC_MASK && world_in_menus();
+    static uint64_t last = ~0ull;
+    const uint64_t now = renderer_present_count();
+    if (g_replay_frame != ~0ull && g_replay_frame + 1 >= now && *(volatile uint32_t *)(uintptr_t)EXEC_MASK &&
+        world_in_menus())
+        last = now;
+    return last != ~0ull && now - last < 30;
 }
 
 #define PRE_EXECUTE 0x7000b175c0ull
