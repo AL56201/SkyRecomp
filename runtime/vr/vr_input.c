@@ -364,8 +364,12 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
     if (s.active) {
         s.time_ns = time;
         if (reference) memcpy(s.reference, reference, sizeof s.reference);
+        // (+ / − open the Gear menu and the map: not while a menu already pauses the game - pressed there, they
+        // invoked the menu again; B closes it)
+        extern bool vr_game_paused(void);
+        const bool paused = vr_game_paused();
         for (int a = ACT_A; a <= ACT_RSTICK; a++)
-            if (get_bool(a)) s.buttons |= action_defs[a].button;
+            if (get_bool(a) && !(paused && (a == ACT_PLUS || a == ACT_MINUS))) s.buttons |= action_defs[a].button;
         if (get_bool(ACT_DPAD_PRESS)) {  // the pressed trackpad's direction as one d-pad button
             const XrVector2f d = get_vec2(ACT_DPAD);
             if (d.x * d.x + d.y * d.y > 0.09f)
@@ -403,6 +407,9 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
             s.stick[0][0] = x * c + y * sn;
             s.stick[0][1] = -x * sn + y * c;
         }
+        // (a menu over the live world - Gear, map: the left stick walked Link behind it; menus pick with the pointer)
+        extern bool vr_world_menu_active(void);
+        if (paused && vr_world_menu_active()) s.stick[0][0] = s.stick[0][1] = 0;
     }
     // The game's motion sensors follow the aim poses (where each controller points); the grip poses (the controller
     // in the palm) place the wrist HUD.

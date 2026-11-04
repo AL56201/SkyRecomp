@@ -4140,7 +4140,12 @@ static RtState g_hud_saved_rt;
 // resets for the next frame.
 static int g_2d_content;  // this frame's 2D-layer draws that are not full-screen quads
 static bool g_fullscreen_2d_since_present;  // a fade/flash covers the eyes; never show a panel over it
+// A full-screen menu over the live world (the map) fills the screen first: its backdrop, on the HUD panel - not a fade.
+// The panel is then opaque (the menu's later draws leave the HUD's alpha as the fill set it, half).
+static bool g_menu_backdrop, g_menu_backdrop_last;
+bool vk_hud_menu_backdrop(void) { return g_menu_backdrop_last; }
 bool vk_hud_frame_blank(void) {
+    g_menu_backdrop_last = g_menu_backdrop, g_menu_backdrop = false;
     const bool blank = g_fullscreen_2d_since_present || g_2d_content == 0;
     g_2d_content = 0;
     g_fullscreen_2d_since_present = false;
@@ -4200,7 +4205,9 @@ static void draw(CmdRec *r, bool indexed) {
     const bool fullscreen_2d = hud_draw && hud_fullscreen_quad();
     g_hud_fullscreen_draw = fullscreen_2d;
     if (fullscreen_2d) g_fullscreen_quad_frame = true;
-    if (g_hud_candidate && fullscreen_2d) g_hud_candidate = false;  // (a fade: over the whole view, in the eyes)
+    // (a fade: over the whole view, in the eyes - except behind a full-screen menu drawn over the live world: its own
+    // full-screen background, the map's parchment, belongs on its panel; in the eyes it covered the world instead)
+    if (g_hud_candidate && fullscreen_2d && !vr_world_menu_active()) g_hud_candidate = false;
     if (!fullscreen_2d && hud_draw) g_2d_content++;  // (vk_hud_frame_blank)
     // World behind a menu (hle/vr_world.c): the menu's own passes that read the screen back (the map's islands,
     // drawn there first, then captured into its map texture) read the HUD texture, where its 2D layer now is.
@@ -4260,7 +4267,9 @@ static bool hud_route(Prog *pr) {
         const float *vb = st.vbuf[0].addr && st.vbuf[0].size >= 48 ? (const float *)(uintptr_t)st.vbuf[0].addr : NULL;
         bool unit = vb && g_hud_rec && g_hud_rec->x[2] <= 6;
         for (int i = 0; unit && i < 12; i++) unit = isfinite(vb[i]) && vb[i] >= -0.01f && vb[i] <= 1.01f;
-        if (unit) return true;  // full-screen menu composite: drawn normally in both eyes
+        // full-screen menu composite: drawn normally in both eyes - unless the menu has its own backdrop on the panel
+        // (the map's soft shadow of its islands, over its parchment: in the eyes, a ghost of the map over the world)
+        if (unit && !g_menu_backdrop) return true;
     }
     if (vk_vr_eye()) return false;
     {   // Diagnostic capture for a user-reproduced floating cutscene card.  Log the actual draw routed to the HUD,
@@ -4422,11 +4431,43 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     // A textured full-screen quad can be the title or file-select background.  Only a textureless black/white fill
     // owns the whole view as a fade; suppressing every full-screen quad makes those screens disappear in VR.
+    // (behind a world menu, a textured full-screen quad goes on the panel only over the menu's own backdrop - the
+    // map's soft shadow of its islands. Without one (the Gear menu) it is the menu's blurred picture of the screen:
+    // in VR a flat image of the view in front of the live world behind the menu - not drawn, in either eye.)
+    // (also its plain copy of the 3D view onto the 2D layer: a 2D draw sampling a screen-sized render target)
+    if (vr_world_menu_active() && !g_menu_backdrop && pr->fi->ntex && vk_hud_layer_on() &&
+        (hud_fullscreen_quad() || g_hud_candidate)) {
+        const bool full = hud_fullscreen_quad();
+        bool from_screen = false;
+        for (int i = 0; i < pr->fi->ntex && i < 64 && !from_screen; i++) {
+            NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+            const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+            from_screen = b && b->gpu_owned && (full || (t->width >= 1280 && t->height >= 720));
+        }
+        if (from_screen) {
+            // (the game's world picture overwrote everything under it - the menu's fills. It then filters that flat,
+            // mono picture into paper (these draws, skipped too); over the live world the panel darkens it instead)
+            // (again at each of the filter's draws: the paper layer drawn between them is the filter's base)
+            if (!full && !vk_vr_eye() && g_hud_tex.backend) {
+                vk_end_pass();
+                TexBackend *hb = vk_tex(&g_hud_tex, true);
+                VkClearColorValue zero = {{0, 0, 0, 0.25f}};
+                VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, hb->layer0, 1};
+                vk_full_barrier(vk_cmd());
+                vkCmdClearColorImage(vk_cmd(), hb->image, VK_IMAGE_LAYOUT_GENERAL, &zero, 1, &all);
+                vk_full_barrier(vk_cmd());
+                st.rt_dirty = true;
+            }
+            stat_skipped++;
+            return;
+        }
+    }
     if (g_hud_fullscreen_draw && pr->fi->ntex == 0 && st.ubuf[1][0].addr && st.ubuf[1][0].size >= 12) {
         const float *c = (const float *)(uintptr_t)st.ubuf[1][0].addr;
         const bool black = c[0] < 0.01f && c[1] < 0.01f && c[2] < 0.01f;
         const bool white = c[0] > 0.99f && c[1] > 0.99f && c[2] > 0.99f;
-        if (black || white) g_fullscreen_2d_since_present = true;
+        if ((black || white) && g_hud_candidate && vr_world_menu_active()) g_menu_backdrop = true;
+        else if (black || white) g_fullscreen_2d_since_present = true;
     }
     // A recognized full-view fill stays in the eyes while we decide whether it is a final veil or an opaque
     // background followed by scene content. Routing that native hold to the HUD leaves a black card over the
@@ -4691,7 +4732,9 @@ static void draw_(CmdRec *r, bool indexed) {
             memcpy(k.blend[i], st.blend[i], 8);
         }
     }
-    if (g_hud_sub_from && k.ncolor && k.color[0] != VK_FORMAT_UNDEFINED && !vr_world_menu_active()) {
+    // (not over a world menu's own backdrop - the map's parchment blends by its destination alpha; a menu without one,
+    // the Gear menu, is its pieces over the live world, like the HUD)
+    if (g_hud_sub_from && k.ncolor && k.color[0] != VK_FORMAT_UNDEFINED && !(vr_world_menu_active() && g_menu_backdrop)) {
         // VR HUD layer: the game writes its 2D layer with RGB-only masks (the screen's alpha was never used). The HUD
         // texture accumulates coverage in alpha instead (alpha = src + dst * (1 - src)), colour blending unchanged:
         // premultiplied colour over transparent black, ready to be composited on the panel.

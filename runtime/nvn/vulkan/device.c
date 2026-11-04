@@ -985,8 +985,9 @@ void backend_present(NvnTexture *t) {
             g_vr_panel_img = hb;
             if (hb) {
                 vk_label_begin(vk_cmd(), "[VR] HUD Quad");
+                extern bool vk_hud_menu_backdrop(void);
                 vr_record_hud_copy((void *)vk_cmd(), (void *)hb->image, hb->width, hb->height, renderer_origin_lower_left(),
-                               vk_hud_opaque() && !g_had_scene && !g_fade);
+                               vk_hud_opaque() && (vr_world_menu_active() ? vk_hud_menu_backdrop() : !g_had_scene) && !g_fade);
                 vk_label_end(vk_cmd());
                 // The panel into both eye images (vr_eye_panel: SteamVR's quad layers judder the game's cursor)
                 extern void vk_vr_panel_into_eye(VkCommandBuffer cb, void *image, uint32_t format, uint32_t w, uint32_t h,
