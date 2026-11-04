@@ -58,6 +58,21 @@ typedef struct VRConfig {
         = 0
 #endif
         ;                                // left stick forward: 0 where the head looks, 1 / 2 the left / right controller
+    int turn_mode
+#ifdef __cplusplus
+        = 0
+#endif
+        ;                                // right stick, 1st person: 0 snap, 1 smooth, 2 off (the game's camera)
+    float snap_turn_angle
+#ifdef __cplusplus
+        = 30.0f
+#endif
+        ;                                // degrees (15..90)
+    float smooth_turn_speed
+#ifdef __cplusplus
+        = 120.0f
+#endif
+        ;                                // degrees per second at full tilt (30..360)
 } VRConfig;
 
 // Always contains a validated configuration. LoadVRConfig resets it to defaults first.

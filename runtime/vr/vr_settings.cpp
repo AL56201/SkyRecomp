@@ -71,6 +71,11 @@ void validate(VRConfig &config) {
     config.camera_distance_offset = std::clamp(config.camera_distance_offset, -100.0f, 100.0f);
     if (config.view_mode != 0 && config.view_mode != 1) config.view_mode = kDefaults.view_mode;
     if (config.move_direction < 0 || config.move_direction > 2) config.move_direction = kDefaults.move_direction;
+    if (config.turn_mode < 0 || config.turn_mode > 2) config.turn_mode = kDefaults.turn_mode;
+    if (!std::isfinite(config.snap_turn_angle)) config.snap_turn_angle = kDefaults.snap_turn_angle;
+    if (!std::isfinite(config.smooth_turn_speed)) config.smooth_turn_speed = kDefaults.smooth_turn_speed;
+    config.snap_turn_angle = std::clamp(config.snap_turn_angle, 15.0f, 90.0f);
+    config.smooth_turn_speed = std::clamp(config.smooth_turn_speed, 30.0f, 360.0f);
 }
 
 bool is_section(const std::string &line, const char *name) {
@@ -111,6 +116,9 @@ std::vector<std::string> vr_lines() {
             "world_scale = " + world.str(),
             "view_mode = " + std::to_string(g_vr_config.view_mode),
             "move_direction = " + std::to_string(g_vr_config.move_direction),
+            "turn_mode = " + std::to_string(g_vr_config.turn_mode),
+            "snap_turn_angle = " + std::to_string((int)g_vr_config.snap_turn_angle),
+            "smooth_turn_speed = " + std::to_string((int)g_vr_config.smooth_turn_speed),
             "camera_height_offset = " + height.str(), "camera_distance_offset = " + distance.str(),
             std::string("level_horizon = ") + (g_vr_config.level_horizon ? "true" : "false"),
             "hud_distance = " + hud_distance.str(), "hud_scale = " + hud_scale.str(),
@@ -157,6 +165,9 @@ extern "C" void LoadVRConfig(const char *filepath) {
         else if (key == "world_scale") parse_float(value, g_vr_config.world_scale);
         else if (key == "view_mode") parse_int(value, g_vr_config.view_mode);
         else if (key == "move_direction") parse_int(value, g_vr_config.move_direction);
+        else if (key == "turn_mode") parse_int(value, g_vr_config.turn_mode);
+        else if (key == "snap_turn_angle") parse_float(value, g_vr_config.snap_turn_angle);
+        else if (key == "smooth_turn_speed") parse_float(value, g_vr_config.smooth_turn_speed);
         else if (key == "camera_height_offset") parse_float(value, g_vr_config.camera_height_offset);
         else if (key == "camera_distance_offset") parse_float(value, g_vr_config.camera_distance_offset);
         else if (key == "level_horizon") parse_bool(value, g_vr_config.level_horizon);

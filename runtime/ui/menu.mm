@@ -899,6 +899,16 @@ static void tab_vr_options(void) {
     changed |= opt_choice("Movement Direction", &g_vr_config.move_direction, move_dirs, 3, 0,
                           "Which way pushing the movement stick forward walks Link: where you look (Head), or where a "
                           "controller points - so you can look around while walking straight.");
+    static const char *turn_modes[] = {"Snap", "Smooth", "Off"};
+    changed |= opt_choice("Turning", &g_vr_config.turn_mode, turn_modes, 3, 0,
+                          "1st person: the right stick turns you. Snap turns in steps (comfortable for most people), "
+                          "Smooth turns continuously. Off leaves the right stick to the game's camera.");
+    if (g_vr_config.turn_mode == 0)
+        changed |= opt_slider("Snap Turn Angle", &g_vr_config.snap_turn_angle, 15.0f, 90.0f, 15.0f, 30.0f, "%g deg",
+                              "How far each flick of the right stick turns you.");
+    if (g_vr_config.turn_mode == 1)
+        changed |= opt_slider("Smooth Turn Speed", &g_vr_config.smooth_turn_speed, 30.0f, 360.0f, 15.0f, 120.0f,
+                              "%g deg/s", "How fast the right stick turns you, at full tilt.");
 
     changed |= opt_toggle("Level Horizon", &g_vr_config.level_horizon, true,
                           "Keeps the VR horizon level when the game camera rolls or tilts.");

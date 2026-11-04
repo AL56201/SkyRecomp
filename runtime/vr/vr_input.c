@@ -410,6 +410,25 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
         // (a menu over the live world - Gear, map: the left stick walked Link behind it; menus pick with the pointer)
         extern bool vr_world_menu_active(void);
         if (paused && vr_world_menu_active()) s.stick[0][0] = s.stick[0][1] = 0;
+        // VR Options > Turning: in 1st person the right stick turns the player (snap: a step per flick, smooth:
+        // continuously) instead of the game's camera.
+        if (g_vr_config.turn_mode != 2 && g_vr_config.view_mode == 1 && !paused && player_eye(NULL)) {
+            extern void vr_turn(float radians);
+            static bool armed = true;
+            static XrTime last;
+            const float x = s.stick[1][0];
+            const float dt = last && time > last ? fminf((float)(time - last) * 1e-9f, 0.1f) : 0.0f;
+            last = time;
+            const float deg = (float)(M_PI / 180.0);
+            if (g_vr_config.turn_mode == 0) {
+                if (armed && fabsf(x) > 0.7f) vr_turn((x > 0 ? 1.0f : -1.0f) * g_vr_config.snap_turn_angle * deg), armed = false;
+                else if (fabsf(x) < 0.3f) armed = true;
+            } else if (fabsf(x) > 0.15f) {
+                const float t = (fabsf(x) - 0.15f) / 0.85f * (x > 0 ? 1.0f : -1.0f);
+                vr_turn(t * g_vr_config.smooth_turn_speed * deg * dt);
+            }
+            s.stick[1][0] = s.stick[1][1] = 0;
+        }
     }
     // The game's motion sensors follow the aim poses (where each controller points); the grip poses (the controller
     // in the palm) place the wrist HUD.

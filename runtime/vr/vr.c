@@ -596,6 +596,27 @@ static void store_pose(float out[7], const XrPosef *p) {
     out[4] = p->position.x; out[5] = p->position.y; out[6] = p->position.z;
 }
 
+// Turning (VR Options > Turning, vr_input.c): the reference head pose - the game camera's stand-in - turns about the
+// vertical through the head, so the world turns about the player. Radians, counter-clockwise from above.
+static _Atomic float g_turn_pending;
+void vr_turn(float radians) {
+    float v = atomic_load(&g_turn_pending);
+    while (!atomic_compare_exchange_weak(&g_turn_pending, &v, v + radians)) {}
+}
+static void apply_turn(void) {
+    const float d = atomic_exchange(&g_turn_pending, 0.0f);
+    if (d == 0.0f || !reference_valid) return;
+    const float hx = (frame.views[0].pose.position.x + frame.views[1].pose.position.x) * 0.5f;
+    const float hz = (frame.views[0].pose.position.z + frame.views[1].pose.position.z) * 0.5f;
+    const float s = sinf(d * 0.5f), c = cosf(d * 0.5f);  // yaw(d) * reference (yaw only: x = z = 0)
+    const float qy = reference_pose[1], qw = reference_pose[3];
+    reference_pose[1] = qy * c + qw * s;
+    reference_pose[3] = qw * c - qy * s;
+    const float sd = sinf(d), cd = cosf(d), x = reference_pose[4] - hx, z = reference_pose[6] - hz;
+    reference_pose[4] = hx + x * cd + z * sd;
+    reference_pose[6] = hz - x * sd + z * cd;
+}
+
 static bool locate_views(void) {
     static int logged;
     const XrSpaceLocationFlags tracked = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
@@ -617,6 +638,7 @@ static bool locate_views(void) {
     const bool located = xr_frame_ok(p_xrLocateViews(xr_session, &li, &vs, 2, &count, frame.views), "xrLocateViews", &logged);
     const bool pose_valid = located && count == 2 && (vs.viewStateFlags & valid) == valid;
     const bool ok = pose_valid && reference_valid;
+    if (ok) apply_turn();
     // (test) SKYRECOMP_VR_PIN_HEAD=<degrees>: the eyes sit still at the reference head pose (+-32 mm), turned left by
     // that many degrees (any value, e.g. 1 or 0.0 for straight ahead): reproducible eye shots whatever the headset does
     static int pin = -1;
