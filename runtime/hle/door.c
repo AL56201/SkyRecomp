@@ -418,6 +418,23 @@ void door_request_step(void) { atomic_store(&g_step_request, 1); }
 
 // (game thread) Link moved through the door: to the far side of its plane, `dist` units beyond it, at the doorway's
 // centre line (the door's origin is the doorway's middle - its leaf spans x -70 .. 70)
+// Trace (always, near a door that is open): build/door_trace.csv - a frame per line, Link's feet in the door's frame
+// (x along the leaf, z across), the open angle, in the doorway, and what held him: 1 the frame's side stopped a step,
+// 2 the leaf pushed him. Plotted to see what is in the way.
+static int g_trace_why;
+float g_door_stick;  // (the left stick's tilt, 0..1 - vr_input.c)
+static void door_trace(uint64_t frame, float lx, float lz, bool inside) {
+    static FILE *f;
+    if (!f) {
+        f = fopen("build/door_trace.csv", "a");
+        if (!f) return;
+        fprintf(f, "frame,x,z,open_deg,inside,why,stick\n");
+    }
+    fprintf(f, "%llu,%.2f,%.2f,%.1f,%d,%d,%.2f\n", (unsigned long long)frame, lx, lz, door_open() * 57.2958f, inside, g_trace_why,
+            g_door_stick);
+    fflush(f);
+}
+
 void door_step_tick(void) {
     // The door open wide: Link walks through its frame as through nothing. Inside the doorway his collision check is
     // skipped (the closed door's collision would stop him) and his height held (the skipped check is his floor's
@@ -449,34 +466,38 @@ void door_step_tick(void) {
     // his feet in the door's closed frame (x along the leaf, z across the doorway)
     const float *p = (const float *)(uintptr_t)(link + 0x148);
     const float d[3] = {p[0] - m[3], p[1] - m[7], p[2] - m[11]};
-    const float lx = m[0] * d[0] + m[4] * d[1] + m[8] * d[2], lz = m[2] * d[0] + m[6] * d[1] + m[10] * d[2];
+    float lx = m[0] * d[0] + m[4] * d[1] + m[8] * d[2]; float lz = m[2] * d[0] + m[6] * d[1] + m[10] * d[2];
+    g_trace_why = 0;
     const bool open = fabsf(door_open()) > 3.0f * (float)(M_PI / 180);  // (the doorway is free once it opens)
     if (getenv("SKYRECOMP_DOOR_SPEED") && fabsf(lx) < 150 && fabsf(lz) < 200) {  // (test: his speed near the door)
         static float plx, plz;
         LOG("[door] speed %.1f at %.0f %.0f%s\n", sqrtf((lx - plx) * (lx - plx) + (lz - plz) * (lz - plz)), lx, lz, inside ? " (in)" : "");
         plx = lx, plz = lz;
     }
-    {   // the leaf itself is solid: a segment from the hinge, turned by the open angle, that pushes him off (his feet
-        // within R of it, to the side he was on)
-        static float leaf_side;
-        const float o = door_open(), c = cosf(o), sn = sinf(o), hx = door_hinge_x(), len = -2 * hx, R = 15.0f;
-        const float ex = c, ez = -sn;  // (the leaf's direction in the door's frame: Ry(open) of x)
-        const float rx = lx - hx, rz = lz;
-        float t = rx * ex + rz * ez;
-        t = t < 0 ? 0 : t > len ? len : t;
-        const float cx = rx - t * ex, cz = rz - t * ez, dist = sqrtf(cx * cx + cz * cz);
-        const float side = (rx * -ez + rz * ex) < 0 ? -1.0f : 1.0f;  // (which face of the leaf he is on)
-        if (o == 0.0f || dist >= R) leaf_side = side;
-        else if (fabsf(o) > 0.02f) {
-            // out to R on his own face: along the leaf's normal (n = (-ez, ex)) times the face he was on
-            const float nx = -ez * leaf_side, nz = ex * leaf_side;
-            const float along = cx * nx + cz * nz, push = R - along;
-            if (push > 0)
+    {   // the leaf is solid to walk into from the doorway's side - never a push. Its face toward the opening (normal n,
+        // +x in the door's frame) takes the part of his step that goes into it (to within R of it); the leaf swung
+        // over him moves nothing (he was already there); its face toward the wall's corner, and its ends, let him by
+        // - so he is never shut in behind it
+        static float pl_x, pl_z;
+        static uint64_t pl_frame;
+        const float o = door_open(), hx = door_hinge_x(), len = -2 * hx, R = 15.0f;
+        const float ex = cosf(o), ez = -sinf(o);  // (the leaf's direction in the door's frame: Ry(open) of x)
+        float nx = -ez, nz = ex;
+        if (nx < 0) nx = -nx, nz = -nz;
+        if (fabsf(o) > 0.02f && pl_frame && frame - pl_frame < 4) {
+            const float t = (lx - hx) * ex + lz * ez, tp = (pl_x - hx) * ex + pl_z * ez;
+            const float along = (lx - hx) * nx + lz * nz, along_p = (pl_x - hx) * nx + pl_z * nz;
+            if (t > 0 && t < len && tp > 0 && tp < len && along_p >= R && along < R) {
+                const float back = R - along;  // (no more than his own step brought him in)
+                g_trace_why |= 2;
                 for (unsigned i = 0; i < NCOPIES; i++) {
                     float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
-                    q[0] += push * (m[0] * nx + m[2] * nz), q[2] += push * (m[8] * nx + m[10] * nz);
+                    q[0] += back * (m[0] * nx + m[2] * nz), q[2] += back * (m[8] * nx + m[10] * nz);
                 }
+                lx += back * nx, lz += back * nz;
+            }
         }
+        pl_x = lx, pl_z = lz, pl_frame = frame;
     }
     // (wider than the leaf, 70 to its edge, and his reach: near the frame the closed door's collision would catch him)
     const bool in_frame = fabsf(lx) < 110.0f && fabsf(lz) < 90.0f;
@@ -499,7 +520,14 @@ void door_step_tick(void) {
         // the frame's sides are walls (his own check skipped): the doorway is |x| <= 42, the wall's face |z| = 45. A
         // step into one is not taken - he stops where he was, never pushed or slid along it
         float nx = lx + bx, nz = lz + bz;
-        if (fabsf(nz) < 45.0f && fabsf(nx) > 42.0f && pframe && frame - pframe < 4) nx = plx, nz = plz;
+        // (55: the opening is 70 to the frame - his centre comes to about his radius from it)
+        // (a wall takes only the part of his step that goes into it: from the doorway the sideways part, from the room
+        // the part toward the wall's face - what he walks along it is his own; nothing is added)
+        if (fabsf(nz) < 45.0f && fabsf(nx) > 55.0f && pframe && frame - pframe < 4) {
+            if (fabsf(plx) <= 55.0f) nx = plx;
+            else nz = plz;
+            g_trace_why |= 1;
+        }
         const float dx = nx - lx, dz = nz - lz;
         plx = nx, plz = nz, pframe = frame;
         for (unsigned i = 0; i < NCOPIES; i++) {
@@ -519,6 +547,7 @@ void door_step_tick(void) {
         LOG("[door] Link out of the doorway (%.0f %.0f)%s\n", lx, lz, crossed ? ": through, the door shuts behind him" : "");
         if (crossed) close_in = 60;
     }
+    if (door_open() != 0.0f && fabsf(lx) < 250 && fabsf(lz) < 250) door_trace(frame, lx, lz, inside);
 }
 
 // ---- the door object turned (its collision with it): its rotation, s16 x / y / z at +0x130 and a copy at +0x13c

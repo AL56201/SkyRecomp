@@ -382,6 +382,7 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
         s.r = get_float(ACT_R);
         const XrVector2f ls = get_vec2(ACT_LEFT_STICK), rs = get_vec2(ACT_RIGHT_STICK);
         s.stick[0][0] = ls.x; s.stick[0][1] = ls.y;
+        { extern float g_door_stick; g_door_stick = sqrtf(ls.x * ls.x + ls.y * ls.y); }  // (hle/door.c trace)
         s.stick[1][0] = rs.x; s.stick[1][1] = rs.y;
         for (int h = 0; h < 2; h++) locate_hand(aim_space[h], space, time, &s.hand[h]);
     }
