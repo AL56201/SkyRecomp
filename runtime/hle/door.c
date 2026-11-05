@@ -797,14 +797,17 @@ void door_step_tick(void) {
         // - so he is never shut in behind it
         static float pl_x, pl_z;
         static uint64_t pl_frame;
-        const float o = door_open(), hx = door_hinge_x(), len = -2 * hx, R = 15.0f;
+        // (both faces, at about Link's own width - 34, the game's walls hold his centre that far - so his eyes never
+        // go into it; the leaf swung over him still moves nothing: from inside R a step is left alone)
+        const float o = door_open(), hx = door_hinge_x(), len = -2 * hx, R = 30.0f;
         const float ex = cosf(o), ez = -sinf(o);  // (the leaf's direction in the door's frame: Ry(open) of x)
         float nx = -ez, nz = ex;
-        if (nx < 0) nx = -nx, nz = -nz;
         if (fabsf(o) > 0.02f && pl_frame && frame - pl_frame < 4) {
             const float t = (lx - hx) * ex + lz * ez, tp = (pl_x - hx) * ex + pl_z * ez;
-            const float along = (lx - hx) * nx + lz * nz, along_p = (pl_x - hx) * nx + pl_z * nz;
-            if (t > 0 && t < len && tp > 0 && tp < len && along_p >= R && along < R) {
+            const float along_p0 = (pl_x - hx) * nx + pl_z * nz;
+            if (along_p0 < 0) nx = -nx, nz = -nz;  // (the face he was on)
+            const float along = (lx - hx) * nx + lz * nz, along_p = fabsf(along_p0);
+            if (t > -R && t < len + R && tp > -R && tp < len + R && along_p >= R && along < R) {
                 const float back = R - along;  // (no more than his own step brought him in)
                 g_trace_why |= 2;
                 for (unsigned i = 0; i < NCOPIES; i++) {
