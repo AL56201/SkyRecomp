@@ -1,4 +1,4 @@
-﻿// VR camera rig (see vr_rig.h): the eye cameras, Link's own draws hidden in 1st person, and culling.
+// VR camera rig (see vr_rig.h): the eye cameras, Link's own draws hidden in 1st person, and culling.
 #include "vr_rig_internal.h"
 
 #include <math.h>
@@ -438,6 +438,7 @@ static bool planar_reflection(const float v[12], const float g[12]) {
 static int g_hand_draw = -1;
 static uint64_t g_hand_count_cur;  // (the hand draw's index count: which pose's mesh)
 static bool hand_block(const VrRigAnchor *a, const float reference[7], const float game[12], float out[12]);
+static void update_controller_poses(const VrRigAnchor *a, const float reference[7]);
 static float g_hand_orig[12], g_hand_repl[12];
 static bool g_hand_blocks;
 static bool g_door_blocks;  // (vr_rig_door_draw) this draw is the door's leaf, turned: g_hand_orig -> g_hand_repl
@@ -522,6 +523,7 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
     }
     float view[12];
     if (!vr_rig_view(&a, reference, eye, vr_rig_units_per_metre(), view)) return false;
+    if (source == 0) update_controller_poses(&a, reference);  // (on the real game camera only: vr_rig_controller_pose)
     // Link's hand: on its controller - its own view block replaced (game camera x the controller's hand frame), so
     // its lighting turns with it too
     float hand_mono[28];
@@ -643,6 +645,39 @@ bool vr_rig_controller_world(int side, float w[3]) {
         return false;
     memcpy(w, g_ctrl_world[side], sizeof g_ctrl_world[side]);
     return true;
+}
+
+// Each controller's whole grip pose in the game world (row-major 3x4: the grip's axes - x right, y up, -z forward,
+// the way a held sword points - and its position), refreshed by every eye camera (eye_camera below) from the same
+// anchor the eyes use. For game hooks that need the hand as an object (runtime/hle/vr_sword.c).
+static float g_ctrl_pose[2][12];
+static uint64_t g_ctrl_pose_frame[2];
+static pthread_mutex_t g_ctrl_pose_lock = PTHREAD_MUTEX_INITIALIZER;  // (written by the replay thread, read by the game)
+bool vr_rig_controller_pose(int side, float c[12]) {
+    extern uint64_t renderer_present_count(void);
+    if (side < 0 || side > 1) return false;
+    pthread_mutex_lock(&g_ctrl_pose_lock);
+    const bool ok = g_ctrl_pose_frame[side] && g_ctrl_pose_frame[side] + 3 >= renderer_present_count() + 1;
+    if (ok) memcpy(c, g_ctrl_pose[side], sizeof g_ctrl_pose[side]);
+    pthread_mutex_unlock(&g_ctrl_pose_lock);
+    return ok;
+}
+static void update_controller_poses(const VrRigAnchor *a, const float reference[7]) {
+    extern uint64_t renderer_present_count(void);
+    pthread_mutex_lock(&g_ctrl_pose_lock);
+    for (int side = 0; side < 2; side++) {
+        if (!g_grip_ok[side]) continue;
+        float rel[9], off[3], rc[9], p[3];
+        vr_rig_relative(reference, g_grip[side], vr_rig_units_per_metre(), rel, off);
+        m_mul(a->rotation, rel, rc);
+        m_vec(a->rotation, off, p);
+        for (int i = 0; i < 3; i++) {
+            g_ctrl_pose[side][i * 4 + 0] = rc[i * 3 + 0], g_ctrl_pose[side][i * 4 + 1] = rc[i * 3 + 1];
+            g_ctrl_pose[side][i * 4 + 2] = rc[i * 3 + 2], g_ctrl_pose[side][i * 4 + 3] = p[i] + a->origin[i];
+        }
+        g_ctrl_pose_frame[side] = renderer_present_count() + 1;
+    }
+    pthread_mutex_unlock(&g_ctrl_pose_lock);
 }
 
 // Where the game puts Link's hand (game world, the wrist) - last drawn within 2 frames
