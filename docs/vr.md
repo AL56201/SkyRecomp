@@ -186,6 +186,29 @@ game's eye point stays at the surface.
 1st person moves the near plane to 15 units (`SKYRECOMP_VR_NEAR`) so Link's own head is clipped. Checked in Skyloft
 against near = 1: only the head pieces differ (no fog, depth-of-field or depth-fighting change).
 
+### The aiming reticle at the shot's end point (`runtime/hle/vr_aim.c`)
+
+On the flat HUD panel, the Slingshot's, Bow's, Clawshots' and Gust Bellows' reticle sits at the panel's distance,
+which doesn't match where the shot goes. With **Aiming Reticle in 3D** (`aim_reticle_3d`, on), its pieces are drawn
+in each eye's own picture instead, moved to where the shot will land:
+
+- **Which draws are the reticle:** the pieces are known by their texture names (`th_sling*`, `th_arrowCursor*`,
+  `th_hook*`, `th_vaccume*`: texpatch role `R_AIM`). The plain `th_circle*` (the Slingshot's dot) counts only after a
+  real piece in the same frame, because other screens draw it too.
+- **The end point:** the game keeps no "where it lands" point. 48 points along the game camera's aim line, through
+  the reticle's centre and 20 to 5000 units ahead, are projected into eye 0's picture. `exec.c aim_probe` copies the
+  scene's depth at those points into a small host buffer and reads it a frame or two later, without waiting.
+  `vr_aim_result` takes the first place where the line passes behind a surface between two neighbouring samples; a
+  surface merely in front of the line (a hand) doesn't count. With no surface, it takes the end of the range.
+- **Each eye's camera:** `vr_aim_camera` gets each eye's main-view camera from its scene draws into the frame's largest
+  depth target. The eye block times the inverse of the game block cancels the draw's model, and hand and door draws are
+  skipped, since their blocks were replaced. `vr_aim_shift` then moves each piece by the difference between where the
+  point falls in that eye and on the game's screen, in the 2D block's translation (floats 19 and 23).
+
+The reticle stays on the panel as before when there's no end point or eye camera yet, in a multiview pass (one
+recording for both eyes can't move it per eye), and behind menus. `SKYRECOMP_VR_NO_AIM=1` turns it off and
+`SKYRECOMP_AIM_LOG=1` logs the end point and its depth samples.
+
 ### The sword's hits follow your hand (`runtime/hle/vr_sword.c`)
 
 VR Options > Sword Hits Follow Your Hand (`sword_hitbox` in `[VR]`, on by default; 1st person). The game keeps Link's

@@ -131,6 +131,7 @@ std::vector<std::string> vr_lines() {
             std::string("wrist_hud = ") + (g_vr_hud_config.wrist_hud ? "true" : "false"),
             std::string("wrist_hud_glance = ") + (g_vr_hud_config.wrist_hud_glance ? "true" : "false"),
             std::string("wrist_hud_swap_hands = ") + (g_vr_hud_config.wrist_hud_swap_hands ? "true" : "false"),
+            std::string("aim_reticle_3d = ") + (g_vr_hud_config.aim_reticle_3d ? "true" : "false"),
             "wrist_hud_size = " + wrist_size.str(), "wrist_hud_side = " + wrist_side.str(),
             "wrist_hud_up = " + wrist_up.str(), "wrist_hud_forward = " + wrist_forward.str(),
             "wrist_hud_tilt = " + wrist_tilt.str(), "wrist_hud_background = " + wrist_background.str(),
@@ -184,6 +185,7 @@ extern "C" void LoadVRConfig(const char *filepath) {
         else if (key == "wrist_hud") parse_bool(value, g_vr_hud_config.wrist_hud);
         else if (key == "wrist_hud_glance") parse_bool(value, g_vr_hud_config.wrist_hud_glance);
         else if (key == "wrist_hud_swap_hands") parse_bool(value, g_vr_hud_config.wrist_hud_swap_hands);
+        else if (key == "aim_reticle_3d") parse_bool(value, g_vr_hud_config.aim_reticle_3d);
         else if (key == "wrist_hud_size") parse_float(value, g_vr_hud_config.wrist_hud_size);
         else if (key == "wrist_hud_side") parse_float(value, g_vr_hud_config.wrist_hud_side);
         else if (key == "wrist_hud_up") parse_float(value, g_vr_hud_config.wrist_hud_up);

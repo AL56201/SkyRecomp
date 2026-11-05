@@ -94,6 +94,11 @@ typedef struct VRHUDConfig {
         = -0.1f
 #endif
         ;                         // metres above (+) / below (-) eye level (-1..1)
+    bool aim_reticle_3d
+#ifdef __cplusplus
+        = true
+#endif
+        ;                         // an aiming item's reticle at the shot's end point in the world (hle/vr_aim.c)
 } VRHUDConfig;
 
 extern VRHUDConfig g_vr_hud_config;
