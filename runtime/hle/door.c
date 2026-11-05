@@ -161,6 +161,136 @@ bool door_at(void) {
     return dx * dx + dz * dz < DOOR_REACH * DOOR_REACH;
 }
 
+// The searches for a door (its leaf, its object, its collision - ~40 ms, and the first look for the rooms' .kcl
+// files ~1.7 s) run on a thread of their own: on the frame's thread they stopped the headset's picture
+#include <pthread.h>
+static uint64_t g_door_job;           // (the leaf found - adopted by door_track)
+static _Atomic int g_job_state;       // 0 idle, 1 running, 2 done
+static float g_job_eye[3];
+static void *door_job(void *arg) {
+    (void)arg;
+    float eye[3];
+    memcpy(eye, g_job_eye, sizeof eye);
+    const uint64_t t0 = plat_now_ns();
+    g_door_job = scan(eye);
+    LOG("[door] timing: leaf scan %.1f ms\n", (plat_now_ns() - t0) / 1e6);
+    if (g_door_job) {
+        g_door_flip = false;
+        take((const float *)(uintptr_t)g_door_job);
+        extern uint64_t door_find_actor(const float m[12]);
+        g_door_actor_found = door_find_actor(g_door_m);
+        const uint64_t t1 = plat_now_ns();
+        door_tris_set(false), door_find_tris(g_door_m);
+        const uint64_t t2 = plat_now_ns();
+        door_find_prisms(g_door_m);
+        LOG("[door] timing: object %.1f ms, triangles %.1f ms, kcl %.1f ms\n", (t1 - t0) / 1e6, (t2 - t1) / 1e6, (plat_now_ns() - t2) / 1e6);
+        if (getenv("SKYRECOMP_DOOR_KCL")) {  // (RE: the rooms' collision in memory - the doorway's prisms 914 / 8771)
+            static const uint8_t pat[2][16] = {
+                {0x43, 0x86, 0x97, 0x0a, 0x01, 0x2a, 0x08, 0x6d, 0x08, 0x72, 0x08, 0x6f, 0x00, 0x7a, 0x00, 0x08},
+                {0x43, 0x86, 0x97, 0x0a, 0x09, 0xbb, 0x06, 0xb2, 0x61, 0xfb, 0x06, 0xb3, 0x00, 0x04, 0x00, 0x09}};
+            uint8_t le[2][16];
+            for (int k = 0; k < 2; k++) {  // (little-endian: the float and each u16 swapped)
+                le[k][0] = pat[k][3], le[k][1] = pat[k][2], le[k][2] = pat[k][1], le[k][3] = pat[k][0];
+                for (int j = 4; j < 16; j += 2) le[k][j] = pat[k][j + 1], le[k][j + 1] = pat[k][j];
+            }
+            extern uint64_t kernel_heap_size(void);
+            extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+            uint64_t ra[64], rs[64];
+            const int nr = kernel_data_regions(ra, rs, 64);
+            for (int r = 0; r < nr; r++) LOG("[door] region %#llx + %#llx\n", (unsigned long long)ra[r], (unsigned long long)rs[r]);
+            for (int r = 0; r < nr; r++)
+                for (uint64_t a = ra[r]; a + 16 <= ra[r] + rs[r]; a += 4)
+                    for (int k = 0; k < 2; k++) {
+                        if (!memcmp((const void *)(uintptr_t)a, pat[k], 16)) LOG("[door] kcl prism %s (big-endian) at %#llx\n", k ? "8771" : "914", (unsigned long long)a);
+                        if (!memcmp((const void *)(uintptr_t)a, le[k], 16)) LOG("[door] kcl prism %s (little-endian) at %#llx\n", k ? "8771" : "914", (unsigned long long)a);
+                    }
+            {   // the kcl2 copy: room 1's triangle 913 (the doorway's), 36 bytes - flattened with its neighbour 914 if
+                // SKYRECOMP_DOOR_KCL_OFF, every triangle of the room if SKYRECOMP_DOOR_KCL_ALL
+                static const uint8_t tri[36] = {0x85, 0x2b, 0x57, 0x44, 0x0a, 0x97, 0x86, 0x43, 0x9a, 0xed, 0x0a, 0xc5,
+                                                0x85, 0x2b, 0x57, 0x44, 0x00, 0x00, 0x00, 0x00, 0x9a, 0xed, 0x0a, 0xc5,
+                                                0xf8, 0x36, 0x32, 0x44, 0x00, 0x00, 0x00, 0x00, 0xea, 0x19, 0x07, 0xc5};
+                for (int r = 0; r < nr; r++)
+                    for (uint64_t a = ra[r]; a + 36 <= ra[r] + rs[r]; a += 4)
+                        if (!memcmp((const void *)(uintptr_t)a, tri, 36)) {
+                            LOG("[door] kcl2 triangle 913 at %#llx\n", (unsigned long long)a);
+                            const char *only = getenv("SKYRECOMP_DOOR_KCL_COPY");  // (test: only the copy in this range)
+                            if (only && (a >> 28) != strtoull(only, NULL, 16)) continue;  // (e.g. 700 or 701)
+                            if (getenv("SKYRECOMP_DOOR_KCL_OFF")) {
+                                float *t = (float *)(uintptr_t)a;
+                                const int count = getenv("SKYRECOMP_DOOR_KCL_ALL") ? 929 : 2;
+                                float *t0 = getenv("SKYRECOMP_DOOR_KCL_ALL") ? t - 9 * 913 : t;
+                                for (int i = 0; i < count; i++)
+                                    for (int j = 3; j < 9; j++) t0[9 * i + j] = t0[9 * i + j % 3];  // (all three corners at the first)
+                                LOG("[door] kcl2: %d triangles flattened\n", count);
+                            }
+                        }
+            }
+            LOG("[door] kcl search done (heap %#llx bytes)\n", (unsigned long long)kernel_heap_size());
+            if (getenv("SKYRECOMP_DOOR_KCL_OFF"))  // (test: the found prisms and the next one flattened)
+                for (int r = 0; r < nr; r++)
+                    for (uint64_t a = ra[r]; a + 16 <= ra[r] + rs[r]; a += 4)
+                        for (int k = 0; k < 2; k++)
+                            if (!memcmp((const void *)(uintptr_t)a, le[k], 16)) {
+                                *(float *)(uintptr_t)a = 0.0f, *(float *)(uintptr_t)(a + 16) = 0.0f;
+                                if (getenv("SKYRECOMP_DOOR_KCL_ALL") && k == 0)  // (test: every prism of Link's room)
+                                    for (int i = 1; i < 930; i++) *(float *)(uintptr_t)(a - 0x10 * 914 + 0x10 * i) = 0.0f;
+                                LOG("[door] flattened prisms at %#llx\n", (unsigned long long)a);
+                            }
+        }
+        if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: the colliders' words, as hex and float)
+            for (uint64_t o = 0x670; o < 0x738; o += 0x10) {
+                const uint32_t *w = (const uint32_t *)(uintptr_t)(g_door_actor_found + o);
+                LOG("[door] +%03llx: %08x %08x %08x %08x | %.2f %.2f %.2f %.2f\n", (unsigned long long)o, w[0], w[1], w[2], w[3],
+                    *(const float *)&w[0], *(const float *)&w[1], *(const float *)&w[2], *(const float *)&w[3]);
+            }
+        if (getenv("SKYRECOMP_DOOR_REFS")) {  // (RE: the vtables' entries)
+            static const uint64_t vts[] = {0x7001600da0ull, 0x700166e508ull, 0x700164ce50ull, 0x700164d6a0ull, 0x7001649878ull};
+            for (int v = 0; v < 5; v++) {
+                char line[1600];
+                int n = snprintf(line, sizeof line, "[door] vtable %#llx:", (unsigned long long)vts[v]);
+                for (int e = 0; e < 40; e++) n += snprintf(line + n, sizeof line - n, " %llx", (unsigned long long)*(const uint64_t *)(uintptr_t)(vts[v] + 8 * e));
+                LOG("%s\n", line);
+            }
+        }
+        if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: matrices at the door inside the door object)
+            for (uint64_t o = 0; o < 0x900; o += 4) {
+                const float *mm = (const float *)(uintptr_t)(g_door_actor_found + o);
+                if (fabsf(mm[3] - g_door_m[3]) < 2 && fabsf(mm[11] - g_door_m[11]) < 2 && level_matrix(mm))
+                    LOG("[door] matrix in the door object at +%#llx (x axis %.3f %.3f)\n", (unsigned long long)o, mm[0], mm[8]);
+            }
+        if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: what points at the door object - its collision body)
+            for (uint64_t a = HEAP_LO; a < HEAP_HI; a += 8)
+                for (int k = 0; k < 1 && g_door_actor_found; k++)
+                    if (*(const uint64_t *)(uintptr_t)a == g_door_actor_found) {
+                        uint64_t vt = 0, at = 0;
+                        for (uint64_t o = a & ~7ull; o + 0x400 > a && !vt; o -= 8) {
+                            const uint64_t v = *(const uint64_t *)(uintptr_t)o;
+                            if (v >= 0x7001400000ull && v < 0x7001800000ull) vt = v, at = o;
+                        }
+                        LOG("[door] ref to %#llx at %#llx (object %#llx +%#llx, vtable %#llx)\n",
+                            (unsigned long long)g_door_actor_found, (unsigned long long)a, (unsigned long long)at,
+                            (unsigned long long)(a - at), (unsigned long long)vt);
+                    }
+        g_door_snd = 0;  // (its sound source: vtable 0x700168ede0, 0x720 before the leaf's matrix in its block)
+        for (uint64_t o = g_door_job & ~7ull; o + 0x2000 > g_door_job && !g_door_snd; o -= 8)
+            if (*(const uint64_t *)(uintptr_t)o == 0x700168ede0ull) g_door_snd = o;
+        if (g_door_actor_found) {
+            // (the door object faces the other way from the drawn leaf: its yaw, s16 at +0x132, minus 180 degrees,
+            // is the leaf's - a copy turned the other way is turned back)
+            const float yaw = *(const int16_t *)(uintptr_t)(g_door_actor_found + 0x132) * (float)(M_PI / 32768) - (float)M_PI;
+            const float leaf = atan2f(-g_door_m[8], g_door_m[0]);
+            float d = leaf - yaw;
+            while (d > (float)M_PI) d -= 2 * (float)M_PI;
+            while (d < -(float)M_PI) d += 2 * (float)M_PI;
+            if (fabsf(d) > (float)(M_PI / 2)) g_door_flip = true, take((const float *)(uintptr_t)g_door_job);
+        }
+        LOG("[door] door at %.1f %.1f %.1f (matrix %#llx, x axis %.3f %.3f)\n", g_door_m[3], g_door_m[7], g_door_m[11],
+            (unsigned long long)g_door_job, g_door_m[0], g_door_m[8]);
+    }
+    atomic_store(&g_job_state, 2);
+    return NULL;
+}
+
 void door_track(void) {
     door_test_open();
     {   // (diagnostics) reaching / leaving a door
@@ -190,118 +320,16 @@ void door_track(void) {
     const uint64_t now = renderer_present_count();
     // (Link's +0x118 is not his action but the collision polygon he touches - 0x6a was one wall of his room - so a
     // door is found from the door objects instead: from either side, any door)
-    if (!g_door && door_object_near(eye) && now >= next_scan) {
+    if (!g_door && atomic_load(&g_job_state) == 2) {  // (a search finished: its door adopted)
+        g_door = g_door_job, atomic_store(&g_job_state, 0);
+    }
+    if (!g_door && door_object_near(eye) && now >= next_scan && atomic_load(&g_job_state) == 0) {
         next_scan = now + 30;
-        g_door = scan(eye);
-        if (g_door) {
-            g_door_flip = false;
-            take((const float *)(uintptr_t)g_door);
-            extern uint64_t door_find_actor(const float m[12]);
-            g_door_actor_found = door_find_actor(g_door_m);
-            door_tris_set(false), door_find_tris(g_door_m), door_find_prisms(g_door_m);
-            if (getenv("SKYRECOMP_DOOR_KCL")) {  // (RE: the rooms' collision in memory - the doorway's prisms 914 / 8771)
-                static const uint8_t pat[2][16] = {
-                    {0x43, 0x86, 0x97, 0x0a, 0x01, 0x2a, 0x08, 0x6d, 0x08, 0x72, 0x08, 0x6f, 0x00, 0x7a, 0x00, 0x08},
-                    {0x43, 0x86, 0x97, 0x0a, 0x09, 0xbb, 0x06, 0xb2, 0x61, 0xfb, 0x06, 0xb3, 0x00, 0x04, 0x00, 0x09}};
-                uint8_t le[2][16];
-                for (int k = 0; k < 2; k++) {  // (little-endian: the float and each u16 swapped)
-                    le[k][0] = pat[k][3], le[k][1] = pat[k][2], le[k][2] = pat[k][1], le[k][3] = pat[k][0];
-                    for (int j = 4; j < 16; j += 2) le[k][j] = pat[k][j + 1], le[k][j + 1] = pat[k][j];
-                }
-                extern uint64_t kernel_heap_size(void);
-                extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
-                uint64_t ra[64], rs[64];
-                const int nr = kernel_data_regions(ra, rs, 64);
-                for (int r = 0; r < nr; r++) LOG("[door] region %#llx + %#llx\n", (unsigned long long)ra[r], (unsigned long long)rs[r]);
-                for (int r = 0; r < nr; r++)
-                    for (uint64_t a = ra[r]; a + 16 <= ra[r] + rs[r]; a += 4)
-                        for (int k = 0; k < 2; k++) {
-                            if (!memcmp((const void *)(uintptr_t)a, pat[k], 16)) LOG("[door] kcl prism %s (big-endian) at %#llx\n", k ? "8771" : "914", (unsigned long long)a);
-                            if (!memcmp((const void *)(uintptr_t)a, le[k], 16)) LOG("[door] kcl prism %s (little-endian) at %#llx\n", k ? "8771" : "914", (unsigned long long)a);
-                        }
-                {   // the kcl2 copy: room 1's triangle 913 (the doorway's), 36 bytes - flattened with its neighbour 914 if
-                    // SKYRECOMP_DOOR_KCL_OFF, every triangle of the room if SKYRECOMP_DOOR_KCL_ALL
-                    static const uint8_t tri[36] = {0x85, 0x2b, 0x57, 0x44, 0x0a, 0x97, 0x86, 0x43, 0x9a, 0xed, 0x0a, 0xc5,
-                                                    0x85, 0x2b, 0x57, 0x44, 0x00, 0x00, 0x00, 0x00, 0x9a, 0xed, 0x0a, 0xc5,
-                                                    0xf8, 0x36, 0x32, 0x44, 0x00, 0x00, 0x00, 0x00, 0xea, 0x19, 0x07, 0xc5};
-                    for (int r = 0; r < nr; r++)
-                        for (uint64_t a = ra[r]; a + 36 <= ra[r] + rs[r]; a += 4)
-                            if (!memcmp((const void *)(uintptr_t)a, tri, 36)) {
-                                LOG("[door] kcl2 triangle 913 at %#llx\n", (unsigned long long)a);
-                                const char *only = getenv("SKYRECOMP_DOOR_KCL_COPY");  // (test: only the copy in this range)
-                                if (only && (a >> 28) != strtoull(only, NULL, 16)) continue;  // (e.g. 700 or 701)
-                                if (getenv("SKYRECOMP_DOOR_KCL_OFF")) {
-                                    float *t = (float *)(uintptr_t)a;
-                                    const int count = getenv("SKYRECOMP_DOOR_KCL_ALL") ? 929 : 2;
-                                    float *t0 = getenv("SKYRECOMP_DOOR_KCL_ALL") ? t - 9 * 913 : t;
-                                    for (int i = 0; i < count; i++)
-                                        for (int j = 3; j < 9; j++) t0[9 * i + j] = t0[9 * i + j % 3];  // (all three corners at the first)
-                                    LOG("[door] kcl2: %d triangles flattened\n", count);
-                                }
-                            }
-                }
-                LOG("[door] kcl search done (heap %#llx bytes)\n", (unsigned long long)kernel_heap_size());
-                if (getenv("SKYRECOMP_DOOR_KCL_OFF"))  // (test: the found prisms and the next one flattened)
-                    for (int r = 0; r < nr; r++)
-                        for (uint64_t a = ra[r]; a + 16 <= ra[r] + rs[r]; a += 4)
-                            for (int k = 0; k < 2; k++)
-                                if (!memcmp((const void *)(uintptr_t)a, le[k], 16)) {
-                                    *(float *)(uintptr_t)a = 0.0f, *(float *)(uintptr_t)(a + 16) = 0.0f;
-                                    if (getenv("SKYRECOMP_DOOR_KCL_ALL") && k == 0)  // (test: every prism of Link's room)
-                                        for (int i = 1; i < 930; i++) *(float *)(uintptr_t)(a - 0x10 * 914 + 0x10 * i) = 0.0f;
-                                    LOG("[door] flattened prisms at %#llx\n", (unsigned long long)a);
-                                }
-            }
-            if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: the colliders' words, as hex and float)
-                for (uint64_t o = 0x670; o < 0x738; o += 0x10) {
-                    const uint32_t *w = (const uint32_t *)(uintptr_t)(g_door_actor_found + o);
-                    LOG("[door] +%03llx: %08x %08x %08x %08x | %.2f %.2f %.2f %.2f\n", (unsigned long long)o, w[0], w[1], w[2], w[3],
-                        *(const float *)&w[0], *(const float *)&w[1], *(const float *)&w[2], *(const float *)&w[3]);
-                }
-            if (getenv("SKYRECOMP_DOOR_REFS")) {  // (RE: the vtables' entries)
-                static const uint64_t vts[] = {0x7001600da0ull, 0x700166e508ull, 0x700164ce50ull, 0x700164d6a0ull, 0x7001649878ull};
-                for (int v = 0; v < 5; v++) {
-                    char line[1600];
-                    int n = snprintf(line, sizeof line, "[door] vtable %#llx:", (unsigned long long)vts[v]);
-                    for (int e = 0; e < 40; e++) n += snprintf(line + n, sizeof line - n, " %llx", (unsigned long long)*(const uint64_t *)(uintptr_t)(vts[v] + 8 * e));
-                    LOG("%s\n", line);
-                }
-            }
-            if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: matrices at the door inside the door object)
-                for (uint64_t o = 0; o < 0x900; o += 4) {
-                    const float *mm = (const float *)(uintptr_t)(g_door_actor_found + o);
-                    if (fabsf(mm[3] - g_door_m[3]) < 2 && fabsf(mm[11] - g_door_m[11]) < 2 && level_matrix(mm))
-                        LOG("[door] matrix in the door object at +%#llx (x axis %.3f %.3f)\n", (unsigned long long)o, mm[0], mm[8]);
-                }
-            if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: what points at the door object - its collision body)
-                for (uint64_t a = HEAP_LO; a < HEAP_HI; a += 8)
-                    for (int k = 0; k < 1 && g_door_actor_found; k++)
-                        if (*(const uint64_t *)(uintptr_t)a == g_door_actor_found) {
-                            uint64_t vt = 0, at = 0;
-                            for (uint64_t o = a & ~7ull; o + 0x400 > a && !vt; o -= 8) {
-                                const uint64_t v = *(const uint64_t *)(uintptr_t)o;
-                                if (v >= 0x7001400000ull && v < 0x7001800000ull) vt = v, at = o;
-                            }
-                            LOG("[door] ref to %#llx at %#llx (object %#llx +%#llx, vtable %#llx)\n",
-                                (unsigned long long)g_door_actor_found, (unsigned long long)a, (unsigned long long)at,
-                                (unsigned long long)(a - at), (unsigned long long)vt);
-                        }
-            g_door_snd = 0;  // (its sound source: vtable 0x700168ede0, 0x720 before the leaf's matrix in its block)
-            for (uint64_t o = g_door & ~7ull; o + 0x2000 > g_door && !g_door_snd; o -= 8)
-                if (*(const uint64_t *)(uintptr_t)o == 0x700168ede0ull) g_door_snd = o;
-            if (g_door_actor_found) {
-                // (the door object faces the other way from the drawn leaf: its yaw, s16 at +0x132, minus 180 degrees,
-                // is the leaf's - a copy turned the other way is turned back)
-                const float yaw = *(const int16_t *)(uintptr_t)(g_door_actor_found + 0x132) * (float)(M_PI / 32768) - (float)M_PI;
-                const float leaf = atan2f(-g_door_m[8], g_door_m[0]);
-                float d = leaf - yaw;
-                while (d > (float)M_PI) d -= 2 * (float)M_PI;
-                while (d < -(float)M_PI) d += 2 * (float)M_PI;
-                if (fabsf(d) > (float)(M_PI / 2)) g_door_flip = true, take((const float *)(uintptr_t)g_door);
-            }
-            LOG("[door] door at %.1f %.1f %.1f (matrix %#llx, x axis %.3f %.3f)\n", g_door_m[3], g_door_m[7], g_door_m[11],
-                (unsigned long long)g_door, g_door_m[0], g_door_m[8]);
-        }
+        memcpy(g_job_eye, eye, sizeof g_job_eye);
+        atomic_store(&g_job_state, 1);
+        pthread_t th;
+        if (pthread_create(&th, NULL, door_job, NULL) == 0) pthread_detach(th);
+        else atomic_store(&g_job_state, 0);
     }
 }
 
@@ -575,16 +603,32 @@ static bool tri_in_doorway(const float m[12], const float c[3][3]) {
 }
 static void door_find_prisms(const float m[12]) {
     g_nprism = 0;
-    extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
-    uint64_t ra[64], rs[64];
-    const int nr = kernel_data_regions(ra, rs, 64);
+    // the loaded .kcl files: found once (a full look takes ~1.7 s) and kept while every one still has its header; looked
+    // for again when one is gone (another stage)
+    static uint64_t kcl[512];
+    static int nkcl = -1;
+    bool valid = nkcl > 0;
+    for (int i = 0; i < nkcl && valid; i++) valid = *(const uint32_t *)(uintptr_t)kcl[i] == 0x38;
+    if (!valid) {
+        nkcl = 0;
+        extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+        uint64_t ra[64], rs[64];
+        const int nr = kernel_data_regions(ra, rs, 64);
+        for (int r = 0; r < nr; r++)
+            for (uint64_t a = (ra[r] + 31) & ~31ull; a + 0x40 <= ra[r] + rs[r] && nkcl < 512; a += 32) {
+                const uint32_t *h = (const uint32_t *)(uintptr_t)a;
+                if (h[0] != 0x38 || !(h[1] > 0x38 && h[2] > h[1] && h[3] > h[2] && h[3] < 0x2000000)) continue;
+                const float thick = *(const float *)&h[4];
+                if (!(thick > 0.0f && thick < 1000.0f) || a + h[3] > ra[r] + rs[r]) continue;
+                kcl[nkcl++] = a;
+            }
+        LOG("[door] looked for the .kcl collision files: %d\n", nkcl);
+    }
     int files = 0;
-    for (int r = 0; r < nr; r++)
-        for (uint64_t a = (ra[r] + 31) & ~31ull; a + 0x40 <= ra[r] + rs[r]; a += 32) {
+    for (int f = 0; f < nkcl; f++)
+        {
+            const uint64_t a = kcl[f];
             const uint32_t *h = (const uint32_t *)(uintptr_t)a;
-            if (h[0] != 0x38 || !(h[1] > 0x38 && h[2] > h[1] && h[3] > h[2] && h[3] < 0x2000000)) continue;
-            const float thick = *(const float *)&h[4];
-            if (!(thick > 0.0f && thick < 1000.0f) || a + h[3] > ra[r] + rs[r]) continue;
             files++;
             const float *pos = (const float *)(uintptr_t)(a + h[0]), *nrm = (const float *)(uintptr_t)(a + h[1]);
             const uint32_t npos = (h[1] - h[0]) / 12, nnrm = (h[2] - h[1]) / 12, npr = (h[3] - h[2]) / 16;
