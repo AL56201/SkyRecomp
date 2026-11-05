@@ -85,7 +85,7 @@ void door_test_open(void);
 // The level's door objects (vtable DOOR_VTABLE, position at +0x144): found a slice of the heap per frame (a whole
 // scan at once is a hitch in the headset), dropped once their vtable is gone (the room unloaded)
 #define DOOR_VTABLE_ 0x7001600da0ull
-#define DOOR_REACH 90.0f  // (units, level: Link's eye from the door's origin - ~60 standing at it)
+#define DOOR_REACH 120.0f  // (units, level: Link's eye from the door's origin - ~60 standing at it)
 static uint64_t g_doors[64];
 static int g_ndoors;
 static bool door_object_near(const float eye[3]) {
@@ -137,7 +137,7 @@ void door_track(void) {
     if (g_door) {
         const float *m = (const float *)(uintptr_t)g_door;
         if (level_matrix(m) && near_link(m, eye)) take(m);
-        else g_door = 0;
+        else g_door = 0, door_set_open(0);  // (Link far from it: the door left open shuts)
     }
     static uint64_t next_scan;
     extern uint64_t renderer_present_count(void);

@@ -506,10 +506,13 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                     // (about the hinge, not the door's middle; carried on from the angle it already had)
                     const float hx = hl[0] - door_hinge_x();
                     if (!a0_set) a0 = atan2f(-hl[2], hx), open0 = door_open(), a0_set = true, a0_hand = hand;
-                    float a = atan2f(-hl[2], hx) - a0 + open0;
-                    while (a > (float)M_PI) a -= 2 * (float)M_PI;
-                    while (a < -(float)M_PI) a += 2 * (float)M_PI;
-                    const float lim = 75.0f * (float)(M_PI / 180);
+                    float d = atan2f(-hl[2], hx) - a0;
+                    while (d > (float)M_PI) d -= 2 * (float)M_PI;
+                    while (d < -(float)M_PI) d += 2 * (float)M_PI;
+                    // (gain, as ShipWright VR's door: a comfortable arm arc swings the full leaf - the hand's own
+                    // arc about the hinge is too small to keep up)
+                    const float a = open0 + 1.75f * d;
+                    const float lim = 90.0f * (float)(M_PI / 180);
                     door_set_open(fmaxf(-lim, fminf(lim, a)));
                     // as it starts to open, the room beyond is activated (hle/door.c - no door event: the door stays in
                     // the hand), so beyond the opening is never void
@@ -539,18 +542,15 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                 extern void door_set_open(float radians);
                 extern float door_open(void);
                 extern void door_request_step(void);
-                if (at_door && fabsf(door_open()) > 45.0f * (float)(M_PI / 180) && s.stick[0][1] > 0.5f) {
+                static uint64_t stepped;  // (when Link went through: the door shuts behind him a second later)
+                if (at_door && !stepped && fabsf(door_open()) > 45.0f * (float)(M_PI / 180) && s.stick[0][1] > 0.5f) {
                     LOG("[door] open %.0f deg, walking on: Link steps through\n", door_open() * 57.2958f);
                     door_request_step();
                     if (hand >= 0) haptic(hand, 0.4f, 30);
-                    hand = -1;
+                    hand = -1, stepped = SDL_GetTicksNS();
                 }
-                // the door stays open while Link is at it; once he has left it (through, or walked away) it swings
-                // shut a second later
-                static uint64_t left;
-                if (at_door || hand >= 0 || door_open() == 0.0f) left = 0;
-                else if (!left) left = SDL_GetTicksNS();
-                else if (SDL_GetTicksNS() - left > 1000000000ull) door_set_open(0), left = 0;
+                // otherwise the door stays as it was left (hle/door.c closes it once Link is far from it)
+                if (stepped && SDL_GetTicksNS() - stepped > 1000000000ull) door_set_open(0), stepped = 0;
             }
             // (at a door the grips are the gesture's, not the game's L / R: squeezed, they made Link leave the door)
             if ((at_door && gesture) || hand >= 0) s.l = s.r = 0;
