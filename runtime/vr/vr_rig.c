@@ -634,6 +634,9 @@ static float g_ctrl_world[2][3];
 static uint64_t g_ctrl_world_frame[2];
 static _Atomic int g_door_grab = -1;
 void vr_rig_door_grab(int side) { atomic_store(&g_door_grab, side); }
+// (vr_input.c) a hand near enough to take a handle: drawn on it in the holding pose - the face (+1 / -1), 0: not
+static _Atomic float g_door_hover[2];
+void vr_rig_door_hover(int side, float face) { if (side >= 0 && side < 2) atomic_store(&g_door_hover[side], face); }
 bool vr_rig_controller_world(int side, float w[3]) {
     extern uint64_t renderer_present_count(void);
     if (side < 0 || side > 1 || !g_ctrl_world_frame[side] || g_ctrl_world_frame[side] + 3 < renderer_present_count() + 1)
@@ -775,22 +778,47 @@ static bool hand_block(const VrRigAnchor *a, const float reference[7], const flo
         if (atomic_load(&g_door_grab) == side && door_handle_hand(h))  // (holding the door: the hand on its handle)
             for (int i = 0; i < 3; i++) c[i * 4 + 3] = h[i];
     }
-    {   // holding the door: the hand as the game's own door sequence has it - its relaxed hand at the knob, palm to the
-        // door, fingers up - turned with the leaf. Mesh frame: fingers +x, thumb +y, the right palm +z (the left -z).
-        extern bool door_handle_frame(float knob[3], float n[3]);
-        float knob[3], n[3];
-        if (atomic_load(&g_door_grab) == side && door_handle_frame(knob, n)) {
-            const float up[3] = {0, 1, 0};
-            float z[3], y[3];
-            const float pz = side == 1 ? 1.0f : -1.0f;  // (the palm's axis toward the door: right +z, left -z)
-            for (int i = 0; i < 3; i++) z[i] = -n[i] * pz;
-            y[0] = z[1] * up[2] - z[2] * up[1], y[1] = z[2] * up[0] - z[0] * up[2], y[2] = z[0] * up[1] - z[1] * up[0];  // (z x x)
+    {   // holding the door's handle, or near enough to take it (hovering): the hand as the game's own door sequence
+        // holds it - its rotation measured there (the left hand on the face Link stood at, in the door's frame), mirrored
+        // for the other face (half a turn about the door's vertical) and for the right hand (the door's x mirrored, and
+        // the mesh's z - the right mesh is the left one mirrored) - turned with the leaf; the fingers at the knob
+        static const float R_LEFT[9] = {0.133f, -0.407f, -0.903f, -0.948f, 0.215f, -0.236f, 0.290f, 0.887f, -0.357f};
+        const int grab = atomic_load(&g_door_grab);
+        const float hover = atomic_load(&g_door_hover[side]);
+        extern bool door_handle_pose(float face, float knob[3], float *face_out, float axes[9]);
+        float knob[3], face, ax[9];
+        if ((grab == side || hover != 0.0f) && door_handle_pose(grab == side ? 0.0f : hover, knob, &face, ax)) {
+            // (the mesh's axes - SKYRECOMP_DOOR_HAND_AXES=<fingers>,<palm>: 1 x, 2 y, 3 z, negative for the other way
+            // - default the mesh as hand_k describes it: fingers +x, the right palm +z, the left -z): fingers up, the palm
+            // to the door; the third axis completes a right-handed frame
+            static int fa = 0, pa = 0;
+            if (!fa) {
+                fa = 1, pa = 3;
+                const char *e = getenv("SKYRECOMP_DOOR_HAND_AXES");
+                if (e) sscanf(e, "%d,%d", &fa, &pa);
+            }
+            (void)R_LEFT;
+            float nface[3];
+            for (int q = 0; q < 3; q++) nface[q] = ax[q * 3 + 2] * face;
+            const float upw[3] = {0, 1, 0};
+            float tow[3] = {-nface[0], -nface[1], -nface[2]};  // (toward the door)
+            const int pal = side == 1 ? pa : -pa;              // (the left palm is the mirrored axis)
+            float col[3][3] = {{0}};
+            const int fi = abs(fa) - 1, pi = abs(pal) - 1, ti = 3 - fi - pi;
+            for (int q = 0; q < 3; q++) col[fi][q] = upw[q] * (fa < 0 ? -1.0f : 1.0f), col[pi][q] = tow[q] * (pal < 0 ? -1.0f : 1.0f);
+            {   // (the third: the cross product of the next two in order, x = y z, y = z x, z = x y)
+                const float *a1 = col[(ti + 1) % 3], *b1 = col[(ti + 2) % 3];
+                col[ti][0] = a1[1] * b1[2] - a1[2] * b1[1], col[ti][1] = a1[2] * b1[0] - a1[0] * b1[2], col[ti][2] = a1[0] * b1[1] - a1[1] * b1[0];
+            }
+            float wr[9];
+            for (int q = 0; q < 3; q++) wr[q * 3 + 0] = col[0][q], wr[q * 3 + 1] = col[1][q], wr[q * 3 + 2] = col[2][q];
             const float u = vr_rig_units_per_metre();
+            float n[3];  // (out of the held face, in the world)
+            for (int q = 0; q < 3; q++) n[q] = ax[q * 3 + 2] * face;
             float w[12];
-            for (int i = 0; i < 3; i++) {
-                w[i * 4 + 0] = up[i], w[i * 4 + 1] = y[i], w[i * 4 + 2] = z[i];
-                // (the wrist below the knob and a little off the face: the fingers' middle at the knob)
-                w[i * 4 + 3] = knob[i] - up[i] * 0.07f * u + n[i] * 0.03f * u;
+            for (int q = 0; q < 3; q++) {
+                w[q * 4 + 0] = wr[q * 3 + 0], w[q * 4 + 1] = wr[q * 3 + 1], w[q * 4 + 2] = wr[q * 3 + 2];
+                w[q * 4 + 3] = knob[q] - (q == 1 ? 0.07f * u : 0.0f) + n[q] * 0.03f * u;
             }
             a_mul(game, w, out);
             return true;

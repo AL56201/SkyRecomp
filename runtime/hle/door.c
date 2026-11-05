@@ -402,6 +402,24 @@ bool door_handle_frame(float knob[3], float out_n[3]) {
     for (int r = 0; r < 3; r++) out_n[r] = m[r * 4 + 0] * nl[0] + m[r * 4 + 1] * nl[1] + m[r * 4 + 2] * nl[2];
     return true;
 }
+// A handle's knob (face +1 / -1; 0: the held one) in the world, the face resolved, and the swung leaf's axes in the world
+// (columns: the door's x, y, z turned by the open angle)
+bool door_handle_pose(float face, float knob[3], float *face_out, float axes[9]) {
+    float m[12], eye[3];
+    if (!door_matrix(m) || !player_eye(eye)) return false;
+    if (face == 0.0f) face = g_handle_face;
+    if (face == 0.0f) {
+        const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
+        face = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;
+    }
+    if (!handle_face_at(face, HANDLE_Z, knob)) return false;
+    const float o = door_open(), c = cosf(o), s = sinf(o);
+    const float ry[9] = {c, 0, s, 0, 1, 0, -s, 0, c};
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 3; k++) axes[r * 3 + k] = m[r * 4 + 0] * ry[0 * 3 + k] + m[r * 4 + 1] * ry[1 * 3 + k] + m[r * 4 + 2] * ry[2 * 3 + k];
+    *face_out = face;
+    return true;
+}
 // The handle on one face (+1 / -1) - for reaching either
 bool door_handle_on(float face, float w[3]) { return handle_face_at(face, HANDLE_Z, w); }
 // A point in the world -> the door's frame (its closed frame: R^T (p - t)); false: no door

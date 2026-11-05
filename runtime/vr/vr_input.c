@@ -476,6 +476,10 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                 }
                 if (near[h] && have_handle && !hovering[h] && hand < 0) haptic(h, 0.15f, 10);
                 hovering[h] = near[h] && have_handle;
+                {   // (vr_rig.c) hovering: the hand shown on the handle in the holding pose - it can be taken
+                    extern void vr_rig_door_hover(int side, float face);
+                    vr_rig_door_hover(h, hovering[h] && hand < 0 ? near_face[h] : 0.0f);
+                }
             }
             if (at_door && gesture && hand < 0) {
                 for (int h = 0; h < 2 && hand < 0; h++)
