@@ -195,6 +195,40 @@ void door_track(void) {
             take((const float *)(uintptr_t)g_door);
             extern uint64_t door_find_actor(const float m[12]);
             g_door_actor_found = door_find_actor(g_door_m);
+            if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: the colliders' words, as hex and float)
+                for (uint64_t o = 0x670; o < 0x738; o += 0x10) {
+                    const uint32_t *w = (const uint32_t *)(uintptr_t)(g_door_actor_found + o);
+                    LOG("[door] +%03llx: %08x %08x %08x %08x | %.2f %.2f %.2f %.2f\n", (unsigned long long)o, w[0], w[1], w[2], w[3],
+                        *(const float *)&w[0], *(const float *)&w[1], *(const float *)&w[2], *(const float *)&w[3]);
+                }
+            if (getenv("SKYRECOMP_DOOR_REFS")) {  // (RE: the vtables' entries)
+                static const uint64_t vts[] = {0x7001600da0ull, 0x700166e508ull, 0x700164ce50ull, 0x700164d6a0ull, 0x7001649878ull};
+                for (int v = 0; v < 5; v++) {
+                    char line[1600];
+                    int n = snprintf(line, sizeof line, "[door] vtable %#llx:", (unsigned long long)vts[v]);
+                    for (int e = 0; e < 40; e++) n += snprintf(line + n, sizeof line - n, " %llx", (unsigned long long)*(const uint64_t *)(uintptr_t)(vts[v] + 8 * e));
+                    LOG("%s\n", line);
+                }
+            }
+            if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: matrices at the door inside the door object)
+                for (uint64_t o = 0; o < 0x900; o += 4) {
+                    const float *mm = (const float *)(uintptr_t)(g_door_actor_found + o);
+                    if (fabsf(mm[3] - g_door_m[3]) < 2 && fabsf(mm[11] - g_door_m[11]) < 2 && level_matrix(mm))
+                        LOG("[door] matrix in the door object at +%#llx (x axis %.3f %.3f)\n", (unsigned long long)o, mm[0], mm[8]);
+                }
+            if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: what points at the door object - its collision body)
+                for (uint64_t a = HEAP_LO; a < HEAP_HI; a += 8)
+                    for (int k = 0; k < 1 && g_door_actor_found; k++)
+                        if (*(const uint64_t *)(uintptr_t)a == g_door_actor_found) {
+                            uint64_t vt = 0, at = 0;
+                            for (uint64_t o = a & ~7ull; o + 0x400 > a && !vt; o -= 8) {
+                                const uint64_t v = *(const uint64_t *)(uintptr_t)o;
+                                if (v >= 0x7001400000ull && v < 0x7001800000ull) vt = v, at = o;
+                            }
+                            LOG("[door] ref to %#llx at %#llx (object %#llx +%#llx, vtable %#llx)\n",
+                                (unsigned long long)g_door_actor_found, (unsigned long long)a, (unsigned long long)at,
+                                (unsigned long long)(a - at), (unsigned long long)vt);
+                        }
             g_door_snd = 0;  // (its sound source: vtable 0x700168ede0, 0x720 before the leaf's matrix in its block)
             for (uint64_t o = g_door & ~7ull; o + 0x2000 > g_door && !g_door_snd; o -= 8)
                 if (*(const uint64_t *)(uintptr_t)o == 0x700168ede0ull) g_door_snd = o;
@@ -444,6 +478,17 @@ static void door_trace(uint64_t frame, float lx, float lz, bool inside) {
 }
 
 void door_step_tick(void) {
+    {   // (RE test) SKYRECOMP_DOOR_TEST_LIFTM=<offset hex>: the door object's 3x4 matrix at that offset lifted 500 every
+        // frame - does its collision follow it?
+        static long off = -2;
+        if (off == -2) off = getenv("SKYRECOMP_DOOR_TEST_LIFTM") ? strtol(getenv("SKYRECOMP_DOOR_TEST_LIFTM"), NULL, 16) : -1;
+        if (off >= 0 && g_door_actor_found) {
+            float *mm = (float *)(uintptr_t)(g_door_actor_found + (uint64_t)off);
+            static float y0 = 1e9f;
+            if (y0 == 1e9f) y0 = mm[7], LOG("[door] lifting the matrix at +%#lx (y %.1f, x %.1f z %.1f)\n", off, mm[7], mm[3], mm[11]);
+            mm[7] = y0 + 500.0f;
+        }
+    }
     // The door open wide: Link walks through its frame as through nothing. Inside the doorway his collision check is
     // skipped (the closed door's collision would stop him) and his height held (the skipped check is his floor's
     // too); he moves by his own walking. Crossed and out of the doorway on the other side, the door shuts behind him.
@@ -524,7 +569,7 @@ void door_step_tick(void) {
             const float sx = lx - plx, sz = lz - plz;
             const float sp = sqrtf(sx * sx + sz * sz);
             // (up to his walking pace, ~4 a frame - never past it: not a push)
-            if (sp > 0.1f && sp < 4.0f) bx = sx * (fminf(1.5f * sp, 4.0f) / sp - 1), bz = sz * (fminf(1.5f * sp, 4.0f) / sp - 1);
+            if (g_door_stick > 0.3f && sp > 0.1f && sp < 4.0f) bx = sx * (fminf(1.5f * sp, 4.0f) / sp - 1), bz = sz * (fminf(1.5f * sp, 4.0f) / sp - 1);
         }
         // the frame's sides are walls (his own check skipped): the doorway is |x| <= 42, the wall's face |z| = 45. A
         // step into one is not taken - he stops where he was, never pushed or slid along it
@@ -532,11 +577,17 @@ void door_step_tick(void) {
         // (55: the opening is 70 to the frame - his centre comes to about his radius from it)
         // (a wall takes only the part of his step that goes into it: from the doorway the sideways part, from the room
         // the part toward the wall's face - what he walks along it is his own; nothing is added)
-        if (fabsf(nz) < 45.0f && fabsf(nx) > 55.0f && pframe && frame - pframe < 4) {
-            if (fabsf(plx) <= 55.0f) nx = plx;
-            else nz = plz;
+        // (against his last place outside the walls, whatever frames were missed: a step that skipped the check had
+        // let him into the wall, slide inside it, and be shoved out by the game's own collision at the zone's edge)
+        static float okx, okz;
+        static bool ok_set;
+        if (!ok_set || frame - pframe > 30) okx = lx, okz = lz, ok_set = true;
+        if (fabsf(nz) < 45.0f && fabsf(nx) > 55.0f) {
+            if (fabsf(okx) <= 55.0f) nx = nx < 0 ? -55.0f : 55.0f;  // (from the doorway: its side)
+            else nz = okz < 0 ? -45.0f : 45.0f;                        // (from the room: the wall's face)
             g_trace_why |= 1;
         }
+        okx = nx, okz = nz;
         const float dx = nx - lx, dz = nz - lz;
         plx = nx, plz = nz, pframe = frame;
         for (unsigned i = 0; i < NCOPIES; i++) {
