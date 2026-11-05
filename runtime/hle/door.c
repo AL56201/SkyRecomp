@@ -7,6 +7,7 @@
 // found, so the matrix is found by scanning the object heap when Link reaches a door (his action 0x6a, player.c) and
 // followed from then on while it stays a level, orthonormal matrix near him.
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -227,6 +228,8 @@ void door_room_tick(Cpu *c) {
     memcpy(c->x, saved, sizeof saved);
     c->sp = sp, c->pc = pc;
     LOG("[door] activated room %d beyond the door (from room %d)\n", to, from);
+    extern void door_mark_activated(void);
+    door_mark_activated();
 }
 
 // ---- stepping through (the door's collision stays where the closed leaf is: the game's own sequence walks Link
@@ -238,10 +241,11 @@ void door_request_step(void) { atomic_store(&g_step_request, 1); }
 // (game thread) Link moved through the door: to the far side of its plane, `dist` units beyond it, at the doorway's
 // centre line (the door's origin is the doorway's middle - its leaf spans x -70 .. 70)
 void door_step_tick(void) {
-    if (!atomic_exchange(&g_step_request, 0)) return;
+    if (!atomic_load(&g_step_request)) return;
     float m[12], eye[3];
     const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
     if (!door_matrix(m) || !player_eye(eye) || link < 0x7000000000ull || link >= 0x7800000000ull) return;
+    atomic_store(&g_step_request, 0);
     const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
     const float side = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;  // (his z in the door's frame)
     const float dist = 90.0f;
@@ -252,10 +256,16 @@ void door_step_tick(void) {
     // (every copy of his x / z that followed him in the snapshot diff: x at these, z 8 bytes on)
     // (at a door, action 0x6a holds him in front of it: standing, 0x58, he stays where put)
     if (*(volatile uint32_t *)(uintptr_t)(link + 0x118) == 0x6a) *(volatile uint32_t *)(uintptr_t)(link + 0x118) = 0x58;
-    static const uint32_t copies[] = {0x1c, 0x48, 0x148, 0x15c, 0x220, 0x234, 0x2d8};
+    // (every float that held his x at the door, z 8 bytes on - snapshot search: also two just before the actor and
+    // one at +0x1634)
+    static const int32_t copies[] = {-0x254, -0x44, 0x1c, 0x48, 0x148, 0x15c, 0x220, 0x234, 0x2d8, 0x1634, 0x2940 + 0x144, 0x2940 + 0x1bc};
     for (unsigned i = 0; i < sizeof copies / sizeof *copies; i++) {
-        float *q = (float *)(uintptr_t)(link + copies[i]);
+        float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
         q[0] = x, q[2] = z;
+    }
+    {   // his wall check would push him back across the closed door's collision: skipped for his next few checks
+        extern volatile int g_fnprof, g_door_nowall;
+        g_door_nowall = 4; g_fnprof = 1;
     }
 }
 
@@ -279,3 +289,53 @@ void door_yaw_tick(void) {
         *y0 = y, *y1 = y;
     }
 }
+
+// (test) SKYRECOMP_DOOR_TEST_POSE=<file of "hex address hex u32" lines>: written every object update - the leaf's
+// matrices at the game's fully open pose, to see whether the door's collision follows them
+void door_pose_tick(void) {
+    static int n = -1;
+    static uint64_t addr[256];
+    static uint32_t val[256];
+    if (n < 0) {
+        n = 0;
+        const char *p = getenv("SKYRECOMP_DOOR_TEST_POSE");
+        FILE *f = p ? fopen(p, "r") : NULL;
+        unsigned long long a;
+        unsigned v;
+        while (f && n < 256 && fscanf(f, "%llx %x", &a, &v) == 2) addr[n] = a, val[n] = v, n++;
+        if (f) fclose(f);
+        if (n) LOG("[door] test pose: %d values\n", n);
+    }
+    if (!n || !g_door_actor_count) return;
+    for (int i = 0; i < n; i++) *(volatile uint32_t *)(uintptr_t)addr[i] = val[i];
+}
+
+// (test) SKYRECOMP_DOOR_TEST_LIFT=<units>: the door objects at the door lifted that far every object update (their
+// position y, +0x148) - is Link's "at a door" stop (and the door's collision) theirs?
+void door_lift_tick(void) {
+    static int on = -1;
+    static float up;
+    if (on < 0) on = getenv("SKYRECOMP_DOOR_TEST_LIFT") != NULL, up = on ? (float)atof(getenv("SKYRECOMP_DOOR_TEST_LIFT")) : 0;
+    if (!on) return;
+    static float base[8];
+    static uint64_t based[8];
+    for (int i = 0; i < g_door_actor_count; i++) {
+        float *y = (float *)(uintptr_t)(g_door_actors[i] + 0x148);
+        if (based[i] != g_door_actors[i]) based[i] = g_door_actors[i], base[i] = *y;
+        *y = base[i] + up;
+    }
+}
+
+// (test) SKYRECOMP_DOOR_TEST_LINK=<hex offset>,<hex u32>: Link's actor field held at that value every object update
+// once a door's room was activated - which of the fields the game's door sequence changes lets him walk through?
+static bool g_room_activated;
+void door_link_tick(void) {
+    static int on = -1;
+    static unsigned off, val;
+    if (on < 0) on = getenv("SKYRECOMP_DOOR_TEST_LINK") && sscanf(getenv("SKYRECOMP_DOOR_TEST_LINK"), "%x,%x", &off, &val) == 2;
+    if (!on || !g_room_activated) return;
+    const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
+    if (link >= 0x7000000000ull && link < 0x7800000000ull) *(volatile uint32_t *)(uintptr_t)(link + off) = val;
+}
+
+void door_mark_activated(void) { g_room_activated = true; }

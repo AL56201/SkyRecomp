@@ -328,6 +328,12 @@ static void pre_execute(Cpu *c) {
     door_step_tick();
     extern void door_yaw_tick(void);
     door_yaw_tick();
+    extern void door_pose_tick(void);
+    door_pose_tick();
+    extern void door_lift_tick(void);
+    door_lift_tick();
+    extern void door_link_tick(void);
+    door_link_tick();
     re_actors();
     re_room(c);
     if (world_in_menus()) {

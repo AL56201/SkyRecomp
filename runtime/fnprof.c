@@ -71,9 +71,12 @@ static void bt_check(uint64_t a, uint64_t lr, uint64_t x0) {
 
 // LARECOMP_FNPROF_WATCH=<hex address>: inside the window, the first function entered after the u32 there changes -
 // logged with its caller and chain (the writer is the function before it, or its caller)
+volatile uint64_t g_fnprof_watch;  // (set at run time: watch this address from now on)
 static void watch_check(uint64_t a, uint64_t lr) {
     static uint64_t addr = 1;
     static uint32_t last;
+    if (g_fnprof_watch) { addr = g_fnprof_watch; g_fnprof_watch = 0; last = *(volatile uint32_t *)(uintptr_t)addr; }
+    
     static int done;
     if (addr == 1) {
         const char *e = getenv("LARECOMP_FNPROF_WATCH");
@@ -108,7 +111,21 @@ static void watch_check(uint64_t a, uint64_t lr) {
     prev_a = a, prev_lr = lr;
 }
 
+// (door) while set, Link's own wall / ground check (f_7000facfe4 called from his update f_7000ab7cf4) is skipped:
+// bit 0 of its +100 flags, set on entry. The object is kept so the door can clear the bit again.
+volatile int g_door_nowall;
+volatile uint64_t g_door_nowall_obj;
+
 void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
+    if (g_door_nowall && a == 0x7000facfe4ull && lr >= 0x7000ab7cf4ull && lr < 0x7000ad99e4ull) {
+        // (a count of his checks to skip: the last one runs again, with the bit cleared)
+        if (--g_door_nowall > 0) *(volatile uint32_t *)(uintptr_t)(x0 + 100) |= 1;
+        else {
+            *(volatile uint32_t *)(uintptr_t)(x0 + 100) &= ~1u;
+            if (!getenv("LARECOMP_FNPROF")) g_fnprof = 0;  // (the entry hook done)
+        }
+        g_door_nowall_obj = x0;
+    }
     watch_check(a, lr);
     if (bt_n) bt_check(a, lr, x0);
     uint32_t h = (uint32_t)((a >> 2) * 0x9E3779B1u) & (NSLOT - 1);
