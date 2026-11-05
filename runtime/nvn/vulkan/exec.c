@@ -2796,6 +2796,25 @@ static VkDescriptorBufferInfo ubo_span(VkSpan s, uint64_t size) {
     return (VkDescriptorBufferInfo){s.buf, s.off, size > max ? max : size};
 }
 
+// VR aiming (runtime/hle/vr_aim.c; see aim_probe): the draw being set up is an aiming item's reticle piece, drawn in
+// the eye's own picture at the shot's end point. Each eye's main camera comes from its scene draws into this frame's
+// largest depth target (the main view's: reflections and shadows draw into smaller ones), and eye 0's depth is that
+// target.
+static bool g_aim_draw;
+static NvnTexture *g_aim_depth;
+static uint64_t g_aim_main_frame[2] = {~0ull, ~0ull};
+static uint32_t g_aim_main_w[2];
+static bool aim_main_target(int eye) {
+    NvnTexture *t = st.rt.depth;
+    if (!t || eye < 0 || eye > 1) return false;
+    const uint64_t f = renderer_present_count();
+    if (g_aim_main_frame[eye] != f) g_aim_main_w[eye] = 0, g_aim_main_frame[eye] = f;
+    if (t->width < g_aim_main_w[eye]) return false;
+    g_aim_main_w[eye] = t->width;
+    if (eye == 0) g_aim_depth = t;
+    return true;
+}
+
 // Constant buffer k of a stage (renderer.m bind_cbufs), copied into transient memory.
 static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32_t gx, uint32_t gy, uint32_t gz) {
     static const uint8_t zeros[0x10000];
@@ -2848,12 +2867,30 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // its camera at slot 2 while using it to project the reflection/refraction scene textures. Probe every fragment
     // uniform through the strict camera classifier so those screen-space effects use the same eye as their geometry.
     // Guest memory keeps the game's mono camera.
+    if (g_aim_draw && stage == 0 && idx == 0 && size >= 96) {  // VR aiming: a reticle piece, moved to the shot's end point
+        extern bool vr_aim_shift(int eye, const float proj[16], float delta[2]);
+        const float *u = (const float *)(uintptr_t)r.addr;
+        float dl[2];
+        if (vr_aim_shift((int)vk_vr_eye(), u, dl)) {
+            VkSpan s = vk_transient_copy(u, size, 256);
+            ((float *)s.ptr)[19] += dl[0];  // (the pane's matrix, rows at 16 and 20: its translation)
+            ((float *)s.ptr)[23] += dl[1];
+            return ubo_span(s, size);
+        }
+    }
     if (!g_draw_screen_composite && (stage == 0 || stage == 1) && (stage == 1 || idx == 0) &&
         size >= 28 * sizeof(float) && vr_stereo_active()) {
         float camera[28];
         const float *source = (const float *)(uintptr_t)r.addr;
         const bool camera_patched = stage == 1 ? vr_patch_scene_fragment_ubo(vk_vr_eye(), camera, source, size)
                                                : vr_patch_scene_ubo(vk_vr_eye(), camera, source, size);
+        if (camera_patched && stage == 0) {  // VR aiming (runtime/hle/vr_aim.c): the main view's camera per eye
+            float ho[12], hr[12];  // (not a hand's or the door's draw: its block was replaced before the eye's)
+            if (!vr_rig_hand_blocks(ho, hr) && aim_main_target((int)vk_vr_eye())) {
+                extern void vr_aim_camera(int eye, const float eye_block[28], const float game_block[28]);
+                vr_aim_camera((int)vk_vr_eye(), camera, source);
+            }
+        }
         if (camera_patched) {
             if (!vk_vr_eye()) g_stereo_camera_patched = true;
             // (a draw seen through a per-eye camera: this frame has a 3D scene - also the sky-only shots the
@@ -4220,6 +4257,7 @@ static void draw(CmdRec *r, bool indexed) {
     if (menu_sub) g_hud_sub_from = g_menu_screen, g_hud_sub_to = &g_hud_tex;
     eye_memo_rec = r;
     draw_(r, indexed);
+    g_aim_draw = false;  // (VR aiming: set by hud_route for this draw only)
     linear_rt_writeback();
     eye_memo_rec = NULL;
     if (menu_sub && !g_hud_active) g_hud_sub_from = g_hud_sub_to = NULL;
@@ -4233,10 +4271,108 @@ static void draw(CmdRec *r, bool indexed) {
     PROF_ADD(prof_draw);
 }
 
+// VR aiming (runtime/hle/vr_aim.c): the left eye's depth along the aim line. At the reticle's first draw of a frame
+// (eye 0), the depth at the points vr_aim_probe asks for is copied into a small host buffer of its own (two slots); a
+// slot is read once its submission has completed - a frame or two later, never waiting for the GPU.
+static void aim_probe(void) {
+    extern int vr_aim_probe(int slot, float u[], float v[], int max, bool flip_y, bool minus_one);
+    extern void vr_aim_result(int slot, const float scene[], int n);
+    static VkBuffer buf;
+    static VmaAllocation mem;
+    static uint8_t *ptr;
+    static struct { uint64_t seq; int n; VkFormat fmt; bool busy; } slot[2];
+    static uint64_t frame = ~0ull;
+    if (!buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 1024, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(g_vk.vma, &bi, &ai, &buf, &mem, &info) != VK_SUCCESS) { buf = VK_NULL_HANDLE; return; }
+        ptr = info.pMappedData;
+    }
+    const uint64_t done = vk_completed_seq();
+    for (int s = 0; s < 2; s++) {  // results that have arrived
+        if (!slot[s].busy || slot[s].seq > done) continue;
+        vmaInvalidateAllocation(g_vk.vma, mem, 0, VK_WHOLE_SIZE);
+        float v[64];
+        const uint8_t *q = ptr + s * 512;
+        for (int i = 0; i < slot[s].n; i++) {
+            uint32_t w;
+            memcpy(&w, q + i * 4, 4);
+            switch (slot[s].fmt) {
+            case VK_FORMAT_D16_UNORM: v[i] = (float)(w & 0xffff) / 65535.0f; break;
+            case VK_FORMAT_D24_UNORM_S8_UINT: case VK_FORMAT_X8_D24_UNORM_PACK32: v[i] = (float)(w & 0xffffff) / 16777215.0f; break;
+            default: memcpy(&v[i], &w, 4);
+            }
+        }
+        vr_aim_result(s, v, slot[s].n);
+        slot[s].busy = false;
+    }
+    const uint64_t f = renderer_present_count();
+    if (frame == f || g_aim_main_frame[0] != f || !g_aim_depth) return;  // (once a frame, with this frame's depth)
+    const int s = !slot[0].busy ? 0 : !slot[1].busy ? 1 : -1;
+    if (s < 0) return;
+    TexBackend *b = vk_tex(g_aim_depth, true);
+    if (!b || !b->image || b->samples > 1 || !(b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT)) return;
+    frame = f;
+    float u[64], v[64];
+    const int n = vr_aim_probe(s, u, v, 64, nvn_window_origin() == 0, nvn_depth_mode() == 0);
+    if (n <= 0) return;
+    VkBufferImageCopy rg[64];
+    for (int i = 0; i < n; i++) {
+        int x = (int)(u[i] * b->width), y = (int)(v[i] * b->height);
+        x = x < 0 ? 0 : x >= (int)b->width ? (int)b->width - 1 : x;
+        y = y < 0 ? 0 : y >= (int)b->height ? (int)b->height - 1 : y;
+        rg[i] = (VkBufferImageCopy){.bufferOffset = (VkDeviceSize)(s * 512 + i * 4),
+                                    .imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, b->layer0, 1},
+                                    .imageOffset = {x, y, 0}, .imageExtent = {1, 1, 1}};
+    }
+    vk_end_pass();
+    VkCommandBuffer cb = vk_cmd();
+    vk_full_barrier(cb);
+    vkCmdCopyImageToBuffer(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, buf, (uint32_t)n, rg);
+    vk_full_barrier(cb);
+    slot[s].seq = vk_pending_seq(), slot[s].n = n, slot[s].fmt = b->format, slot[s].busy = true;
+}
+
+// (hud_route) An aiming item's reticle piece in a frame with the 3D scene: true when it's drawn in each eye's own
+// picture, moved to the shot's end point (cbuf_info, g_aim_draw) rather than on the HUD panel. Not in a multiview
+// pass (one recording for both eyes: it can't move per eye) - it stays on the panel then.
+static bool aim_piece(Prog *pr, bool mv) {
+    extern bool vr_aim_enabled(void), vr_aim_ready(void);
+    extern void vr_aim_center(float x, float y);
+    extern const char *texpatch_aim_name(int id);
+    if (mv || !vr_aim_enabled() || !g_scene_since_present || vr_world_menu_active()) return false;
+    for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
+        NvnTexture *t = shader_texture_object(1, &pr->fi->tex[i]);
+        const TexBackend *b = t ? (const TexBackend *)t->backend : NULL;
+        const char *nm = b && b->tp > 0 ? texpatch_aim_name(b->tp - 1) : NULL;
+        if (!nm) continue;
+        // (plain circles - the Slingshot's dot - only after a real reticle piece this frame: other screens use them)
+        static uint64_t piece_frame[2] = {~0ull, ~0ull};
+        const int eye = (int)vk_vr_eye() & 1;
+        if (strncmp(nm, "th_circle", 9)) piece_frame[eye] = renderer_present_count();
+        else if (piece_frame[eye] != renderer_present_count()) return false;
+        const float *u = (const float *)(uintptr_t)st.ubuf[0][0].addr;  // (is_hud_draw: the 192-byte 2D block)
+        if (!eye) {
+            // its centre: an unrotated piece (the ring, the dot; the arrows are turned 45 degrees)
+            if (fabsf(u[17]) < 1e-4f && fabsf(u[20]) < 1e-4f) vr_aim_center(u[0] * u[19] + u[3], u[5] * u[23] + u[7]);
+            aim_probe();
+        }
+        if (!vr_aim_ready()) return false;  // (no end point or eye camera yet: on the panel, as before)
+        g_aim_draw = true;
+        static int said;
+        if (!said++) LOG("[vr] aiming: the reticle (%s) is drawn at the shot's end point\n", nm);
+        return true;
+    }
+    return false;
+}
+
 // (draw_, its program known) Where a 2D-layer draw goes. Some of the 2D layer's draws composite the 3D scene
 // (bloom, the title's haze): they read a texture made from this frame's scene and stay
 // in the eyes. The rest renders once, in eye 0, into the HUD texture; eye 1 skips it. False: skip the draw.
-static bool hud_route(Prog *pr) {
+static bool hud_route(Prog *pr, bool mv) {
+    if (aim_piece(pr, mv)) return true;  // (an aiming reticle: in the eyes, at the shot's end point)
     const uint64_t fr1 = renderer_present_count() + 1;
     const uint64_t fs = st.program ? st.program->stages[1].code_addr : 0;
     const uint64_t fs_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
@@ -4477,7 +4613,7 @@ static void draw_(CmdRec *r, bool indexed) {
     // A recognized full-view fill stays in the eyes while we decide whether it is a final veil or an opaque
     // background followed by scene content. Routing that native hold to the HUD leaves a black card over the
     // world even after later scene draws correctly cancel promotion to the final compositor fade.
-    if (g_hud_candidate && !view_fade_draw && !hud_route(pr)) {
+    if (g_hud_candidate && !view_fade_draw && !hud_route(pr, mv)) {
         stat_skipped++;
         return;
     }
