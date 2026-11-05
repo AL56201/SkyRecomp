@@ -520,9 +520,9 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                     float d = atan2f(-hl[2], hx) - a0;
                     while (d > (float)M_PI) d -= 2 * (float)M_PI;
                     while (d < -(float)M_PI) d += 2 * (float)M_PI;
-                    // (gain - ShipWright VR's door used 1.75, raised to 2.5: a comfortable arm arc swings the full leaf - the hand's own
+                    // (gain - ShipWright VR's door used 1.75, raised to 3: a comfortable arm arc swings the full leaf - the hand's own
                     // arc about the hinge is too small to keep up)
-                    const float a = open0 + 2.5f * d;
+                    const float a = open0 + 3.0f * d;
                     const float lim = 90.0f * (float)(M_PI / 180);
                     door_set_open(fmaxf(-lim, fminf(lim, a)));
                     // as it starts to open, the room beyond is activated (hle/door.c - no door event: the door stays in
