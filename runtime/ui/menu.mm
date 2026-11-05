@@ -856,6 +856,9 @@ static void tab_vr_options(void) {
                           "The menu panel's width. Applies the next time the menu opens.");
     changed |= opt_slider("Menu Height", &g_vr_hud_config.menu_height, -1.0f, 1.0f, 0.05f, -0.1f, "%+.2f m",
                           "Above or below eye level. Applies the next time the menu opens.");
+    changed |= opt_toggle("Aiming Reticle in 3D", &g_vr_hud_config.aim_reticle_3d, true,
+                          "The Slingshot's, Bow's, Clawshots' and Gust Bellows' reticle is drawn where the shot will "
+                          "land, at its depth in the world, instead of on the flat HUD panel.");
 
     opt_section("Wrist HUD");
     changed |= opt_toggle("Enable Wrist HUD", &g_vr_hud_config.wrist_hud, true,

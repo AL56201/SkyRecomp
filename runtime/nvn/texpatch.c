@@ -41,7 +41,7 @@
 enum { K_BC5, K_BC3, K_ASTC4, K_RGBA8, K_BC1, K_RG8, K_GR8 /* RG8, alpha in red */, K_R8 /* intensity = alpha */ };
 // roles: the prompt glyphs' R_A..R_MINUS / L_* (prompt_icons.h), then these
 enum { R_HERO = R_MINUS + 1, R_SHEET, R_PICTURE, R_BOTTLE, R_BOTTLE_MODEL, R_FAIRY_MODEL,
-       R_ITEM_CURSOR, R_TUNIC, R_TUNIC_RED, R_TUNIC_BLUE, R_HEART, R_POWDER_MODEL, R_BASICINFO_BG };
+       R_ITEM_CURSOR, R_TUNIC, R_TUNIC_RED, R_TUNIC_BLUE, R_HEART, R_POWDER_MODEL, R_BASICINFO_BG, R_AIM };
 enum { L_LS_CLICK = L_ARM_RIGHT + 1, L_RS_CLICK };  // (the picture font's stick presses: the click's own key on a keyboard)
 
 typedef struct {
@@ -117,6 +117,10 @@ static int role_of(const char *name) {
         {"Hp_00^w", R_HEART}, {"Hp_01^w", R_HEART}, {"Hp_02^w", R_HEART}, {"HeartUp^w", R_HEART},
         // the Items page's cursor brackets: identified only (hidden while the companion card has the cursor, pets.c)
         {"ItemCursor_", R_ITEM_CURSOR},
+        // aiming items' reticles (Main2D.arc): identified only - VR draws them at the shot's end point in 3D instead
+        // of on the HUD panel (runtime/nvn/vulkan/exec.c, runtime/hle/vr_aim.c)
+        {"th_slingS_", R_AIM}, {"th_sling_", R_AIM}, {"th_arrowCursor", R_AIM}, {"th_hookS_", R_AIM}, {"th_hook_", R_AIM},
+        {"th_vaccume", R_AIM}, {"th_circle", R_AIM},
     };
     for (unsigned i = 0; i < sizeof m / sizeof *m; i++)
         if (!strncmp(name, m[i].prefix, strlen(m[i].prefix))) return m[i].role;
@@ -437,6 +441,8 @@ static const uint8_t *seed_tunic(uint32_t *size) {
 static TexLayout g_tunic_layout;  // (the game's tunic texture: its levels' places in the map's data)
 static bool g_tunic_layout_ok;
 bool texpatch_is_item_cursor(int id) { return id >= 0 && id < g_nrefs && g_refs[id].role == R_ITEM_CURSOR; }
+// an aiming item's reticle piece: its texture's name, else NULL
+const char *texpatch_aim_name(int id) { return id >= 0 && id < g_nrefs && g_refs[id].role == R_AIM ? g_refs[id].name : NULL; }
 
 // The upload's texel i (lin: its level 0 as `kind`) as RGBA
 static void texel(const uint8_t *lin, int kind, size_t i, uint8_t p[4]) {
@@ -1087,7 +1093,7 @@ void texpatch_apply(int id, uint32_t lv, uint8_t *blocks, uint32_t w, uint32_t h
     if (r->role == R_TUNIC || r->role == R_TUNIC_RED || r->role == R_TUNIC_BLUE) { tunic_apply(lv, blocks, w, h, row); return; }
     if (lv || r->w != w || r->h != h) return;
     if (r->role == R_BOTTLE || r->role == R_BOTTLE_MODEL || r->role == R_FAIRY_MODEL || r->role == R_POWDER_MODEL ||
-        r->role == R_ITEM_CURSOR ||
+        r->role == R_ITEM_CURSOR || r->role == R_AIM ||
         r->role == R_HEART) return;
     if (r->role == R_HERO) {  // fully transparent (BC5 blocks of zeros)
         if (hide_hero()) for (uint32_t y = 0; y < (h + 3) / 4; y++) memset(blocks + y * row, 0, (w + 3) / 4 * 16);
