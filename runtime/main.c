@@ -192,6 +192,7 @@ static void boot(const char *root) {
     { extern void motion_vr_init(void); motion_vr_init(); }  // VR: skip the obsolete Joy-Con calibration modal
     { extern void vr_world_init(void); vr_world_init(); }  // (VR: the world keeps drawing behind the map)
     { extern void vr_cull_init(void); vr_cull_init(); }  // (VR: objects outside the game camera's view are drawn)
+    { extern void vr_sword_init(void); vr_sword_init(); }  // (VR: the sword's hits follow the blade in your hand)
 
     uint32_t stack_size = 0x100000;
     int prio = 44;

@@ -43,6 +43,9 @@ int vr_rig_hand_side(const float *slot0, uint64_t size0, uint64_t count, uint64_
 void vr_rig_set_hand_draw(int side);
 bool vr_rig_settling(void);  // 1st person, just spawned: Link's eye point not settled yet (the view is held black)
 bool vr_rig_hand_blocks(float orig[12], float repl[12]);  // (exec.c) this hand draw's view block: game's, replacement
+// A controller's grip pose in the game world (row-major 3x4: x right, y up, -z forward; game units), as of the last
+// eye camera drawn with the real game camera (within 3 frames). side: 0 left, 1 right. Any thread.
+bool vr_rig_controller_pose(int side, float c[12]);
 // Once per stereo frame: both eyes (pose, fov) -> the field of view the game culls with (vr_rig_cull_fov).
 void vr_rig_update_cull(const float reference[7], const float eye0[7], const float fov0[4], const float eye1[7],
                         const float fov1[4]);

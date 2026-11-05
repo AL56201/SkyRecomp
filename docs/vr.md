@@ -186,6 +186,27 @@ game's eye point stays at the surface.
 1st person moves the near plane to 15 units (`SKYRECOMP_VR_NEAR`) so Link's own head is clipped. Checked in Skyloft
 against near = 1: only the head pieces differ (no fog, depth-of-field or depth-fighting change).
 
+### The sword's hits follow your hand (`runtime/hle/vr_sword.c`)
+
+VR Options > Sword Hits Follow Your Hand (`sword_hitbox` in `[VR]`, on by default; 1st person). The game keeps Link's
+sword as a swept line in his actor at +0x66e4: the blade's tip (80 units along the sword model's +X from the hilt), a
+point 12 units along, and both of last frame's, in world space. Its hits come from that line: with the line moved
+2 m up (`SKYRECOMP_SWORD_SHIFT="0 200 0"`, a test) a swing at grass in front of Link cuts nothing. Link's update
+(main+0xab7cf4) writes it every frame and is called through his vtable, so it is wrapped with `hle_override`; after
+it runs, the line is replaced by the blade held by the right controller - along the grip's -z, 12 to 80 units out
+(`vr_rig_controller_pose`: the grip in the game world from the eyes' own anchor, updated by every eye camera drawn
+with the real game camera) - this frame's and the last frame's. The game still decides when Link swings (its motion
+controls); where the blade is when it does is the player's hand.
+
+Drawn or sheathed comes from the game's own line: its base point sits 19-20 units from Link's eye point
+(main+0x1829a30) while sheathed, 47-125 while drawn and swinging (measured in Faron Woods); above 30 for 3 frames it
+counts as drawn, below 25 for 10 frames as sheathed. Only Link's actor (`*(main+0x18299d0)`) is changed: the update
+also serves the title screen's Link. `SKYRECOMP_SWORD_LOG=1` logs the line written every 120 frames.
+
+The line, the update and the hit test were found with a memory search for positions that keep their place in the
+drawn hilt's frame while the sword swings, and by watching which functions write them; the effect was confirmed in
+play (grass and the training logs cut where the controller's blade passes).
+
 ### Frame rate and pacing
 
 - The frame rate setting (Video > Frame rate) offers 60, 120 and 144 FPS. The Skyward Sword simulation step follows
