@@ -477,7 +477,9 @@ static void activate_room(Cpu *c, int to, int from) {
     memcpy(saved, c->x, sizeof saved);
     const uint64_t sp = c->sp, pc = c->pc;
     c->x[0] = *(const uint64_t *)(uintptr_t)ROOMS_PTR, c->x[1] = (uint64_t)to, c->x[2] = (uint64_t)from;
+    const uint64_t ta = plat_now_ns();
     guest_call(c, 0x7000e0854cull);
+    LOG("[door] timing: room activation %.1f ms\n", (plat_now_ns() - ta) / 1e6);
     memcpy(c->x, saved, sizeof saved);
     c->sp = sp, c->pc = pc;
 }
@@ -520,7 +522,9 @@ void door_room_tick(Cpu *c) {
     memcpy(saved, c->x, sizeof saved);
     const uint64_t sp = c->sp, pc = c->pc;
     c->x[0] = rooms, c->x[1] = (uint64_t)to, c->x[2] = (uint64_t)from;
+    const uint64_t ta = plat_now_ns();
     guest_call(c, 0x7000e0854cull);
+    LOG("[door] timing: room activation %.1f ms\n", (plat_now_ns() - ta) / 1e6);
     memcpy(c->x, saved, sizeof saved);
     c->sp = sp, c->pc = pc;
     LOG("[door] activated room %d beyond the door (from room %d)\n", to, from);

@@ -522,3 +522,111 @@ void astc_decode_ldr(const uint8_t *blocks, uint32_t width, uint32_t height, uin
         }
     }
 }
+
+// The same, its block rows split in bands over several threads - large textures. On a GPU without ASTC every one is
+// decoded here the first time it is drawn; a room first seen (through a door) brought ~380 at once: ~200 ms of decoding
+// on the frame's thread. Small textures stay on the caller's thread (a thread costs more than they do).
+#include <pthread.h>
+typedef struct { const uint8_t *blocks; uint32_t width, height, bw, bh; bool srgb; uint8_t *out; } AstcBand;
+static void *astc_band(void *arg) {
+    const AstcBand *b = arg;
+    astc_decode_ldr(b->blocks, b->width, b->height, b->bw, b->bh, b->srgb, b->out);
+    return NULL;
+}
+void astc_decode_ldr_mt(const uint8_t *blocks, uint32_t width, uint32_t height, uint32_t bw, uint32_t bh, bool srgb,
+                        uint8_t *rgba_out) {
+    if (bw < 4 || bh < 4 || bw > 12 || bh > 12) return;
+    const uint32_t bx = (width + bw - 1) / bw, by = (height + bh - 1) / bh;
+    enum { MAXT = 8 };
+    uint32_t nt = (uint32_t)((uint64_t)bx * by / 2048);  // (a band per ~2048 blocks, up to 8)
+    if (nt > MAXT) nt = MAXT;
+    if (nt > by) nt = by;
+    if (nt < 2) { astc_decode_ldr(blocks, width, height, bw, bh, srgb, rgba_out); return; }
+    AstcBand band[MAXT];
+    pthread_t th[MAXT];
+    bool started[MAXT] = {0};
+    const uint32_t rows = (by + nt - 1) / nt;  // (block rows a band)
+    uint32_t n = 0;
+    for (uint32_t j0 = 0; j0 < by; j0 += rows, n++) {
+        const uint32_t y0 = j0 * bh, h = height - y0 < rows * bh ? height - y0 : rows * bh;
+        band[n] = (AstcBand){blocks + 16 * (size_t)j0 * bx, width, h, bw, bh, srgb, rgba_out + (size_t)y0 * width * 4};
+        if (n > 0) started[n] = pthread_create(&th[n], NULL, astc_band, &band[n]) == 0;
+        if (n > 0 && !started[n]) astc_band(&band[n]);  // (no thread: here)
+    }
+    astc_band(&band[0]);  // (the first band on this thread)
+    for (uint32_t i = 1; i < n; i++)
+        if (started[i]) pthread_join(th[i], NULL);
+}
+
+// A batch of decodes (a texture's levels and layers) over a pool of worker threads kept running: large ones split
+// in bands, small ones spread whole - a texture's hundreds of small mip levels went one after another.
+#include <stdatomic.h>
+#include <stdlib.h>
+enum { POOL = 8, MAXJOBS = 4096 };
+static pthread_mutex_t pool_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t pool_cv = PTHREAD_COND_INITIALIZER, pool_done = PTHREAD_COND_INITIALIZER;
+static AstcBand pool_job[MAXJOBS];
+static int pool_n, pool_next, pool_left;
+static bool pool_started;
+static pthread_mutex_t batch_lock = PTHREAD_MUTEX_INITIALIZER;  // (one batch at a time)
+static bool pool_take(AstcBand *out) {  // (pool_lock held)
+    if (pool_next >= pool_n) return false;
+    *out = pool_job[pool_next++];
+    return true;
+}
+static void pool_finish(void) {  // (pool_lock held)
+    if (--pool_left == 0) pthread_cond_broadcast(&pool_done);
+}
+static void *pool_worker(void *arg) {
+    (void)arg;
+    pthread_mutex_lock(&pool_lock);
+    for (;;) {
+        AstcBand j;
+        while (!pool_take(&j)) pthread_cond_wait(&pool_cv, &pool_lock);
+        pthread_mutex_unlock(&pool_lock);
+        astc_band(&j);
+        pthread_mutex_lock(&pool_lock);
+        pool_finish();
+    }
+    return NULL;
+}
+void astc_decode_batch(const AstcJob *jobs, int n) {
+    pthread_mutex_lock(&batch_lock);
+    pthread_mutex_lock(&pool_lock);
+    if (!pool_started) {
+        pool_started = true;
+        for (int i = 0; i < POOL; i++) {
+            pthread_t th;
+            if (pthread_create(&th, NULL, pool_worker, NULL) == 0) pthread_detach(th);
+        }
+    }
+    pool_n = pool_next = 0;
+    for (int i = 0; i < n; i++) {
+        const AstcJob *jb = &jobs[i];
+        if (jb->bw < 4 || jb->bh < 4 || jb->bw > 12 || jb->bh > 12) continue;
+        const uint32_t bx = (jb->width + jb->bw - 1) / jb->bw, by = (jb->height + jb->bh - 1) / jb->bh;
+        uint32_t nt = (uint32_t)((uint64_t)bx * by / 1024);  // (a band per ~1024 blocks)
+        if (nt < 1) nt = 1;
+        if (nt > POOL) nt = POOL;
+        if (nt > by) nt = by;
+        const uint32_t rows = (by + nt - 1) / nt;
+        for (uint32_t j0 = 0; j0 < by && pool_n < MAXJOBS; j0 += rows) {
+            const uint32_t y0 = j0 * jb->bh, h = jb->height - y0 < rows * jb->bh ? jb->height - y0 : rows * jb->bh;
+            pool_job[pool_n++] = (AstcBand){jb->blocks + 16 * (size_t)j0 * bx, jb->width, h, jb->bw, jb->bh, jb->srgb,
+                                            jb->out + (size_t)y0 * jb->width * 4};
+        }
+    }
+    pool_left = pool_n;
+    pthread_cond_broadcast(&pool_cv);
+    // (this thread works too)
+    AstcBand j;
+    while (pool_take(&j)) {
+        pthread_mutex_unlock(&pool_lock);
+        astc_band(&j);
+        pthread_mutex_lock(&pool_lock);
+        pool_finish();
+    }
+    while (pool_left > 0) pthread_cond_wait(&pool_done, &pool_lock);
+    pthread_mutex_unlock(&pool_lock);
+    pthread_mutex_unlock(&batch_lock);
+}

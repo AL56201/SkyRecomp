@@ -812,6 +812,13 @@ static bool upload_custom_surface(NvnTexture *t, TexBackend *b, SDL_Surface *s) 
     return true;
 }
 
+uint64_t g_up_hash, g_up_swz, g_up_astc, g_up_astc_n, g_up_astc_small;  // (profiling: where uploads spend their time)
+void tex_upload_prof_log(void) {
+    if (g_up_hash + g_up_swz + g_up_astc > 20000000ull)
+        LOG("[tex] upload: hash %.1f ms, deswizzle %.1f ms, astc %.1f ms (%llu levels, %llu small)\n", g_up_hash / 1e6, g_up_swz / 1e6,
+            g_up_astc / 1e6, (unsigned long long)g_up_astc_n, (unsigned long long)g_up_astc_small);
+    g_up_hash = g_up_swz = g_up_astc = g_up_astc_n = g_up_astc_small = 0;
+}
 static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (!t->addr || t->target == 10) return;
     if (b->custom_wait) {  // (its pack replacement was being decoded: swapped in once ready)
@@ -870,7 +877,9 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         }
     }
     prof_tex_full++; prof_tex_full_bytes += total; if (b->dynamic) prof_tex_dyn++;
+    uint64_t tq0 = SDL_GetTicksNS();
     uint64_t h = hash_full(mem, total);
+    g_up_hash += SDL_GetTicksNS() - tq0;
     b->full_frame = frame;
     b->sample_hash = fnv_sample(mem, total);
     if (b->uploaded && h == b->data_hash && !restyle) {
@@ -893,23 +902,30 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     uint64_t layer_size = tegra_layer_size(&t->layout);
     bool linear = (t->flags & 0x10) != 0;
     uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
+    // (ASTC levels: collected, decoded together over the decode pool, then copied)
+    enum { MAXLV = 256 };
+    AstcJob ajob[MAXLV];
+    VkBufferImageCopy acopy[MAXLV];
+    VkBuffer abuf[MAXLV];
+    uint8_t *ablocks[MAXLV];
+    int na = 0;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
-            if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
+            if (b->astc_bw && na < MAXLV) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
                 uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
                 if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
-                else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
+                else { uint64_t tq = SDL_GetTicksNS(); tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2); g_up_swz += SDL_GetTicksNS() - tq; }
                 if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, blocks, l.w, l.h, l.wb * 16);
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
-                astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
-                free(blocks);
-                VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
+                ajob[na] = (AstcJob){blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr};
+                ablocks[na] = blocks, abuf[na] = s.buf;
+                acopy[na] = (VkBufferImageCopy){.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
-                vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
-                vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+                na++;
+                g_up_astc_n++; if (l.w * l.h < 128 * 128) g_up_astc_small++;
                 continue;
             }
             uint32_t row = l.wb * fi->bpb;
@@ -922,7 +938,7 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             if (linear) {
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * t->stride, row);
             } else {
-                tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
+                { uint64_t tq = SDL_GetTicksNS(); tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2); g_up_swz += SDL_GetTicksNS() - tq; }
             }
             if (b->tp > 0 && layer == 0) texpatch_apply(b->tp - 1, lv, lin, l.w, l.h, row);
             if (expand) {  // RGB8 -> RGBA8
@@ -946,6 +962,16 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             if (b->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) continue;  // packed D/S: no CPU layout
             vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height, rg.imageSubresource.mipLevel);
                 vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+        }
+    }
+    if (na) {
+        const uint64_t tq = SDL_GetTicksNS();
+        astc_decode_batch(ajob, na);
+        g_up_astc += SDL_GetTicksNS() - tq;
+        for (int i = 0; i < na; i++) {
+            free(ablocks[i]);
+            vk_dl_note_upload((void *)b->image, acopy[i].imageExtent.width, acopy[i].imageExtent.height, acopy[i].imageSubresource.mipLevel);
+            vkCmdCopyBufferToImage(cb, abuf[i], b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &acopy[i]);
         }
     }
 }

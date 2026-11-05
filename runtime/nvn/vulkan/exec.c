@@ -766,7 +766,10 @@ static bool sync_shaders(void) { return shader_compile_mode() == SHADERS_WAIT; }
 // ponytail: aspect-ratio heuristic; track which targets get read before they're redrawn if a skipped draw sticks.
 static bool draw_must_wait(NvnTexture *target) {
     int m = shader_compile_mode();
-    return m == SHADERS_WAIT || (m == SHADERS_HYBRID && !(target && target->width > target->height));
+    // (in VR the scene's targets are the eyes' - taller than wide, and with an eye-1 copy: drawn like the screen, a
+    // draw whose pipeline is still building skips a frame instead of stopping it - a room first seen through a door
+    // built 33 at once: a 104 ms frame in the headset)
+    return m == SHADERS_WAIT || (m == SHADERS_HYBRID && !(target && (target->width > target->height || (target->backend && ((const TexBackend *)target->backend)->vr_eye))));
 }
 
 // A waiting draw whose build was already queued by a skippable one: block until a worker finishes it
@@ -904,6 +907,7 @@ const char *renderer_stats(void) {
              (unsigned long long)stat_vr_shared_lists, (unsigned long long)stat_mv_passes, (unsigned long long)stat_mv_draws,
              (unsigned long long)stat_mv_skipped);
     stat_feedback_copies = stat_upload_bytes = stat_feedback_direct = 0;
+    { extern void tex_upload_prof_log(void); tex_upload_prof_log(); }
     {
         extern void vk_alias_stats(void);
         vk_alias_stats();
