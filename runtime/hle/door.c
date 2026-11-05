@@ -451,10 +451,15 @@ void door_step_tick(void) {
     const float d[3] = {p[0] - m[3], p[1] - m[7], p[2] - m[11]};
     const float lx = m[0] * d[0] + m[4] * d[1] + m[8] * d[2], lz = m[2] * d[0] + m[6] * d[1] + m[10] * d[2];
     const bool open = fabsf(door_open()) > 3.0f * (float)(M_PI / 180);  // (the doorway is free once it opens)
+    if (getenv("SKYRECOMP_DOOR_SPEED") && fabsf(lx) < 150 && fabsf(lz) < 200) {  // (test: his speed near the door)
+        static float plx, plz;
+        LOG("[door] speed %.1f at %.0f %.0f%s\n", sqrtf((lx - plx) * (lx - plx) + (lz - plz) * (lz - plz)), lx, lz, inside ? " (in)" : "");
+        plx = lx, plz = lz;
+    }
     {   // the leaf itself is solid: a segment from the hinge, turned by the open angle, that pushes him off (his feet
         // within R of it, to the side he was on)
         static float leaf_side;
-        const float o = door_open(), c = cosf(o), sn = sinf(o), hx = door_hinge_x(), len = -2 * hx, R = 30.0f;
+        const float o = door_open(), c = cosf(o), sn = sinf(o), hx = door_hinge_x(), len = -2 * hx, R = 15.0f;
         const float ex = c, ez = -sn;  // (the leaf's direction in the door's frame: Ry(open) of x)
         const float rx = lx - hx, rz = lz;
         float t = rx * ex + rz * ez;
@@ -481,10 +486,19 @@ void door_step_tick(void) {
             LOG("[door] Link in the doorway (%.0f %.0f)\n", lx, lz);
         }
         // (the doorway's sides hold him in - his own check, skipped, would: kept within +-38 along the leaf)
-        const float over = lx > 38.0f ? 38.0f - lx : lx < -38.0f ? -38.0f - lx : 0.0f;
+        const float over = lx > 42.0f ? 42.0f - lx : lx < -42.0f ? -42.0f - lx : 0.0f;  // (where the game's own walls hold him)
+        // (unchecked he walks as in the air - about 2/3 of his pace: his step this frame made up to it)
+        static float plx, plz;
+        static uint64_t pframe;
+        float bx = 0, bz = 0;
+        if (pframe + 1 == frame) {
+            const float sx = lx - plx, sz = lz - plz;
+            if (sx * sx + sz * sz < 100.0f) bx = 0.5f * sx, bz = 0.5f * sz;  // (not a jump)
+        }
+        plx = lx + bx, plz = lz + bz, pframe = frame;
         for (unsigned i = 0; i < NCOPIES; i++) {
             float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
-            q[0] += over * m[0], q[2] += over * m[8];
+            q[0] += over * m[0] + bx * m[0] + bz * m[2], q[2] += over * m[8] + bx * m[8] + bz * m[10];
             q[1] = ys[i];
         }
         *(float *)(uintptr_t)(link + 0x2b2c) = 0.0f;
