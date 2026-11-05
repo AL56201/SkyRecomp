@@ -85,7 +85,8 @@ void door_test_open(void);
 // The level's door objects (vtable DOOR_VTABLE, position at +0x144): found a slice of the heap per frame (a whole
 // scan at once is a hitch in the headset), dropped once their vtable is gone (the room unloaded)
 #define DOOR_VTABLE_ 0x7001600da0ull
-#define DOOR_REACH 120.0f  // (units, level: Link's eye from the door's origin - ~60 standing at it)
+#define DOOR_KEEP 500.0f  // (units: a door left open stays open until Link is this far from it)
+#define DOOR_REACH 150.0f  // (units, level: Link's eye from the door's origin - ~60 standing at it)
 static uint64_t g_doors[64];
 static int g_ndoors;
 static bool door_object_near(const float eye[3]) {
@@ -136,7 +137,8 @@ void door_track(void) {
     if (!player_eye(eye)) { g_door = 0; return; }
     if (g_door) {
         const float *m = (const float *)(uintptr_t)g_door;
-        if (level_matrix(m) && near_link(m, eye)) take(m);
+        const float kx = m[3] - eye[0], kz = m[11] - eye[2];  // (kept while Link is within DOOR_KEEP of it)
+        if (level_matrix(m) && kx * kx + kz * kz < DOOR_KEEP * DOOR_KEEP) take(m);
         else g_door = 0, door_set_open(0);  // (Link far from it: the door left open shuts)
     }
     static uint64_t next_scan;
