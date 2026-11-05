@@ -119,12 +119,38 @@ volatile uint64_t g_door_nowall_obj;
 void fnprof_hit(uint64_t a, uint64_t lr, uint64_t x0) {
     if (g_door_nowall && a == 0x7000facfe4ull && lr >= 0x7000ab7cf4ull && lr < 0x7000ad99e4ull) {
         // (a count of his checks to skip: the last one runs again, with the bit cleared)
-        if (--g_door_nowall > 0) *(volatile uint32_t *)(uintptr_t)(x0 + 100) |= 1;
+        static uint32_t bit;  // (SKYRECOMP_DOOR_NOWALL_BIT: which flag - test)
+        if (!bit) bit = getenv("SKYRECOMP_DOOR_NOWALL_MASK") ? (uint32_t)strtoul(getenv("SKYRECOMP_DOOR_NOWALL_MASK"), NULL, 16) : 1u;
+        if (--g_door_nowall > 0) *(volatile uint32_t *)(uintptr_t)(x0 + 100) |= bit;
         else {
-            *(volatile uint32_t *)(uintptr_t)(x0 + 100) &= ~1u;
+            *(volatile uint32_t *)(uintptr_t)(x0 + 100) &= ~bit;
             if (!getenv("LARECOMP_FNPROF")) g_fnprof = 0;  // (the entry hook done)
         }
         g_door_nowall_obj = x0;
+    }
+    {   // LARECOMP_FNPROF_ARG=<hex>[,...]: log functions entered with one of these values in x0..x3 (a few per value)
+        static uint64_t vals[16];
+        static int nv = -1, said[16];
+        if (nv < 0) {
+            nv = 0;
+            for (const char *p = getenv("LARECOMP_FNPROF_ARG"); p && *p && nv < 16;) {
+                vals[nv++] = strtoull(p, (char **)&p, 16);
+                while (*p == ',') p++;
+            }
+        }
+        if (nv) {
+            Cpu *kernel_current_cpu(void);
+            Cpu *cc = kernel_current_cpu();
+            for (int r = 0; cc && r < 4; r++)
+                for (int i = 0; i < nv; i++)
+                    if (cc->x[r] == vals[i] && said[i] < 12) {
+                        said[i]++;
+                        fprintf(stderr, "[fnprof-arg] %llx entered with x%d = %llx (lr %llx, x0 %llx x1 %llx x2 %llx x3 %llx)\n",
+                                (unsigned long long)a, r, (unsigned long long)vals[i], (unsigned long long)lr,
+                                (unsigned long long)cc->x[0], (unsigned long long)cc->x[1], (unsigned long long)cc->x[2],
+                                (unsigned long long)cc->x[3]);
+                    }
+        }
     }
     watch_check(a, lr);
     if (bt_n) bt_check(a, lr, x0);

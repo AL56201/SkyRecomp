@@ -26,7 +26,27 @@ static uint64_t g_door_actor_found;  // (its door object, found with it - below)
 // the game's own sequence; measured -22.5 -> -82 degrees of its x axis). vr_input.c sets it; vr_rig.c draws it.
 #include <stdatomic.h>
 static _Atomic float g_open;
-void door_set_open(float radians) { atomic_store(&g_open, radians); }
+// The door's sound, opening (true) or shutting (false) - the game's own door sounds
+// (any thread: played on the game thread - door_sound_tick). Measured 2026-11-04 from the game's own door sequence:
+// f_7000f4b8c0(sound source, id, 1, 0); the wooden door's SE_Door_W_OPEN 0x9d6 / SE_Door_W_CLOSE 0x9d7 (WZSound.brsar)
+static uint64_t g_door_snd;  // (the door's sound source - found with the door)
+static _Atomic int g_sound_request;  // (0 none, else the sound id)
+void door_sound(bool open) { atomic_store(&g_sound_request, open ? 0x9d6 : 0x9d7); }
+void door_sound_tick(Cpu *c) {
+    const int id = atomic_exchange(&g_sound_request, 0);
+    if (!id || !g_door_snd || *(const uint64_t *)(uintptr_t)g_door_snd != 0x700168ede0ull) return;
+    uint64_t saved[31];
+    memcpy(saved, c->x, sizeof saved);
+    const uint64_t sp = c->sp, pc = c->pc;
+    c->x[0] = g_door_snd, c->x[1] = (uint64_t)id, c->x[2] = 1, c->x[3] = 0;
+    guest_call(c, 0x7000f4b8c0ull);
+    memcpy(c->x, saved, sizeof saved);
+    c->sp = sp, c->pc = pc;
+    LOG("[door] sound %#x\n", id);
+}
+static _Atomic bool g_closing;  // (swinging shut by itself - door_close; a hand's set stops it)
+void door_set_open(float radians) { atomic_store(&g_closing, false); atomic_store(&g_open, radians); }
+void door_close(void) { if (atomic_load(&g_open) != 0.0f) atomic_store(&g_closing, true); }
 float door_open(void) { return atomic_load(&g_open); }
 static float g_door_m[12];
 // (the copy found is turned 180 degrees from the drawn leaf: its x and z axes are taken negated)
@@ -154,6 +174,9 @@ void door_track(void) {
             take((const float *)(uintptr_t)g_door);
             extern uint64_t door_find_actor(const float m[12]);
             g_door_actor_found = door_find_actor(g_door_m);
+            g_door_snd = 0;  // (its sound source: vtable 0x700168ede0, 0x720 before the leaf's matrix in its block)
+            for (uint64_t o = g_door & ~7ull; o + 0x2000 > g_door && !g_door_snd; o -= 8)
+                if (*(const uint64_t *)(uintptr_t)o == 0x700168ede0ull) g_door_snd = o;
             if (g_door_actor_found) {
                 // (the door object faces the other way from the drawn leaf: its yaw, s16 at +0x132, minus 180 degrees,
                 // is the leaf's - a copy turned the other way is turned back)
@@ -178,7 +201,7 @@ void door_test_open(void) {
     if (on) door_set_open(g_door ? deg * (float)(M_PI / 180) : 0.0f);
     static bool requested;  // (and the room beyond, once - as a pulled door does)
     void door_request_room(void);
-    if (on && g_door && !requested) requested = true, door_request_room();
+    if (on && g_door && !requested) requested = true, door_request_room(), door_sound(true);
     static int step_at = -1;  // (SKYRECOMP_DOOR_TEST_STEP=<frames>: and Link stepped through that long after)
     if (step_at < 0) step_at = getenv("SKYRECOMP_DOOR_TEST_STEP") ? atoi(getenv("SKYRECOMP_DOOR_TEST_STEP")) : 0;
     static int since;
@@ -345,7 +368,12 @@ void door_step_tick(void) {
     float m[12];
     const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
     if (link < 0x7000000000ull || link >= 0x7800000000ull || !door_matrix(m)) { inside = false; return; }
-    if (close_in && !--close_in) door_set_open(0);
+    if (close_in && !--close_in) door_close();
+    if (atomic_load(&g_closing)) {  // (swinging shut, easing in, then latched)
+        const float o = atomic_load(&g_open), step = 0.01f + 0.03f * fabsf(o);  // (radians a frame)
+        if (fabsf(o) <= step) atomic_store(&g_open, 0.0f), atomic_store(&g_closing, false), door_sound(false);
+        else atomic_store(&g_open, o - (o > 0 ? step : -step));
+    }
     // his feet in the door's closed frame (x along the leaf, z across the doorway)
     const float *p = (const float *)(uintptr_t)(link + 0x148);
     const float d[3] = {p[0] - m[3], p[1] - m[7], p[2] - m[11]};
@@ -362,8 +390,10 @@ void door_step_tick(void) {
         const float over = lx > 38.0f ? 38.0f - lx : lx < -38.0f ? -38.0f - lx : 0.0f;
         for (unsigned i = 0; i < NCOPIES; i++) {
             float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
-            q[0] += over * m[0], q[1] = ys[i], q[2] += over * m[8];
+            q[0] += over * m[0], q[2] += over * m[8];
+            q[1] = ys[i];
         }
+        *(float *)(uintptr_t)(link + 0x2b2c) = 0.0f;
         extern volatile int g_fnprof, g_door_nowall;
         // (fnprof.c: his checks skipped while he is in it - he is checked several times a frame - and released below)
         g_door_nowall = 1000000; g_fnprof = 1;

@@ -324,6 +324,8 @@ static void re_room(Cpu *c) {
 static void pre_execute(Cpu *c) {
     extern void door_room_tick(Cpu *c);
     door_room_tick(c);  // (physical doors: the room beyond, activated - hle/door.c)
+    extern void door_sound_tick(Cpu *c);
+    door_sound_tick(c);  // (and its sounds)
     extern void door_step_tick(void);
     door_step_tick();
     extern void door_yaw_tick(void);

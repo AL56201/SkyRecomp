@@ -519,6 +519,8 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                     if (!opening && fabsf(a) > 3.0f * (float)(M_PI / 180)) {
                         extern void door_request_room(void);
                         LOG("[door] swung open %.0f deg: activating the room beyond\n", a * 57.2958f);
+                        extern void door_sound(bool open);
+                        if (fabsf(open0) < 0.01f) door_sound(true);  // (not again for a door grabbed already open)
                         door_request_room();
                         opening = true, haptic(hand, 0.6f, 40);
                     }
