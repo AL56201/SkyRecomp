@@ -733,6 +733,17 @@ static void door_trace(uint64_t frame, float lx, float lz, bool inside) {
 }
 
 void door_step_tick(void) {
+    {   // (RE test) SKYRECOMP_DOOR_TEST_RADIUS=<hex offset from Link>,<float>: that float of Link's written every frame
+        static int on = -1;
+        static long off;
+        static float val;
+        if (on < 0) {
+            const char *e = getenv("SKYRECOMP_DOOR_TEST_RADIUS");
+            on = e && sscanf(e, "%lx,%f", &off, &val) == 2;
+        }
+        const uint64_t lk = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
+        if (on && lk >= 0x7000000000ull && lk < 0x7800000000ull) *(volatile float *)(uintptr_t)(lk + (int64_t)off) = val;
+    }
     {   // (RE test) SKYRECOMP_DOOR_TEST_LIFTM=<offset hex>: the door object's 3x4 matrix at that offset lifted 500 every
         // frame - does its collision follow it?
         static long off = -2;
@@ -889,3 +900,31 @@ void door_link_tick(void) {
 }
 
 void door_mark_activated(void) { g_room_activated = true; }
+
+// ---- recording the player's door use, to see what they see: while Link is at a door or one is open, the headset's
+// eye 0 every 20 frames -> door_rec/<frame>.png next to the exe (device.c), the frame matching door_trace.csv's.
+// (frames accumulate: the folder is cleared between sessions by hand)
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+bool door_rec_path(uint64_t frame, char *out, size_t n) {
+    if (frame % 20 || !g_door || !(door_open() != 0.0f || door_at())) return false;
+    static char dir[600];
+    if (!dir[0]) {
+        snprintf(dir, sizeof dir, "door_rec");
+#if defined(_WIN32)
+        extern unsigned long __stdcall GetModuleFileNameA(void *, char *, unsigned long);
+        char exe[512];
+        const unsigned long k = GetModuleFileNameA(NULL, exe, sizeof exe);
+        char *slash = k && k < sizeof exe ? strrchr(exe, '\\') : NULL;
+        if (slash) slash[1] = 0, snprintf(dir, sizeof dir, "%sdoor_rec", exe);
+        _mkdir(dir);
+#else
+        mkdir(dir, 0755);
+#endif
+    }
+    snprintf(out, n, "%s/%06llu.png", dir, (unsigned long long)frame);
+    return true;
+}

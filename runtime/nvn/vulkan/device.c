@@ -859,6 +859,11 @@ void backend_present(NvnTexture *t) {
                 snprintf(p, sizeof p, "build/vr_live_%06llu.png", (unsigned long long)total_frames);
                 renderer_save_texture_tex(b, p);
             }
+            {   // (hle/door.c) the player's door use, recorded
+                extern bool door_rec_path(uint64_t frame, char *out, size_t n);
+                char p[700];
+                if (door_rec_path(total_frames, p, sizeof p)) renderer_save_texture_tex(b, p);
+            }
             for (int i = 0; i < n; i++) {
                 if (total_frames != (uint64_t)at[i]) continue;
                 char p0[64] = "build/vr_eye0.png", p1[64] = "build/vr_eye1.png";
