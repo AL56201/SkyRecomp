@@ -366,11 +366,15 @@ bool door_matrix(float m[12]) {
 float door_hinge_x(void) { return DOOR_HINGE_X; }
 #define HANDLE_Y 115.0f
 #define HANDLE_Z 19.0f
-static bool handle_at(float out_z, float w[3]) {
+// The door has a handle on each face (z +-HANDLE_Z in its frame, turning with the leaf). The one held: g_handle_face
+// (vr_input.c sets it at the grab - the one nearer the hand); 0: the face on Link's side (his z in the door's frame)
+static float g_handle_face;
+void door_set_handle_face(float face) { g_handle_face = face; }
+static bool handle_face_at(float face, float out_z, float w[3]) {
     float m[12], eye[3];
     if (!door_matrix(m) || !player_eye(eye)) return false;
     const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
-    const float side = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;  // (his z in the door's frame)
+    const float side = face != 0.0f ? face : m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;
     // (turned with the leaf: Ry(open) in the door's frame - x' = c x + s z, z' = -s x + c z)
     // (about the hinge, x = DOOR_HINGE_X: l = h + Ry (l0 - h))
     const float o = door_open(), c = cosf(o), s = sinf(o), lx = HANDLE_X - DOOR_HINGE_X, lz = out_z * side;
@@ -378,7 +382,10 @@ static bool handle_at(float out_z, float w[3]) {
     for (int r = 0; r < 3; r++) w[r] = m[r * 4 + 0] * l[0] + m[r * 4 + 1] * l[1] + m[r * 4 + 2] * l[2] + m[r * 4 + 3];
     return true;
 }
+static bool handle_at(float out_z, float w[3]) { return handle_face_at(g_handle_face, out_z, w); }
 bool door_handle(float w[3]) { return handle_at(HANDLE_Z, w); }
+// The handle on one face (+1 / -1) - for reaching either
+bool door_handle_on(float face, float w[3]) { return handle_face_at(face, HANDLE_Z, w); }
 // A point in the world -> the door's frame (its closed frame: R^T (p - t)); false: no door
 bool door_local(const float p[3], float l[3]) {
     float m[12];

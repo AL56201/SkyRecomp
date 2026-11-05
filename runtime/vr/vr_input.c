@@ -450,10 +450,19 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
             const float reach = 0.40f * vr_rig_units_per_metre();
             bool near[2] = {!have_handle, !have_handle};  // (no handle found: any grab, as before)
             static bool hovering[2];
+            float near_face[2] = {0, 0};  // (which of the door's two handles each hand is nearer - either can be held)
+            extern bool door_handle_on(float face, float w[3]);
             for (int h = 0; h < 2; h++) {
                 if (have_handle && vr_rig_controller_world(h, cw)) {
-                    const float dx = cw[0] - handle[0], dy = cw[1] - handle[1], dz = cw[2] - handle[2];
-                    near[h] = dx * dx + dy * dy + dz * dz < reach * reach;
+                    float best = 1e30f;
+                    for (int f = 0; f < 2; f++) {
+                        float hw[3];
+                        const float face = f ? 1.0f : -1.0f;
+                        if (!door_handle_on(face, hw)) continue;
+                        const float dx = cw[0] - hw[0], dy = cw[1] - hw[1], dz = cw[2] - hw[2], d2 = dx * dx + dy * dy + dz * dz;
+                        if (d2 < best) best = d2, near_face[h] = face;
+                    }
+                    near[h] = best < reach * reach;
                 }
                 {   // (diagnostics) every half second at a door: the handle, each controller and its distance
                     static uint64_t next[2];
@@ -472,6 +481,8 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                 for (int h = 0; h < 2 && hand < 0; h++)
                     if (grip[h] > 0.5f && s.hand[h].tracked && near[h]) {
                         extern float door_open(void);  // (an open door needs no turn: it is grabbed as it is)
+                        extern void door_set_handle_face(float face);
+                        door_set_handle_face(near_face[h]);  // (the handle this hand took - either face's)
                         hand = h, turned = door_open() != 0.0f, loose = 0, best_turn = best_pull = 0;
                         LOG("[door] grab (%s hand)\n", h ? "right" : "left");
                         memcpy(q0, s.hand[h].orientation, sizeof q0), memcpy(p0, s.hand[h].position, sizeof p0);
