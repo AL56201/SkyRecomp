@@ -53,6 +53,7 @@ uint64_t prof_up_ns = ~0ull;  // textures.c upload checks (~0: profiling off)
 #define PROF_T0() uint64_t prof_t0_ = prof ? SDL_GetTicksNS() : 0
 #define PROF_ADD(v) do { if (prof) v += SDL_GetTicksNS() - prof_t0_; } while (0)
 static _Atomic int stat_compiles;
+static uint64_t stat_tex_deferred;  // (draws skipped for a texture left to a later frame)
 static uint64_t op_counts[CMD_COUNT];
 static uint64_t stat_vrs_passes;  // (VR foveated passes, begin_pass)
 static uint64_t stat_hidden_masks;  // (VR hidden-area masks drawn, hidden_mask)
@@ -4914,12 +4915,16 @@ static void draw_(CmdRec *r, bool indexed) {
     PROF_ADD(prof_sets);
     VkDescriptorImageInfo fii[64];
     uint64_t prof_tx_ = prof ? SDL_GetTicksNS() : 0;
+    extern bool g_tex_defer_ok, g_tex_deferred;
+    g_tex_defer_ok = true, g_tex_deferred = false;  // (textures.c: new ones over this frame's budget wait a frame)
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
         float sc[2]; uint32_t wh[2];
         texture_info(1, pr->fi, i, &fii[i], sc, wh);
         tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
     }
+    g_tex_defer_ok = false;
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
+    if (g_tex_deferred) { stat_skipped++; stat_tex_deferred++; return; }  // (drawn once its textures are ready)
     // Sky draws depth-tested scene geometry on the presented target; it must not be boxed like UI.
     if ((g_is_las || !st.ds[0]) && fabsf(pass_sx - pass_sy) > 0.01f * pass_sy &&
         st.rt.ncolor && renderer_texture_presented(st.rt.color[0])) {

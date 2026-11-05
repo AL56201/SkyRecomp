@@ -976,16 +976,36 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     }
 }
 
+// New textures spread over frames: a draw's textures (exec.c sets g_tex_defer_ok while it gathers them) that would be
+// decoded for the first time (ASTC: decoded on the CPU) once this frame has spent its budget on that are left for a
+// later frame, and the draw is skipped this once (g_tex_deferred) - a room first seen came with hundreds at once: one
+// frame of ~55-100 ms. LARECOMP_TEX_BUDGET_MS (default 6; 0: never deferred).
+bool g_tex_defer_ok, g_tex_deferred;
+static uint64_t tex_budget_frame, tex_budget_spent;
+static uint64_t tex_budget_ns(void) {
+    static int64_t ns = -1;
+    if (ns < 0) { const char *e = getenv("LARECOMP_TEX_BUDGET_MS"); ns = (int64_t)((e ? atof(e) : 6.0) * 1e6); }
+    return (uint64_t)ns;
+}
 TexBackend *vk_tex(NvnTexture *t, bool for_render) {
     TexBackend *b = tex_backend(t);
     if (t->video_uploaded) b->gpu_owned = true;
     if (t->pending_rgba) upload_pending(t, b);
     if (for_render) b->gpu_owned = true;
     else if (!b->gpu_owned) {
+        const uint64_t frame = vk_frame_counter();
+        if (tex_budget_frame != frame) tex_budget_frame = frame, tex_budget_spent = 0;
+        const bool first = !b->uploaded && b->astc_bw && t->addr;
+        if (first && g_tex_defer_ok && tex_budget_ns() && tex_budget_spent >= tex_budget_ns()) {
+            g_tex_deferred = true;  // (a later frame)
+            return vr_eye_backend(t, b, for_render);
+        }
         extern uint64_t prof_up_ns;
-        uint64_t t0 = prof_up_ns != ~0ull ? SDL_GetTicksNS() : 0;
+        uint64_t t0 = SDL_GetTicksNS();
         upload_texture(t, b);
-        if (prof_up_ns != ~0ull) prof_up_ns += SDL_GetTicksNS() - t0;
+        const uint64_t dt = SDL_GetTicksNS() - t0;
+        if (first) tex_budget_spent += dt;
+        if (prof_up_ns != ~0ull) prof_up_ns += dt;
     }
     return vr_eye_backend(t, b, for_render);
 }
