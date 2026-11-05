@@ -478,27 +478,33 @@ void door_step_tick(void) {
                 }
         }
     }
-    const bool in_frame = fabsf(lx) < 60.0f && fabsf(lz) < 80.0f;  // (he stops ~60 from the closed leaf)
+    // (wider than the leaf, 70 to its edge, and his reach: near the frame the closed door's collision would catch him)
+    const bool in_frame = fabsf(lx) < 110.0f && fabsf(lz) < 90.0f;
     if (open && in_frame) {
         if (!inside) {
             inside = true, entry_side = lz < 0 ? -1.0f : 1.0f;
             for (unsigned i = 0; i < NCOPIES; i++) ys[i] = ((const float *)(uintptr_t)(link + (int64_t)copies[i]))[1];
             LOG("[door] Link in the doorway (%.0f %.0f)\n", lx, lz);
         }
-        // (the doorway's sides hold him in - his own check, skipped, would: kept within +-38 along the leaf)
-        const float over = lx > 42.0f ? 42.0f - lx : lx < -42.0f ? -42.0f - lx : 0.0f;  // (where the game's own walls hold him)
         // (unchecked he walks as in the air - about 2/3 of his pace: his step this frame made up to it)
         static float plx, plz;
         static uint64_t pframe;
         float bx = 0, bz = 0;
-        if (pframe + 1 == frame) {
+        if (pframe && frame - pframe < 4) {  // (the last few frames: presents and game frames do not pair exactly)
             const float sx = lx - plx, sz = lz - plz;
-            if (sx * sx + sz * sz < 100.0f) bx = 0.5f * sx, bz = 0.5f * sz;  // (not a jump)
+            const float sp = sqrtf(sx * sx + sz * sz);
+            // (up to his walking pace, ~4 a frame - never past it: not a push)
+            if (sp > 0.1f && sp < 4.0f) bx = sx * (fminf(1.5f * sp, 4.0f) / sp - 1), bz = sz * (fminf(1.5f * sp, 4.0f) / sp - 1);
         }
-        plx = lx + bx, plz = lz + bz, pframe = frame;
+        // the frame's sides are walls (his own check skipped): the doorway is |x| <= 42, the wall's face |z| = 45. A
+        // step into one is not taken - he stops where he was, never pushed or slid along it
+        float nx = lx + bx, nz = lz + bz;
+        if (fabsf(nz) < 45.0f && fabsf(nx) > 42.0f && pframe && frame - pframe < 4) nx = plx, nz = plz;
+        const float dx = nx - lx, dz = nz - lz;
+        plx = nx, plz = nz, pframe = frame;
         for (unsigned i = 0; i < NCOPIES; i++) {
             float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
-            q[0] += over * m[0] + bx * m[0] + bz * m[2], q[2] += over * m[8] + bx * m[8] + bz * m[10];
+            q[0] += dx * m[0] + dz * m[2], q[2] += dx * m[8] + dz * m[10];
             q[1] = ys[i];
         }
         *(float *)(uintptr_t)(link + 0x2b2c) = 0.0f;
