@@ -32,6 +32,7 @@ static _Atomic float g_open;
 static uint64_t g_door_snd;  // (the door's sound source - found with the door)
 static _Atomic int g_sound_request;  // (0 none, else the sound id)
 void door_sound(bool open) { atomic_store(&g_sound_request, open ? 0x9d6 : 0x9d7); }
+void door_sound_locked(void) { atomic_store(&g_sound_request, 0x9d5); }  // (SE_Door_LOCKED)
 void door_sound_tick(Cpu *c) {
     const int id = atomic_exchange(&g_sound_request, 0);
     if (!id || !g_door_snd || *(const uint64_t *)(uintptr_t)g_door_snd != 0x700168ede0ull) return;
@@ -46,7 +47,8 @@ void door_sound_tick(Cpu *c) {
 }
 static _Atomic bool g_closing;  // (swinging shut by itself - door_close; a hand's set stops it)
 void door_set_open(float radians) { atomic_store(&g_closing, false); atomic_store(&g_open, radians); }
-void door_close(void) { if (atomic_load(&g_open) != 0.0f) atomic_store(&g_closing, true); }
+static bool g_test_closed;  // (the test door, once shut by itself, is left to close)
+void door_close(void) { if (atomic_load(&g_open) != 0.0f) atomic_store(&g_closing, true), g_test_closed = true; }
 float door_open(void) { return atomic_load(&g_open); }
 static float g_door_m[12];
 // (the copy found is turned 180 degrees from the drawn leaf: its x and z axes are taken negated)
@@ -116,7 +118,21 @@ static bool door_object_near(const float eye[3]) {
         if (*(const uint64_t *)(uintptr_t)a == DOOR_VTABLE_) {
             bool known = false;
             for (int i = 0; i < g_ndoors && !known; i++) known = g_doors[i] == a;
-            if (!known && g_ndoors < 64) g_doors[g_ndoors++] = a;
+            if (!known && g_ndoors < 64) {
+                g_doors[g_ndoors++] = a;
+                if (getenv("SKYRECOMP_DOOR_CENSUS")) {  // (RE: each door object's fields, to tell the locked ones)
+                    const uint8_t *b = (const uint8_t *)(uintptr_t)a;
+                    char line[1200];
+                    int n = snprintf(line, sizeof line, "[door] census %#llx at %.0f %.0f %.0f:", (unsigned long long)a,
+                                     *(const float *)(b + 0x144), *(const float *)(b + 0x148), *(const float *)(b + 0x14c));
+                    static const int ranges[][2] = {{0x0, 0x40}, {0xb0, 0xd0}, {0x780, 0x800}};
+                    for (int r = 0; r < 3; r++) {
+                        n += snprintf(line + n, sizeof line - n, " |%x:", ranges[r][0]);
+                        for (int o = ranges[r][0]; o < ranges[r][1]; o += 4) n += snprintf(line + n, sizeof line - n, " %08x", *(const uint32_t *)(b + o));
+                    }
+                    LOG("%s\n", line);
+                }
+            }
         }
     cursor = end >= HEAP_HI ? HEAP_LO : end;
     bool near = false;
@@ -130,6 +146,11 @@ static bool door_object_near(const float eye[3]) {
 }
 
 // Link is at the door (within reach of it, either side): the gesture's
+// The door is locked: its object's lock type (+0x7b9) is not 0 - measured 2026-11-04: 0 on Link's room's door, 1 / 4 / 6
+// on the academy's locked ones (+0x7ba their flag). Its handle still turns; it does not open.
+bool door_locked(void) {
+    return g_door && g_door_actor_found && *(const uint8_t *)(uintptr_t)(g_door_actor_found + 0x7b9) != 0;
+}
 bool door_at(void) {
     float eye[3];
     if (!g_door || !player_eye(eye)) return false;
@@ -198,7 +219,7 @@ void door_test_open(void) {
     static int on = -1;
     static float deg;
     if (on < 0) on = getenv("SKYRECOMP_DOOR_TEST_OPEN") != NULL, deg = on ? (float)atof(getenv("SKYRECOMP_DOOR_TEST_OPEN")) : 0;
-    if (on) door_set_open(g_door ? deg * (float)(M_PI / 180) : 0.0f);
+    if (on && !g_test_closed) door_set_open(g_door ? deg * (float)(M_PI / 180) : 0.0f);
     static bool requested;  // (and the room beyond, once - as a pulled door does)
     void door_request_room(void);
     if (on && g_door && !requested) requested = true, door_request_room(), door_sound(true);
@@ -315,9 +336,56 @@ bool door_rooms(int *to, int *from) {
 
 // (vr_input.c, any thread) Activate the room beyond the door: done on the game thread (door_room_tick).
 void door_request_room(void) { atomic_store(&g_room_request, 1); }
+// The two rooms the door joins, as activated: the one opened (to) and the one he stood in (from), and the side of the
+// door he stood on then (his z in its frame). While the door is open both stay active; shut, the one behind him goes.
+static int g_room_to = -1, g_room_from = -1;
+static float g_room_from_side;
+static _Atomic int g_unload_request;
+static float link_side(void) {
+    float m[12];
+    const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
+    if (link < 0x7000000000ull || link >= 0x7800000000ull || !door_matrix(m)) return 0;
+    const float *p = (const float *)(uintptr_t)(link + 0x148);
+    const float lz = m[2] * (p[0] - m[3]) + m[6] * (p[1] - m[7]) + m[10] * (p[2] - m[11]);
+    return lz < 0 ? -1.0f : 1.0f;
+}
+static bool room_active(int index) {
+    const uint64_t r = room_object(index);
+    return r && !(*(const uint8_t *)(uintptr_t)(r + 0x9f0) & 0x1e);
+}
+static void activate_room(Cpu *c, int to, int from) {
+    uint64_t saved[31];
+    memcpy(saved, c->x, sizeof saved);
+    const uint64_t sp = c->sp, pc = c->pc;
+    c->x[0] = *(const uint64_t *)(uintptr_t)ROOMS_PTR, c->x[1] = (uint64_t)to, c->x[2] = (uint64_t)from;
+    guest_call(c, 0x7000e0854cull);
+    memcpy(c->x, saved, sizeof saved);
+    c->sp = sp, c->pc = pc;
+}
 
 // (hle/vr_world.c, the game thread, inside an object's update)
 void door_room_tick(Cpu *c) {
+    if (g_room_to >= 0 && *(const uint64_t *)(uintptr_t)ROOMS_PTR) {
+        const float side = link_side();
+        const int here = side == g_room_from_side ? g_room_from : g_room_to, behind = here == g_room_from ? g_room_to : g_room_from;
+        if (atomic_exchange(&g_unload_request, 0)) {
+            // shut: the room he is in made current again, as the game's own room change does - the one behind goes
+            LOG("[door] shut: room %d current, room %d behind released\n", here, behind);
+            activate_room(c, here, behind);
+            {   // (that keeps it active - its neighbour: marked inactive as the game had it, 0x0a at +0x9f0)
+                const uint64_t r = room_object(behind);
+                if (r) *(volatile uint8_t *)(uintptr_t)(r + 0x9f0) |= 0x0a;
+            }
+            LOG("[door]   room %d now %s\n", behind, room_active(behind) ? "still active" : "inactive");
+            g_room_to = g_room_from = -1;
+        } else if (door_open() != 0.0f && side != 0 && !room_active(behind)) {
+            // (open: the game, seeing him in the new room, let the one behind go - kept while it can be seen)
+            static uint64_t said;
+            extern uint64_t renderer_present_count(void);
+            if (renderer_present_count() > said + 60) LOG("[door] room %d behind kept while the door is open\n", behind), said = renderer_present_count();
+            activate_room(c, behind, here);
+        }
+    }
     if (!atomic_exchange(&g_room_request, 0)) return;
     int to, from;
     const uint64_t rooms = *(const uint64_t *)(uintptr_t)ROOMS_PTR;
@@ -337,6 +405,7 @@ void door_room_tick(Cpu *c) {
     memcpy(c->x, saved, sizeof saved);
     c->sp = sp, c->pc = pc;
     LOG("[door] activated room %d beyond the door (from room %d)\n", to, from);
+    g_room_to = to, g_room_from = from, g_room_from_side = link_side();
     extern void door_mark_activated(void);
     door_mark_activated();
 }
@@ -371,14 +440,39 @@ void door_step_tick(void) {
     if (close_in && !--close_in) door_close();
     if (atomic_load(&g_closing)) {  // (swinging shut, easing in, then latched)
         const float o = atomic_load(&g_open), step = 0.01f + 0.03f * fabsf(o);  // (radians a frame)
-        if (fabsf(o) <= step) atomic_store(&g_open, 0.0f), atomic_store(&g_closing, false), door_sound(false);
+        if (fabsf(o) <= step) {
+            atomic_store(&g_open, 0.0f), atomic_store(&g_closing, false), door_sound(false);
+            atomic_store(&g_unload_request, 1);  // (shut: the room behind him can go - door_room_tick)
+        }
         else atomic_store(&g_open, o - (o > 0 ? step : -step));
     }
     // his feet in the door's closed frame (x along the leaf, z across the doorway)
     const float *p = (const float *)(uintptr_t)(link + 0x148);
     const float d[3] = {p[0] - m[3], p[1] - m[7], p[2] - m[11]};
     const float lx = m[0] * d[0] + m[4] * d[1] + m[8] * d[2], lz = m[2] * d[0] + m[6] * d[1] + m[10] * d[2];
-    const bool open = fabsf(door_open()) > 45.0f * (float)(M_PI / 180);
+    const bool open = fabsf(door_open()) > 3.0f * (float)(M_PI / 180);  // (the doorway is free once it opens)
+    {   // the leaf itself is solid: a segment from the hinge, turned by the open angle, that pushes him off (his feet
+        // within R of it, to the side he was on)
+        static float leaf_side;
+        const float o = door_open(), c = cosf(o), sn = sinf(o), hx = door_hinge_x(), len = -2 * hx, R = 30.0f;
+        const float ex = c, ez = -sn;  // (the leaf's direction in the door's frame: Ry(open) of x)
+        const float rx = lx - hx, rz = lz;
+        float t = rx * ex + rz * ez;
+        t = t < 0 ? 0 : t > len ? len : t;
+        const float cx = rx - t * ex, cz = rz - t * ez, dist = sqrtf(cx * cx + cz * cz);
+        const float side = (rx * -ez + rz * ex) < 0 ? -1.0f : 1.0f;  // (which face of the leaf he is on)
+        if (o == 0.0f || dist >= R) leaf_side = side;
+        else if (fabsf(o) > 0.02f) {
+            // out to R on his own face: along the leaf's normal (n = (-ez, ex)) times the face he was on
+            const float nx = -ez * leaf_side, nz = ex * leaf_side;
+            const float along = cx * nx + cz * nz, push = R - along;
+            if (push > 0)
+                for (unsigned i = 0; i < NCOPIES; i++) {
+                    float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
+                    q[0] += push * (m[0] * nx + m[2] * nz), q[2] += push * (m[8] * nx + m[10] * nz);
+                }
+        }
+    }
     const bool in_frame = fabsf(lx) < 60.0f && fabsf(lz) < 80.0f;  // (he stops ~60 from the closed leaf)
     if (open && in_frame) {
         if (!inside) {

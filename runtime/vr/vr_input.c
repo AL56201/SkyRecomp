@@ -485,7 +485,17 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
                 const float rw = q0[3] * q[3] + q0[0] * q[0] + q0[1] * q[1] + q0[2] * q[2];
                 const float rz = q0[3] * q[2] - q0[2] * q[3] - q0[0] * q[1] + q0[1] * q[0];
                 const float turn = fabsf(2.0f * atan2f(rz, rw));
-                if (!turned && turn > (float)(M_PI / 2)) turned = true, haptic(hand, 0.5f, 30);
+                // a locked door: the handle turns, the door does not - the game's locked rattle, once per turn (turned back
+                // near the start, it can rattle again)
+                extern bool door_locked(void);
+                static bool rattled;
+                const bool locked = door_locked();
+                if (locked && !rattled && turn > (float)(M_PI / 2)) {
+                    extern void door_sound_locked(void);
+                    LOG("[door] locked: the handle turns, the door stays shut\n");
+                    door_sound_locked(), haptic(hand, 0.9f, 60), rattled = true;
+                } else if (rattled && turn < (float)(M_PI / 6)) rattled = false;
+                if (!locked && !turned && turn > (float)(M_PI / 2)) turned = true, haptic(hand, 0.5f, 30);
                 // turned: the door follows the hand about its origin (hle/door.c) - the angle that keeps the
                 // handle under it, measured as atan2(-z, x) in the door's closed frame; open wide enough, the game's
                 // own sequence takes over (the next room loads)
