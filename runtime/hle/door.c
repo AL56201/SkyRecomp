@@ -29,6 +29,13 @@ static _Atomic float g_open;
 void door_set_open(float radians) { atomic_store(&g_open, radians); }
 float door_open(void) { return atomic_load(&g_open); }
 static float g_door_m[12];
+// (the copy found is turned 180 degrees from the drawn leaf: its x and z axes are taken negated)
+static bool g_door_flip;
+static void take(const float *m) {
+    memcpy(g_door_m, m, sizeof g_door_m);
+    if (g_door_flip)
+        for (int r = 0; r < 3; r++) g_door_m[r * 4 + 0] = -g_door_m[r * 4 + 0], g_door_m[r * 4 + 2] = -g_door_m[r * 4 + 2];
+}
 
 static bool level_matrix(const float *m) {
     for (int i = 0; i < 12; i++)
@@ -60,6 +67,13 @@ static uint64_t scan(const float eye[3]) {
         if (dx * dx + dz * dz < 25.0f * 25.0f) continue;  // (at Link himself: his own)
         if (!near_link(m, eye) || !level_matrix(m)) continue;
         if (fabsf(m[0] - 1) < 1e-6f && fabsf(m[10] - 1) < 1e-6f) continue;  // (an identity-turned helper, not a leaf)
+        {   // (not one inside a door object - its own matrix at +0x1f4 faces the other way: the leaf's draw matrix is
+            // in a block of its own)
+            bool in_door = false;
+            for (uint64_t o = (a & ~7ull); o + 0x900 > a && o > HEAP_LO && !in_door; o -= 8)
+                in_door = *(const uint64_t *)(uintptr_t)o == 0x7001600da0ull;
+            if (in_door) continue;
+        }
         const float d = dx * dx + dz * dz;
         if (d < best_d) best_d = d, best = a;
     }
@@ -68,27 +82,88 @@ static uint64_t scan(const float eye[3]) {
 
 // (once per frame, vr_rig.c)
 void door_test_open(void);
+// The level's door objects (vtable DOOR_VTABLE, position at +0x144): found a slice of the heap per frame (a whole
+// scan at once is a hitch in the headset), dropped once their vtable is gone (the room unloaded)
+#define DOOR_VTABLE_ 0x7001600da0ull
+#define DOOR_REACH 90.0f  // (units, level: Link's eye from the door's origin - ~60 standing at it)
+static uint64_t g_doors[64];
+static int g_ndoors;
+static bool door_object_near(const float eye[3]) {
+    static uint64_t cursor = HEAP_LO;
+    const uint64_t end = cursor + (HEAP_HI - HEAP_LO) / 32;
+    for (uint64_t a = cursor; a < end; a += 8)
+        if (*(const uint64_t *)(uintptr_t)a == DOOR_VTABLE_) {
+            bool known = false;
+            for (int i = 0; i < g_ndoors && !known; i++) known = g_doors[i] == a;
+            if (!known && g_ndoors < 64) g_doors[g_ndoors++] = a;
+        }
+    cursor = end >= HEAP_HI ? HEAP_LO : end;
+    bool near = false;
+    for (int i = 0; i < g_ndoors; i++) {
+        if (*(const uint64_t *)(uintptr_t)g_doors[i] != DOOR_VTABLE_) { g_doors[i--] = g_doors[--g_ndoors]; continue; }
+        const float *p = (const float *)(uintptr_t)(g_doors[i] + 0x144);
+        const float dx = p[0] - eye[0], dz = p[2] - eye[2];
+        near |= dx * dx + dz * dz < DOOR_REACH * DOOR_REACH && eye[1] - p[1] > 100 && eye[1] - p[1] < 220;
+    }
+    return near;
+}
+
+// Link is at the door (within reach of it, either side): the gesture's
+bool door_at(void) {
+    float eye[3];
+    if (!g_door || !player_eye(eye)) return false;
+    const float dx = g_door_m[3] - eye[0], dz = g_door_m[11] - eye[2];
+    return dx * dx + dz * dz < DOOR_REACH * DOOR_REACH;
+}
+
 void door_track(void) {
     door_test_open();
+    {   // (diagnostics) reaching / leaving a door
+        static bool was;
+        const bool at = door_at();
+        if (at != was) {
+            float e[3] = {0, 0, 0};
+            player_eye(e);
+            float h[3] = {0, 0, 0};
+            extern bool door_handle(float w[3]);
+            if (at) door_handle(h);
+            LOG("[door] %s the door (eye %.1f %.1f, handle %.1f %.1f %.1f)\n", at ? "at" : "left", e[0], e[2], h[0], h[1],
+                h[2]);
+            was = at;
+        }
+    }
     float eye[3];
     if (!player_eye(eye)) { g_door = 0; return; }
     if (g_door) {
         const float *m = (const float *)(uintptr_t)g_door;
-        if (level_matrix(m) && near_link(m, eye)) memcpy(g_door_m, m, sizeof g_door_m);
+        if (level_matrix(m) && near_link(m, eye)) take(m);
         else g_door = 0;
     }
     static uint64_t next_scan;
     extern uint64_t renderer_present_count(void);
     const uint64_t now = renderer_present_count();
-    if (!g_door && player_action() == 0x6a && now >= next_scan) {
+    // (Link's +0x118 is not his action but the collision polygon he touches - 0x6a was one wall of his room - so a
+    // door is found from the door objects instead: from either side, any door)
+    if (!g_door && door_object_near(eye) && now >= next_scan) {
         next_scan = now + 30;
         g_door = scan(eye);
         if (g_door) {
-            memcpy(g_door_m, (const float *)(uintptr_t)g_door, sizeof g_door_m);
+            g_door_flip = false;
+            take((const float *)(uintptr_t)g_door);
             extern uint64_t door_find_actor(const float m[12]);
             g_door_actor_found = door_find_actor(g_door_m);
-            LOG("[door] door at %.1f %.1f %.1f (matrix %#llx)\n", g_door_m[3], g_door_m[7], g_door_m[11],
-                (unsigned long long)g_door);
+            if (g_door_actor_found) {
+                // (the door object faces the other way from the drawn leaf: its yaw, s16 at +0x132, minus 180 degrees,
+                // is the leaf's - a copy turned the other way is turned back)
+                const float yaw = *(const int16_t *)(uintptr_t)(g_door_actor_found + 0x132) * (float)(M_PI / 32768) - (float)M_PI;
+                const float leaf = atan2f(-g_door_m[8], g_door_m[0]);
+                float d = leaf - yaw;
+                while (d > (float)M_PI) d -= 2 * (float)M_PI;
+                while (d < -(float)M_PI) d += 2 * (float)M_PI;
+                if (fabsf(d) > (float)(M_PI / 2)) g_door_flip = true, take((const float *)(uintptr_t)g_door);
+            }
+            LOG("[door] door at %.1f %.1f %.1f (matrix %#llx, x axis %.3f %.3f)\n", g_door_m[3], g_door_m[7], g_door_m[11],
+                (unsigned long long)g_door, g_door_m[0], g_door_m[8]);
         }
     }
 }
@@ -122,6 +197,8 @@ bool door_matrix(float m[12]) {
 // (measured 2026-11-04: the controllers held on the knob in VR sat at x 42..62, y 115, z 17..21 from the door's
 // side - the grip's centre, in the hand around the knob)
 #define HANDLE_X 52.0f
+#define DOOR_HINGE_X (-70.0f)  // (the leaf turns about its edge away from the knob)
+float door_hinge_x(void) { return DOOR_HINGE_X; }
 #define HANDLE_Y 115.0f
 #define HANDLE_Z 19.0f
 static bool handle_at(float out_z, float w[3]) {
@@ -130,8 +207,9 @@ static bool handle_at(float out_z, float w[3]) {
     const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
     const float side = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;  // (his z in the door's frame)
     // (turned with the leaf: Ry(open) in the door's frame - x' = c x + s z, z' = -s x + c z)
-    const float o = door_open(), c = cosf(o), s = sinf(o), lx = HANDLE_X, lz = out_z * side;
-    const float l[3] = {c * lx + s * lz, HANDLE_Y, -s * lx + c * lz};
+    // (about the hinge, x = DOOR_HINGE_X: l = h + Ry (l0 - h))
+    const float o = door_open(), c = cosf(o), s = sinf(o), lx = HANDLE_X - DOOR_HINGE_X, lz = out_z * side;
+    const float l[3] = {DOOR_HINGE_X + c * lx + s * lz, HANDLE_Y, -s * lx + c * lz};
     for (int r = 0; r < 3; r++) w[r] = m[r * 4 + 0] * l[0] + m[r * 4 + 1] * l[1] + m[r * 4 + 2] * l[2] + m[r * 4 + 3];
     return true;
 }
@@ -255,7 +333,7 @@ void door_step_tick(void) {
     LOG("[door] stepping Link through: %.1f %.1f -> %.1f %.1f\n", p[0], p[2], x, z);
     // (every copy of his x / z that followed him in the snapshot diff: x at these, z 8 bytes on)
     // (at a door, action 0x6a holds him in front of it: standing, 0x58, he stays where put)
-    if (*(volatile uint32_t *)(uintptr_t)(link + 0x118) == 0x6a) *(volatile uint32_t *)(uintptr_t)(link + 0x118) = 0x58;
+    // (his +0x118 is the collision polygon he touches, not an action: left to his own collision check)
     // (every float that held his x at the door, z 8 bytes on - snapshot search: also two just before the actor and
     // one at +0x1634)
     static const int32_t copies[] = {-0x254, -0x44, 0x1c, 0x48, 0x148, 0x15c, 0x220, 0x234, 0x2d8, 0x1634, 0x2940 + 0x144, 0x2940 + 0x1bc};

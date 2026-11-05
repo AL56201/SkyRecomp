@@ -1,4 +1,4 @@
-// VR camera rig (see vr_rig.h): the eye cameras, Link's own draws hidden in 1st person, and culling.
+﻿// VR camera rig (see vr_rig.h): the eye cameras, Link's own draws hidden in 1st person, and culling.
 #include "vr_rig_internal.h"
 
 #include <math.h>
@@ -989,15 +989,22 @@ void vr_rig_door_draw(const float *slot0, uint64_t size0) {
     float game = atan2f(-x[2], x[0]) - atan2f(-dm[8], dm[0]);
     while (game > (float)M_PI) game -= 2 * (float)M_PI;
     while (game < -(float)M_PI) game += 2 * (float)M_PI;
+    {   // (diagnostics) the leaf's own angle against the door's, as it changes
+        static float last = 1e9f;
+        if (fabsf(game - last) > 0.05f) fprintf(stderr, "[door] leaf draw at %.0f deg from the door's matrix\n", game * 57.2958f), last = game;
+    }
     if (fabsf(game) >= fabsf(open)) return;
     const float c = cosf(open - game), s = sinf(open - game);
+    extern float door_hinge_x(void);
+    const float hx = door_hinge_x();
     float r[12];
     for (int row = 0; row < 3; row++) {
         const float *br = b + row * 4;
         r[row * 4 + 0] = br[0] * c - br[2] * s;  // B * Ry: [c 0 s; 0 1 0; -s 0 c]
         r[row * 4 + 1] = br[1];
         r[row * 4 + 2] = br[0] * s + br[2] * c;
-        r[row * 4 + 3] = br[3];
+        // (about the hinge h = (hx, 0, 0) in the leaf's frame, not its origin: t += B (h - Ry h))
+        r[row * 4 + 3] = br[3] + br[0] * hx * (1.0f - c) + br[2] * hx * s;
     }
     memcpy(g_hand_orig, b, sizeof g_hand_orig);
     memcpy(g_hand_repl, r, sizeof g_hand_repl);
