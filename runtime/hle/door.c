@@ -607,9 +607,40 @@ static void door_find_prisms(const float m[12]) {
     // for again when one is gone (another stage)
     static uint64_t kcl[512];
     static int nkcl = -1;
-    bool valid = nkcl > 0;
+    bool valid = false;  // (through the rooms every time - ~2 ms, and rooms loaded since are in it)
     for (int i = 0; i < nkcl && valid; i++) valid = *(const uint32_t *)(uintptr_t)kcl[i] == 0x38;
     if (!valid) {
+        nkcl = 0;
+        // first through the rooms: a room object's pointers (and theirs, one level on) to a .kcl's header - only ones
+        // into mapped memory are read
+        extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+        uint64_t mra[64], mrs[64];
+        const int mnr = kernel_data_regions(mra, mrs, 64);
+        #define MAPPED(p, n) ({ bool ok_ = false; for (int q_ = 0; q_ < mnr && !ok_; q_++) ok_ = (p) >= mra[q_] && (p) < mra[q_] + mrs[q_] && (n) <= mra[q_] + mrs[q_] - (p); ok_; })
+        const uint64_t t0 = plat_now_ns();
+        for (int ri = 0; ri < 64; ri++) {
+            const uint64_t room = room_object(ri);
+            if (!room) continue;
+            for (uint64_t o = 0; o < 0x2000; o += 8) {
+                const uint64_t p1 = *(const uint64_t *)(uintptr_t)(room + o);
+                if ((p1 & 3) || !MAPPED(p1, 0x400)) continue;
+                for (int lvl = 0; lvl < 2; lvl++) {
+                    // (level 0: the pointer itself; level 1: the pointers in what it points at)
+                    const int count = lvl ? 0x80 : 1;
+                    for (int j = 0; j < count; j++) {
+                        const uint64_t c = lvl ? *(const uint64_t *)(uintptr_t)(p1 + 8 * j) : p1;
+                        if ((c & 3) || !MAPPED(c, 0x40)) continue;
+                        const uint32_t *h = (const uint32_t *)(uintptr_t)c;
+                        if (h[0] != 0x38 || !(h[1] > 0x38 && h[2] > h[1] && h[3] > h[2] && h[3] < 0x2000000)) continue;
+                        bool known = false;
+                        for (int k = 0; k < nkcl && !known; k++) known = kcl[k] == c;
+                        if (!known && nkcl < 512) kcl[nkcl++] = c;
+                    }
+                }
+            }
+        }
+        LOG("[door] .kcl collision files through the rooms: %d (%.1f ms)\n", nkcl, (plat_now_ns() - t0) / 1e6);
+        if (nkcl) goto have_list;  // (the rooms' own: ~2 ms - the full look below only if none was found that way)
         nkcl = 0;
         extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
         uint64_t ra[64], rs[64];
@@ -624,6 +655,7 @@ static void door_find_prisms(const float m[12]) {
             }
         LOG("[door] looked for the .kcl collision files: %d\n", nkcl);
     }
+have_list:;
     int files = 0;
     for (int f = 0; f < nkcl; f++)
         {
