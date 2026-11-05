@@ -339,6 +339,12 @@ void door_test_open(void) {
     static float deg;
     if (on < 0) on = getenv("SKYRECOMP_DOOR_TEST_OPEN") != NULL, deg = on ? (float)atof(getenv("SKYRECOMP_DOOR_TEST_OPEN")) : 0;
     if (on && !g_test_closed) door_set_open(g_door ? deg * (float)(M_PI / 180) : 0.0f);
+    {   // (test) SKYRECOMP_DOOR_TEST_GRAB=<0 left / 1 right>: that hand holds the handle while at a door
+        static int grab = -2;
+        if (grab == -2) grab = getenv("SKYRECOMP_DOOR_TEST_GRAB") ? atoi(getenv("SKYRECOMP_DOOR_TEST_GRAB")) : -1;
+        extern void vr_rig_door_grab(int side);
+        if (grab >= 0) vr_rig_door_grab(g_door ? grab : -1);
+    }
     static bool requested;  // (and the room beyond, once - as a pulled door does)
     void door_request_room(void);
     if (on && g_door && !requested) requested = true, door_request_room(), door_sound(true);
@@ -384,6 +390,18 @@ static bool handle_face_at(float face, float out_z, float w[3]) {
 }
 static bool handle_at(float out_z, float w[3]) { return handle_face_at(g_handle_face, out_z, w); }
 bool door_handle(float w[3]) { return handle_at(HANDLE_Z, w); }
+// The held handle's knob and the way its face looks (out of the door, turned with the leaf), in the world - for the hand
+// put on it (vr_rig.c): palm to the door, fingers up, as the game's own door sequence holds it
+bool door_handle_frame(float knob[3], float out_n[3]) {
+    float m[12], eye[3];
+    if (!door_matrix(m) || !player_eye(eye) || !handle_face_at(g_handle_face, HANDLE_Z, knob)) return false;
+    const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
+    const float face = g_handle_face != 0.0f ? g_handle_face : m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;
+    const float o = door_open(), c = cosf(o), s = sinf(o);
+    const float nl[3] = {s * face, 0, c * face};  // (Ry(open) of the face's z)
+    for (int r = 0; r < 3; r++) out_n[r] = m[r * 4 + 0] * nl[0] + m[r * 4 + 1] * nl[1] + m[r * 4 + 2] * nl[2];
+    return true;
+}
 // The handle on one face (+1 / -1) - for reaching either
 bool door_handle_on(float face, float w[3]) { return handle_face_at(face, HANDLE_Z, w); }
 // A point in the world -> the door's frame (its closed frame: R^T (p - t)); false: no door

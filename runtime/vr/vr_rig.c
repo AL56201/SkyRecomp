@@ -436,6 +436,7 @@ static bool planar_reflection(const float v[12], const float g[12]) {
 }
 
 static int g_hand_draw = -1;
+static uint64_t g_hand_count_cur;  // (the hand draw's index count: which pose's mesh)
 static bool hand_block(const VrRigAnchor *a, const float reference[7], const float game[12], float out[12]);
 static float g_hand_orig[12], g_hand_repl[12];
 static bool g_hand_blocks;
@@ -524,6 +525,24 @@ static bool eye_camera(const float mono[28], const float reference[7], const flo
     // Link's hand: on its controller - its own view block replaced (game camera x the controller's hand frame), so
     // its lighting turns with it too
     float hand_mono[28];
+    if (g_hand_draw >= 0 && g_scripted && getenv("SKYRECOMP_DOOR_HANDREL")) {
+        // (RE) the game's own hand on the door's handle during its door sequence: the hand mesh's world matrix
+        // (game view^-1 x its block) in the door leaf's frame (the leaf's matrix, animated by the game) - logged
+        static uint64_t last;
+        extern uint64_t renderer_present_count(void);
+        extern bool door_matrix(float m[12]);
+        float vi[12], w[12], dm[12], di[12], h[12];
+        if (renderer_present_count() >= last + 5 && door_matrix(dm) && a_inverse(game, vi)) {
+            last = renderer_present_count();
+            a_mul(vi, mono + 16, w);
+            a_rigid_inverse(dm, di);
+            a_mul(di, w, h);
+            fprintf(stderr, "[door-hand] frame %llu side %d mesh %llu:", (unsigned long long)last, g_hand_draw,
+                    (unsigned long long)g_hand_count_cur);
+            for (int j = 0; j < 12; j++) fprintf(stderr, " %.3f", h[j]);
+            fprintf(stderr, "\n");
+        }
+    }
     if (g_hand_draw >= 0 && hand_block(&a, reference, game, hand_mono + 16)) {
         memcpy(hand_mono, mono, 16 * sizeof(float));
         memcpy(g_hand_orig, mono + 16, sizeof g_hand_orig);
@@ -690,6 +709,7 @@ static int hand_side(const float *slot0, uint64_t count, uint64_t vb, uint64_t v
     }
     memcpy(g_hand_last[side], w, sizeof w);
     g_hand_last_frame[side] = now;
+    g_hand_count_cur = count;
     return side;
 }
 
@@ -735,7 +755,29 @@ int vr_rig_hand_side(const float *slot0, uint64_t size0, uint64_t count, uint64_
 static bool hand_block(const VrRigAnchor *a, const float reference[7], const float game[12], float out[12]) {
     const int side = g_hand_draw;
     // (during a scripted move his hands stay where the game animates them: on the door's handle)
-    if (side < 0 || side > 1 || !g_grip_ok[side] || !hands_on() || g_scripted) return false;
+    if (side < 0 || side > 1 || !hands_on() || g_scripted) return false;
+    {   // holding the door: the hand as the game's own door sequence has it - its relaxed hand at the knob, palm to the
+        // door, fingers up - turned with the leaf. Mesh frame: fingers +x, thumb +y, the right palm +z (the left -z).
+        extern bool door_handle_frame(float knob[3], float n[3]);
+        float knob[3], n[3];
+        if (atomic_load(&g_door_grab) == side && door_handle_frame(knob, n)) {
+            const float up[3] = {0, 1, 0};
+            float z[3], y[3];
+            const float pz = side == 1 ? -1.0f : 1.0f;  // (the palm's axis toward the door: right +z, left -z)
+            for (int i = 0; i < 3; i++) z[i] = -n[i] * pz;
+            y[0] = z[1] * up[2] - z[2] * up[1], y[1] = z[2] * up[0] - z[0] * up[2], y[2] = z[0] * up[1] - z[1] * up[0];  // (z x x)
+            const float u = vr_rig_units_per_metre();
+            float w[12];
+            for (int i = 0; i < 3; i++) {
+                w[i * 4 + 0] = up[i], w[i * 4 + 1] = y[i], w[i * 4 + 2] = z[i];
+                // (the wrist below the knob and a little off the face: the fingers' middle at the knob)
+                w[i * 4 + 3] = knob[i] - up[i] * 0.07f * u + n[i] * 0.03f * u;
+            }
+            a_mul(game, w, out);
+            return true;
+        }
+    }
+    if (!g_grip_ok[side]) return false;
     float rel[9], off[3], rc[9], c[12], k[12], ck[12];
     vr_rig_relative(reference, g_grip[side], vr_rig_units_per_metre(), rel, off);
     m_mul(a->rotation, rel, rc);
