@@ -41,6 +41,8 @@ bool vr_rig_is_link_draw(const float *slot0, uint64_t size0, const float *bones,
 void vr_rig_set_grips(bool left_ok, const float left[7], bool right_ok, const float right[7]);
 int vr_rig_hand_side(const float *slot0, uint64_t size0, uint64_t count, uint64_t vb, uint64_t vb_size);
 void vr_rig_set_hand_draw(int side);
+// (after vr_rig_set_hand_draw(-1)) a rigid draw that is the sword or shield in his hand: drawn with that hand
+bool vr_rig_held_draw(const float *slot0, uint64_t size0, uint64_t count);
 bool vr_rig_settling(void);  // 1st person, just spawned: Link's eye point not settled yet (the view is held black)
 bool vr_rig_hand_blocks(float orig[12], float repl[12]);  // (exec.c) this hand draw's view block: game's, replacement
 // Once per stereo frame: both eyes (pose, fov) -> the field of view the game culls with (vr_rig_cull_fov).
