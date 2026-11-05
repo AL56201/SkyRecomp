@@ -426,7 +426,15 @@ float g_door_stick;  // (the left stick's tilt, 0..1 - vr_input.c)
 static void door_trace(uint64_t frame, float lx, float lz, bool inside) {
     static FILE *f;
     if (!f) {
-        f = fopen("build/door_trace.csv", "a");
+        char path[600] = "door_trace.csv";  // (next to the exe, as the log: the working folder depends on the launch)
+#if defined(_WIN32)
+        extern unsigned long __stdcall GetModuleFileNameA(void *, char *, unsigned long);
+        char exe[512];
+        const unsigned long n = GetModuleFileNameA(NULL, exe, sizeof exe);
+        char *slash = n && n < sizeof exe ? strrchr(exe, '\\') : NULL;
+        if (slash) slash[1] = 0, snprintf(path, sizeof path, "%sdoor_trace.csv", exe);
+#endif
+        f = fopen(path, "a");
         if (!f) return;
         fprintf(f, "frame,x,z,open_deg,inside,why,stick\n");
     }
@@ -501,7 +509,8 @@ void door_step_tick(void) {
     }
     // (wider than the leaf, 70 to its edge, and his reach: near the frame the closed door's collision would catch him)
     const bool in_frame = fabsf(lx) < 110.0f && fabsf(lz) < 90.0f;
-    if (open && in_frame) {
+    if ((open || inside) && in_frame) {  // (once in, he stays free until he walks out: the door easing shut
+        // under the hand gave him back to the closed door's collision, which shoved him out)
         if (!inside) {
             inside = true, entry_side = lz < 0 ? -1.0f : 1.0f;
             for (unsigned i = 0; i < NCOPIES; i++) ys[i] = ((const float *)(uintptr_t)(link + (int64_t)copies[i]))[1];
