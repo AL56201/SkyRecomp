@@ -51,6 +51,9 @@ static bool g_test_closed;  // (the test door, once shut by itself, is left to c
 void door_close(void) { if (atomic_load(&g_open) != 0.0f) atomic_store(&g_closing, true), g_test_closed = true; }
 float door_open(void) { return atomic_load(&g_open); }
 static float g_door_m[12];
+static void door_find_tris(const float m[12]);
+static void door_tris_set(bool flat);
+static void door_find_prisms(const float m[12]);
 // (the copy found is turned 180 degrees from the drawn leaf: its x and z axes are taken negated)
 static bool g_door_flip;
 static void take(const float *m) {
@@ -195,6 +198,60 @@ void door_track(void) {
             take((const float *)(uintptr_t)g_door);
             extern uint64_t door_find_actor(const float m[12]);
             g_door_actor_found = door_find_actor(g_door_m);
+            door_tris_set(false), door_find_tris(g_door_m), door_find_prisms(g_door_m);
+            if (getenv("SKYRECOMP_DOOR_KCL")) {  // (RE: the rooms' collision in memory - the doorway's prisms 914 / 8771)
+                static const uint8_t pat[2][16] = {
+                    {0x43, 0x86, 0x97, 0x0a, 0x01, 0x2a, 0x08, 0x6d, 0x08, 0x72, 0x08, 0x6f, 0x00, 0x7a, 0x00, 0x08},
+                    {0x43, 0x86, 0x97, 0x0a, 0x09, 0xbb, 0x06, 0xb2, 0x61, 0xfb, 0x06, 0xb3, 0x00, 0x04, 0x00, 0x09}};
+                uint8_t le[2][16];
+                for (int k = 0; k < 2; k++) {  // (little-endian: the float and each u16 swapped)
+                    le[k][0] = pat[k][3], le[k][1] = pat[k][2], le[k][2] = pat[k][1], le[k][3] = pat[k][0];
+                    for (int j = 4; j < 16; j += 2) le[k][j] = pat[k][j + 1], le[k][j + 1] = pat[k][j];
+                }
+                extern uint64_t kernel_heap_size(void);
+                extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+                uint64_t ra[64], rs[64];
+                const int nr = kernel_data_regions(ra, rs, 64);
+                for (int r = 0; r < nr; r++) LOG("[door] region %#llx + %#llx\n", (unsigned long long)ra[r], (unsigned long long)rs[r]);
+                for (int r = 0; r < nr; r++)
+                    for (uint64_t a = ra[r]; a + 16 <= ra[r] + rs[r]; a += 4)
+                        for (int k = 0; k < 2; k++) {
+                            if (!memcmp((const void *)(uintptr_t)a, pat[k], 16)) LOG("[door] kcl prism %s (big-endian) at %#llx\n", k ? "8771" : "914", (unsigned long long)a);
+                            if (!memcmp((const void *)(uintptr_t)a, le[k], 16)) LOG("[door] kcl prism %s (little-endian) at %#llx\n", k ? "8771" : "914", (unsigned long long)a);
+                        }
+                {   // the kcl2 copy: room 1's triangle 913 (the doorway's), 36 bytes - flattened with its neighbour 914 if
+                    // SKYRECOMP_DOOR_KCL_OFF, every triangle of the room if SKYRECOMP_DOOR_KCL_ALL
+                    static const uint8_t tri[36] = {0x85, 0x2b, 0x57, 0x44, 0x0a, 0x97, 0x86, 0x43, 0x9a, 0xed, 0x0a, 0xc5,
+                                                    0x85, 0x2b, 0x57, 0x44, 0x00, 0x00, 0x00, 0x00, 0x9a, 0xed, 0x0a, 0xc5,
+                                                    0xf8, 0x36, 0x32, 0x44, 0x00, 0x00, 0x00, 0x00, 0xea, 0x19, 0x07, 0xc5};
+                    for (int r = 0; r < nr; r++)
+                        for (uint64_t a = ra[r]; a + 36 <= ra[r] + rs[r]; a += 4)
+                            if (!memcmp((const void *)(uintptr_t)a, tri, 36)) {
+                                LOG("[door] kcl2 triangle 913 at %#llx\n", (unsigned long long)a);
+                                const char *only = getenv("SKYRECOMP_DOOR_KCL_COPY");  // (test: only the copy in this range)
+                                if (only && (a >> 28) != strtoull(only, NULL, 16)) continue;  // (e.g. 700 or 701)
+                                if (getenv("SKYRECOMP_DOOR_KCL_OFF")) {
+                                    float *t = (float *)(uintptr_t)a;
+                                    const int count = getenv("SKYRECOMP_DOOR_KCL_ALL") ? 929 : 2;
+                                    float *t0 = getenv("SKYRECOMP_DOOR_KCL_ALL") ? t - 9 * 913 : t;
+                                    for (int i = 0; i < count; i++)
+                                        for (int j = 3; j < 9; j++) t0[9 * i + j] = t0[9 * i + j % 3];  // (all three corners at the first)
+                                    LOG("[door] kcl2: %d triangles flattened\n", count);
+                                }
+                            }
+                }
+                LOG("[door] kcl search done (heap %#llx bytes)\n", (unsigned long long)kernel_heap_size());
+                if (getenv("SKYRECOMP_DOOR_KCL_OFF"))  // (test: the found prisms and the next one flattened)
+                    for (int r = 0; r < nr; r++)
+                        for (uint64_t a = ra[r]; a + 16 <= ra[r] + rs[r]; a += 4)
+                            for (int k = 0; k < 2; k++)
+                                if (!memcmp((const void *)(uintptr_t)a, le[k], 16)) {
+                                    *(float *)(uintptr_t)a = 0.0f, *(float *)(uintptr_t)(a + 16) = 0.0f;
+                                    if (getenv("SKYRECOMP_DOOR_KCL_ALL") && k == 0)  // (test: every prism of Link's room)
+                                        for (int i = 1; i < 930; i++) *(float *)(uintptr_t)(a - 0x10 * 914 + 0x10 * i) = 0.0f;
+                                    LOG("[door] flattened prisms at %#llx\n", (unsigned long long)a);
+                                }
+            }
             if (getenv("SKYRECOMP_DOOR_REFS"))  // (RE: the colliders' words, as hex and float)
                 for (uint64_t o = 0x670; o < 0x738; o += 0x10) {
                     const uint32_t *w = (const uint32_t *)(uintptr_t)(g_door_actor_found + o);
@@ -452,6 +509,124 @@ void door_request_step(void) { atomic_store(&g_step_request, 1); }
 
 // (game thread) Link moved through the door: to the far side of its plane, `dist` units beyond it, at the doorway's
 // centre line (the door's origin is the doorway's middle - its leaf spans x -70 .. 70)
+// The closed door's collision: triangles in the rooms' live collision (the kcl2 triangle lists, 9 floats each - the
+// game collides against these; the .kcl copy in memory is not used) lying in the doorway: every corner within the
+// leaf's width and a few units of the door's plane, between the floor and the lintel, facing across the doorway.
+// Measured 2026-11-05 on Link's room's door: two in the bedroom's list (10 units in), two in the hallway's. Found for
+// whichever door Link is at; flattened (all three corners at the first) while the door is open, put back once shut.
+#define DOOR_TRIS_MAX 32
+static uint64_t g_tri[DOOR_TRIS_MAX];
+static float g_tri_orig[DOOR_TRIS_MAX][9];
+static int g_ntri;
+static bool g_tris_flat;
+static void door_find_tris(const float m[12]) {
+    g_ntri = 0;
+    for (uint64_t a = HEAP_LO; a + 36 <= HEAP_HI && g_ntri < DOOR_TRIS_MAX; a += 4) {
+        const float *t = (const float *)(uintptr_t)a;
+        // (cheap first: the first corner near the door, level with its floor or above)
+        const float dx = t[0] - m[3], dz = t[2] - m[11];
+        if (!(dx * dx + dz * dz < 100.0f * 100.0f) || !(t[1] - m[7] > -5.0f && t[1] - m[7] < 285.0f)) continue;
+        bool ok = true;
+        float l[3][3];
+        for (int v = 0; v < 3 && ok; v++) {
+            const float px = t[3 * v] - m[3], py = t[3 * v + 1] - m[7], pz = t[3 * v + 2] - m[11];
+            if (!isfinite(px) || !isfinite(py) || !isfinite(pz)) { ok = false; break; }
+            l[v][0] = m[0] * px + m[4] * py + m[8] * pz;   // (along the leaf)
+            l[v][1] = py;
+            l[v][2] = m[2] * px + m[6] * py + m[10] * pz;  // (across the doorway)
+            ok = fabsf(l[v][0]) < 86.0f && fabsf(l[v][2]) < 20.0f && py > -5.0f && py < 285.0f;  // (measured: +-80, 0..269)
+        }
+        if (!ok) continue;
+        // facing across the doorway (its normal along the door's z), and a real triangle, not a sliver
+        const float e1[3] = {l[1][0] - l[0][0], l[1][1] - l[0][1], l[1][2] - l[0][2]};
+        const float e2[3] = {l[2][0] - l[0][0], l[2][1] - l[0][1], l[2][2] - l[0][2]};
+        const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+        const float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (nl < 200.0f || fabsf(n[2]) < 0.9f * nl) continue;
+        g_tri[g_ntri] = a;
+        memcpy(g_tri_orig[g_ntri], t, sizeof g_tri_orig[0]);
+        g_ntri++;
+        a += 32;  // (past this triangle)
+    }
+    LOG("[door] the closed door's collision: %d triangles\n", g_ntri);
+}
+// The same doorway in the rooms' .kcl collision (also used: with only the triangle lists taken out Link still stopped in
+// the doorway). Every loaded .kcl is found by its header (little-endian: 0x38, the positions', normals', prisms' and
+// octree's offsets in order, a positive thickness - files in archives are 32-byte aligned), its prisms decoded to
+// triangles (KCL: the corner, then the others along the edge normals' crossings by the height) and those in the
+// doorway flattened by a height of 0.
+#define DOOR_PRISMS_MAX 32
+static uint64_t g_prism[DOOR_PRISMS_MAX];
+static float g_prism_h[DOOR_PRISMS_MAX];
+static int g_nprism;
+static bool tri_in_doorway(const float m[12], const float c[3][3]) {
+    float l[3][3];
+    for (int v = 0; v < 3; v++) {
+        const float px = c[v][0] - m[3], py = c[v][1] - m[7], pz = c[v][2] - m[11];
+        if (!isfinite(px) || !isfinite(py) || !isfinite(pz)) return false;
+        l[v][0] = m[0] * px + m[4] * py + m[8] * pz, l[v][1] = py, l[v][2] = m[2] * px + m[6] * py + m[10] * pz;
+        if (!(fabsf(l[v][0]) < 86.0f && fabsf(l[v][2]) < 20.0f && py > -5.0f && py < 285.0f)) return false;
+    }
+    const float e1[3] = {l[1][0] - l[0][0], l[1][1] - l[0][1], l[1][2] - l[0][2]};
+    const float e2[3] = {l[2][0] - l[0][0], l[2][1] - l[0][1], l[2][2] - l[0][2]};
+    const float n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
+    const float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    return nl >= 200.0f && fabsf(n[2]) >= 0.9f * nl;
+}
+static void door_find_prisms(const float m[12]) {
+    g_nprism = 0;
+    extern int kernel_data_regions(uint64_t *addr, uint64_t *size, int max);
+    uint64_t ra[64], rs[64];
+    const int nr = kernel_data_regions(ra, rs, 64);
+    int files = 0;
+    for (int r = 0; r < nr; r++)
+        for (uint64_t a = (ra[r] + 31) & ~31ull; a + 0x40 <= ra[r] + rs[r]; a += 32) {
+            const uint32_t *h = (const uint32_t *)(uintptr_t)a;
+            if (h[0] != 0x38 || !(h[1] > 0x38 && h[2] > h[1] && h[3] > h[2] && h[3] < 0x2000000)) continue;
+            const float thick = *(const float *)&h[4];
+            if (!(thick > 0.0f && thick < 1000.0f) || a + h[3] > ra[r] + rs[r]) continue;
+            files++;
+            const float *pos = (const float *)(uintptr_t)(a + h[0]), *nrm = (const float *)(uintptr_t)(a + h[1]);
+            const uint32_t npos = (h[1] - h[0]) / 12, nnrm = (h[2] - h[1]) / 12, npr = (h[3] - h[2]) / 16;
+            for (uint32_t i = 1; i < npr && g_nprism < DOOR_PRISMS_MAX; i++) {
+                const uint8_t *pr = (const uint8_t *)(uintptr_t)(a + h[2] + 16ull * i);
+                const float height = *(const float *)pr;
+                const uint16_t *ix = (const uint16_t *)(pr + 4);  // (position, face normal, three edge normals)
+                if (ix[0] >= npos || ix[1] >= nnrm || ix[2] >= nnrm || ix[3] >= nnrm || ix[4] >= nnrm) continue;
+                const float *P = pos + 3 * ix[0], *fn = nrm + 3 * ix[1], *n1 = nrm + 3 * ix[2], *n2 = nrm + 3 * ix[3], *n3 = nrm + 3 * ix[4];
+                // (quick: the corner near the door)
+                const float qx = P[0] - m[3], qz = P[2] - m[11];
+                if (!(qx * qx + qz * qz < 100.0f * 100.0f)) continue;
+                const float cA[3] = {fn[1] * n1[2] - fn[2] * n1[1], fn[2] * n1[0] - fn[0] * n1[2], fn[0] * n1[1] - fn[1] * n1[0]};
+                const float cB[3] = {fn[1] * n2[2] - fn[2] * n2[1], fn[2] * n2[0] - fn[0] * n2[2], fn[0] * n2[1] - fn[1] * n2[0]};
+                const float dA = cA[0] * n3[0] + cA[1] * n3[1] + cA[2] * n3[2], dB = cB[0] * n3[0] + cB[1] * n3[1] + cB[2] * n3[2];
+                if (fabsf(dA) < 1e-6f || fabsf(dB) < 1e-6f) continue;
+                const float c[3][3] = {{P[0], P[1], P[2]},
+                                       {P[0] + cB[0] * height / dB, P[1] + cB[1] * height / dB, P[2] + cB[2] * height / dB},
+                                       {P[0] + cA[0] * height / dA, P[1] + cA[1] * height / dA, P[2] + cA[2] * height / dA}};
+                if (!tri_in_doorway(m, c)) continue;
+                g_prism[g_nprism] = (uint64_t)(uintptr_t)pr, g_prism_h[g_nprism] = height, g_nprism++;
+            }
+        }
+    LOG("[door] the closed door in the .kcl collision: %d prisms (%d collision files)\n", g_nprism, files);
+}
+static void door_tris_set(bool flat) {
+    if (flat == g_tris_flat) return;
+    for (int i = 0; i < g_nprism; i++) {
+        float *h = (float *)(uintptr_t)g_prism[i];
+        if (flat && *h == g_prism_h[i]) *h = 0.0f;
+        else if (!flat && *h == 0.0f) *h = g_prism_h[i];
+    }
+    for (int i = 0; i < g_ntri; i++) {
+        float *t = (float *)(uintptr_t)g_tri[i];
+        if (flat) {
+            if (memcmp(t, g_tri_orig[i], sizeof g_tri_orig[0])) continue;  // (not ours any more: left alone)
+            for (int j = 3; j < 9; j++) t[j] = t[j % 3];
+        } else if (t[3] == t[0] && t[4] == t[1] && t[5] == t[2]) memcpy(t, g_tri_orig[i], sizeof g_tri_orig[0]);
+    }
+    g_tris_flat = flat;
+}
+
 // Trace (always, near a door that is open): build/door_trace.csv - a frame per line, Link's feet in the door's frame
 // (x along the leaf, z across), the open angle, in the doorway, and what held him: 1 the frame's side stopped a step,
 // 2 the leaf pushed him. Plotted to see what is in the way.
@@ -489,9 +664,8 @@ void door_step_tick(void) {
             mm[7] = y0 + 500.0f;
         }
     }
-    // The door open wide: Link walks through its frame as through nothing. Inside the doorway his collision check is
-    // skipped (the closed door's collision would stop him) and his height held (the skipped check is his floor's
-    // too); he moves by his own walking. Crossed and out of the doorway on the other side, the door shuts behind him.
+    // The door open: Link walks through its frame by the game's own collision, the closed door's triangles taken out
+    // of it (door_tris_set). Crossed and out of the doorway on the other side, the door shuts behind him.
     extern uint64_t renderer_present_count(void);
     static uint64_t last_frame;
     const uint64_t frame = renderer_present_count();
@@ -500,13 +674,12 @@ void door_step_tick(void) {
     atomic_store(&g_step_request, 0);  // (no scripted step)
     static const int32_t copies[] = {-0x254, -0x44, 0x1c, 0x48, 0x148, 0x15c, 0x220, 0x234, 0x2d8, 0x1634, 0x2940 + 0x144, 0x2940 + 0x1bc};
     enum { NCOPIES = sizeof copies / sizeof *copies };
-    static float ys[NCOPIES];
     static bool inside;
     static float entry_side;
     static int close_in;  // (frames until the door shuts behind him; 0: none)
     float m[12];
     const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
-    if (link < 0x7000000000ull || link >= 0x7800000000ull || !door_matrix(m)) { inside = false; return; }
+    if (link < 0x7000000000ull || link >= 0x7800000000ull || !door_matrix(m)) { inside = false, door_tris_set(false); return; }
     if (close_in && !--close_in) door_close();
     if (atomic_load(&g_closing)) {  // (swinging shut, easing in, then latched)
         const float o = atomic_load(&g_open), step = 0.01f + 0.03f * fabsf(o);  // (radians a frame)
@@ -552,60 +725,16 @@ void door_step_tick(void) {
         }
         pl_x = lx, pl_z = lz, pl_frame = frame;
     }
-    // (wider than the leaf, 70 to its edge, and his reach: near the frame the closed door's collision would catch him)
+    // the closed door's collision - its triangles in the rooms' collision, found with the door - is taken away while
+    // the door is open, and put back once it is shut: he walks through by the game's own collision, nothing else
+    door_tris_set(open);
+    // through: in the doorway, then out of it on the other side - the door shuts behind him
     const bool in_frame = fabsf(lx) < 110.0f && fabsf(lz) < 90.0f;
-    if ((open || inside) && in_frame) {  // (once in, he stays free until he walks out: the door easing shut
-        // under the hand gave him back to the closed door's collision, which shoved him out)
-        if (!inside) {
-            inside = true, entry_side = lz < 0 ? -1.0f : 1.0f;
-            for (unsigned i = 0; i < NCOPIES; i++) ys[i] = ((const float *)(uintptr_t)(link + (int64_t)copies[i]))[1];
-            LOG("[door] Link in the doorway (%.0f %.0f)\n", lx, lz);
-        }
-        // (unchecked he walks as in the air - about 2/3 of his pace: his step this frame made up to it)
-        static float plx, plz;
-        static uint64_t pframe;
-        float bx = 0, bz = 0;
-        if (pframe && frame - pframe < 4) {  // (the last few frames: presents and game frames do not pair exactly)
-            const float sx = lx - plx, sz = lz - plz;
-            const float sp = sqrtf(sx * sx + sz * sz);
-            // (up to his walking pace, ~4 a frame - never past it: not a push)
-            if (g_door_stick > 0.3f && sp > 0.1f && sp < 4.0f) bx = sx * (fminf(1.5f * sp, 4.0f) / sp - 1), bz = sz * (fminf(1.5f * sp, 4.0f) / sp - 1);
-        }
-        // the frame's sides are walls (his own check skipped): the doorway is |x| <= 42, the wall's face |z| = 45. A
-        // step into one is not taken - he stops where he was, never pushed or slid along it
-        float nx = lx + bx, nz = lz + bz;
-        // (55: the opening is 70 to the frame - his centre comes to about his radius from it)
-        // (a wall takes only the part of his step that goes into it: from the doorway the sideways part, from the room
-        // the part toward the wall's face - what he walks along it is his own; nothing is added)
-        // (against his last place outside the walls, whatever frames were missed: a step that skipped the check had
-        // let him into the wall, slide inside it, and be shoved out by the game's own collision at the zone's edge)
-        static float okx, okz;
-        static bool ok_set;
-        if (!ok_set || frame - pframe > 30) okx = lx, okz = lz, ok_set = true;
-        if (fabsf(nz) < 45.0f && fabsf(nx) > 55.0f) {
-            if (fabsf(okx) <= 55.0f) nx = nx < 0 ? -55.0f : 55.0f;  // (from the doorway: its side)
-            else nz = okz < 0 ? -45.0f : 45.0f;                        // (from the room: the wall's face)
-            g_trace_why |= 1;
-        }
-        okx = nx, okz = nz;
-        const float dx = nx - lx, dz = nz - lz;
-        plx = nx, plz = nz, pframe = frame;
-        for (unsigned i = 0; i < NCOPIES; i++) {
-            float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
-            q[0] += dx * m[0] + dz * m[2], q[2] += dx * m[8] + dz * m[10];
-            q[1] = ys[i];
-        }
-        *(float *)(uintptr_t)(link + 0x2b2c) = 0.0f;
-        extern volatile int g_fnprof, g_door_nowall;
-        // (fnprof.c: his checks skipped while he is in it - he is checked several times a frame - and released below)
-        g_door_nowall = 1000000; g_fnprof = 1;
-    } else if (inside) {
+    if (in_frame && !inside) inside = true, entry_side = lz < 0 ? -1.0f : 1.0f;
+    else if (!in_frame && inside) {
         inside = false;
-        extern volatile int g_door_nowall;
-        g_door_nowall = 1;  // (his next check clears the skip and runs: he is on the floor again)
-        const bool crossed = (lz < 0 ? -1.0f : 1.0f) != entry_side && fabsf(lz) >= 80.0f;  // (out the far end)
-        LOG("[door] Link out of the doorway (%.0f %.0f)%s\n", lx, lz, crossed ? ": through, the door shuts behind him" : "");
-        if (crossed) close_in = 60;
+        const bool crossed = (lz < 0 ? -1.0f : 1.0f) != entry_side && fabsf(lz) >= 90.0f;
+        if (crossed) LOG("[door] Link through the doorway (%.0f %.0f): the door shuts behind him\n", lx, lz), close_in = 60;
     }
     if (door_open() != 0.0f && fabsf(lx) < 250 && fabsf(lz) < 250) door_trace(frame, lx, lz, inside);
 }
