@@ -327,51 +327,54 @@ void door_request_step(void) { atomic_store(&g_step_request, 1); }
 // (game thread) Link moved through the door: to the far side of its plane, `dist` units beyond it, at the doorway's
 // centre line (the door's origin is the doorway's middle - its leaf spans x -70 .. 70)
 void door_step_tick(void) {
-    // a glide, not a jump: Link is carried from where he stands to `dist` beyond the door's plane over GLIDE frames
-    // (once per frame - this runs for every object), his wall check skipped meanwhile (the closed door's collision
-    // would push him back)
-    enum { GLIDE = 36 };
-    static int glide;  // (frames left; 0: none)
-    static float x0, z0, x1, z1;
-    // (every float that held his x at the door, z 8 bytes on - snapshot search, and his body's at +0x2940; each one's
-    // height is held as it was: the skipped check is his floor's too)
-    static const int32_t copies[] = {-0x254, -0x44, 0x1c, 0x48, 0x148, 0x15c, 0x220, 0x234, 0x2d8, 0x1634, 0x2940 + 0x144, 0x2940 + 0x1bc};
-    enum { NCOPIES = sizeof copies / sizeof *copies };
-    static float ys[NCOPIES];
+    // The door open wide: Link walks through its frame as through nothing. Inside the doorway his collision check is
+    // skipped (the closed door's collision would stop him) and his height held (the skipped check is his floor's
+    // too); he moves by his own walking. Crossed and out of the doorway on the other side, the door shuts behind him.
     extern uint64_t renderer_present_count(void);
     static uint64_t last_frame;
     const uint64_t frame = renderer_present_count();
     if (frame == last_frame) return;
-    float m[12], eye[3];
-    const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
-    if (link < 0x7000000000ull || link >= 0x7800000000ull) return;
-    if (!glide && atomic_load(&g_step_request)) {
-        if (!door_matrix(m) || !player_eye(eye)) return;
-        atomic_store(&g_step_request, 0);
-        const float d[3] = {eye[0] - m[3], eye[1] - m[7], eye[2] - m[11]};
-        const float side = m[2] * d[0] + m[6] * d[1] + m[10] * d[2] < 0 ? -1.0f : 1.0f;  // (his z in the door's frame)
-        const float dist = 90.0f;
-        // the door's z axis in the world (its third column), to the far side, on the doorway's centre line
-        x1 = m[3] - side * m[2] * dist, z1 = m[11] - side * m[10] * dist;
-        const float *p = (const float *)(uintptr_t)(link + 0x148);
-        x0 = p[0], z0 = p[2];
-        for (unsigned i = 0; i < NCOPIES; i++) ys[i] = ((const float *)(uintptr_t)(link + (int64_t)copies[i]))[1];
-        glide = GLIDE;
-        LOG("[door] Link walks through: %.1f %.1f -> %.1f %.1f\n", x0, z0, x1, z1);
-    }
-    if (!glide) return;
     last_frame = frame;
-    glide--;
-    float t = 1.0f - (float)glide / GLIDE;
-    t = t * t * (3 - 2 * t);  // (eased)
-    const float x = x0 + (x1 - x0) * t, z = z0 + (z1 - z0) * t;
-    // (every float that held his x at the door, z 8 bytes on - snapshot search, and his body's at +0x2940)
-    for (unsigned i = 0; i < NCOPIES; i++) {
-        float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
-        q[0] = x, q[1] = ys[i], q[2] = z;
+    atomic_store(&g_step_request, 0);  // (no scripted step)
+    static const int32_t copies[] = {-0x254, -0x44, 0x1c, 0x48, 0x148, 0x15c, 0x220, 0x234, 0x2d8, 0x1634, 0x2940 + 0x144, 0x2940 + 0x1bc};
+    enum { NCOPIES = sizeof copies / sizeof *copies };
+    static float ys[NCOPIES];
+    static bool inside;
+    static float entry_side;
+    static int close_in;  // (frames until the door shuts behind him; 0: none)
+    float m[12];
+    const uint64_t link = *(const uint64_t *)(uintptr_t)(MAIN_BASE + 0x18299d0);
+    if (link < 0x7000000000ull || link >= 0x7800000000ull || !door_matrix(m)) { inside = false; return; }
+    if (close_in && !--close_in) door_set_open(0);
+    // his feet in the door's closed frame (x along the leaf, z across the doorway)
+    const float *p = (const float *)(uintptr_t)(link + 0x148);
+    const float d[3] = {p[0] - m[3], p[1] - m[7], p[2] - m[11]};
+    const float lx = m[0] * d[0] + m[4] * d[1] + m[8] * d[2], lz = m[2] * d[0] + m[6] * d[1] + m[10] * d[2];
+    const bool open = fabsf(door_open()) > 45.0f * (float)(M_PI / 180);
+    const bool in_frame = fabsf(lx) < 60.0f && fabsf(lz) < 80.0f;  // (he stops ~60 from the closed leaf)
+    if (open && in_frame) {
+        if (!inside) {
+            inside = true, entry_side = lz < 0 ? -1.0f : 1.0f;
+            for (unsigned i = 0; i < NCOPIES; i++) ys[i] = ((const float *)(uintptr_t)(link + (int64_t)copies[i]))[1];
+            LOG("[door] Link in the doorway (%.0f %.0f)\n", lx, lz);
+        }
+        // (the doorway's sides hold him in - his own check, skipped, would: kept within +-38 along the leaf)
+        const float over = lx > 38.0f ? 38.0f - lx : lx < -38.0f ? -38.0f - lx : 0.0f;
+        for (unsigned i = 0; i < NCOPIES; i++) {
+            float *q = (float *)(uintptr_t)(link + (int64_t)copies[i]);
+            q[0] += over * m[0], q[1] = ys[i], q[2] += over * m[8];
+        }
+        extern volatile int g_fnprof, g_door_nowall;
+        // (fnprof.c: his checks skipped while he is in it - he is checked several times a frame - and released below)
+        g_door_nowall = 1000000; g_fnprof = 1;
+    } else if (inside) {
+        inside = false;
+        extern volatile int g_door_nowall;
+        g_door_nowall = 1;  // (his next check clears the skip and runs: he is on the floor again)
+        const bool crossed = (lz < 0 ? -1.0f : 1.0f) != entry_side && fabsf(lz) >= 80.0f;  // (out the far end)
+        LOG("[door] Link out of the doorway (%.0f %.0f)%s\n", lx, lz, crossed ? ": through, the door shuts behind him" : "");
+        if (crossed) close_in = 60;
     }
-    extern volatile int g_fnprof, g_door_nowall;
-    g_door_nowall = 3; g_fnprof = 1;  // (fnprof.c: his next checks skipped, the last one runs again)
 }
 
 // ---- the door object turned (its collision with it): its rotation, s16 x / y / z at +0x130 and a copy at +0x13c

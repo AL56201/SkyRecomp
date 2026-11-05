@@ -537,21 +537,8 @@ void vr_input_sync(XrSpace space, XrTime time, const float reference[7]) {
             }
             if (g_vr_config.door_mode == 1 && at_door) s.buttons &= ~(uint32_t)SKY_JC_A;  // (gesture only)
             if (press > 0) press--, s.buttons |= SKY_JC_A;
-            {   // open wide (held or not) and walking on, the stick forward: Link steps through himself (hle/door.c -
-                // no door sequence; the room beyond is already there)
-                extern void door_set_open(float radians);
-                extern float door_open(void);
-                extern void door_request_step(void);
-                static uint64_t stepped;  // (when Link went through: the door shuts behind him a second later)
-                if (at_door && !stepped && fabsf(door_open()) > 45.0f * (float)(M_PI / 180) && s.stick[0][1] > 0.5f) {
-                    LOG("[door] open %.0f deg, walking on: Link steps through\n", door_open() * 57.2958f);
-                    door_request_step();
-                    if (hand >= 0) haptic(hand, 0.4f, 30);
-                    hand = -1, stepped = SDL_GetTicksNS();
-                }
-                // otherwise the door stays as it was left (hle/door.c closes it once Link is far from it)
-                if (stepped && SDL_GetTicksNS() - stepped > 1000000000ull) door_set_open(0), stepped = 0;
-            }
+            // (open wide, Link walks through the doorway by himself - hle/door.c door_step_tick - and it shuts behind him;
+            // otherwise the door stays as it was left until he is far from it)
             // (at a door the grips are the gesture's, not the game's L / R: squeezed, they made Link leave the door)
             if ((at_door && gesture) || hand >= 0) s.l = s.r = 0;
         }
