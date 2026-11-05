@@ -910,7 +910,9 @@ void door_mark_activated(void) { g_room_activated = true; }
 #include <sys/stat.h>
 #endif
 bool door_rec_path(uint64_t frame, char *out, size_t n) {
-    if (frame % 20 || !g_door || !(door_open() != 0.0f || door_at())) return false;
+    static int on = -1;  // (off unless SKYRECOMP_DOOR_REC: saving a frame is a stutter)
+    if (on < 0) on = getenv("SKYRECOMP_DOOR_REC") != NULL;
+    if (!on || frame % 20 || !g_door || !(door_open() != 0.0f || door_at())) return false;
     static char dir[600];
     if (!dir[0]) {
         snprintf(dir, sizeof dir, "door_rec");
