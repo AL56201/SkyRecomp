@@ -78,6 +78,11 @@ typedef struct VRConfig {
         = 0
 #endif
         ;                                // opening doors: 0 A or the grab-twist-pull gesture, 1 the gesture only, 2 A only
+    bool sword_hitbox
+#ifdef __cplusplus
+        = true
+#endif
+        ;                                // 1st person: the sword's hits follow the blade in your right hand (hle/vr_sword.c)
 } VRConfig;
 
 // Always contains a validated configuration. LoadVRConfig resets it to defaults first.

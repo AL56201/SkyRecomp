@@ -906,6 +906,9 @@ static void tab_vr_options(void) {
     changed |= opt_choice("Door Opening", &g_vr_config.door_mode, door_modes, 3, 0,
                           "At a door: grab the handle with a grip, turn your wrist a quarter turn and pull it towards "
                           "you to open it. Gesture only ignores the A button at doors; Button only turns the gesture off.");
+    changed |= opt_toggle("Sword Hits Follow Your Hand", &g_vr_config.sword_hitbox, true,
+                          "1st person: while the sword is drawn, what it hits is where the blade in your right hand is, "
+                          "not where the game swings it. The game still decides when you swing.");
     static const char *turn_modes[] = {"Snap", "Smooth", "Off"};
     changed |= opt_choice("Turning", &g_vr_config.turn_mode, turn_modes, 3, 0,
                           "1st person: the right stick turns you. Snap turns in steps (comfortable for most people), "
